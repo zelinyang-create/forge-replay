@@ -7,11 +7,14 @@ from forge_replay.tools.file_tools import (
     FileReconcileDecision,
     ReplaySafeFileTools,
 )
+from forge_replay.tools.process_supervisor import ProcessReceipt, ProcessSupervisor
 
 __all__ = [
     "FileConflictError",
     "FileMutationPlan",
     "FileMutationReceipt",
     "FileReconcileDecision",
+    "ProcessReceipt",
+    "ProcessSupervisor",
     "ReplaySafeFileTools",
 ]
