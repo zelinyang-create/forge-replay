@@ -93,3 +93,27 @@ def test_file_size_quota_applies_to_reads_and_writes(tmp_path):
         tools.read_text("big.txt")
     with pytest.raises(ValueError, match="byte limit"):
         tools.plan_write("new.txt", b"12345")
+
+
+def test_list_and_search_are_bounded_to_workspace_files(tmp_path):
+    workspace, tools = build_tools(tmp_path)
+    (workspace / "src" / "other.py").write_text("value = 2\nneedle = True\n", encoding="utf-8")
+    (workspace / ".git").mkdir()
+    (workspace / ".git" / "secret").write_text("needle\n", encoding="utf-8")
+
+    files = tools.list_files()
+    matches = tools.search(r"needle\s*=", "src")
+
+    assert files == ["src/app.py", "src/other.py"]
+    assert matches == [{"path": "src/other.py", "line": 2, "text": "needle = True"}]
+
+
+def test_search_caps_results_and_skips_binary_or_oversized_files(tmp_path):
+    workspace, tools = build_tools(tmp_path)
+    (workspace / "src" / "many.txt").write_text("hit\nhit\nhit\n", encoding="utf-8")
+    (workspace / "src" / "binary.bin").write_bytes(b"hit\x00\xff")
+
+    results = tools.search("hit", max_results=2)
+
+    assert len(results) == 2
+    assert all(result["path"] == "src/many.txt" for result in results)

@@ -68,6 +68,20 @@ def test_agent_runs_read_tool_then_commits_final_answer(tmp_path):
     assert totals == '{"model_calls":2}'
 
 
+def test_agent_can_list_and_search_without_process_execution(tmp_path):
+    _, _, runtime = build_runtime(
+        tmp_path,
+        [
+            '<tool>{"name":"list_files","args":{"path":"."}}</tool>',
+            '<tool>{"name":"search","args":{"pattern":"durable","path":"."}}</tool>',
+            "<final>Found the durable text.</final>",
+        ],
+    )
+    outcome = runtime.run("run-1")
+    assert outcome.status == "completed"
+    assert outcome.final_answer == "Found the durable text."
+
+
 def test_auto_approved_file_write_executes_and_continues_loop(tmp_path):
     workspace, store, runtime = build_runtime(
         tmp_path,

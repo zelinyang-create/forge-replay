@@ -53,7 +53,7 @@ class DurableFileExecutor:
         if attempt.state.value != "dispatched":
             return attempt
         args = json.loads(call.args_json)
-        if call.tool_name == "read_file":
+        if call.tool_name in {"read_file", "list_files", "search"}:
             return self._execute_dispatched(attempt, call.tool_name, args, None)
         if call.action_plan is None:
             return self._uncertain(attempt, "durable file action plan is missing")
@@ -75,6 +75,14 @@ class DurableFileExecutor:
                 content, digest = self.tools.read_text(args["path"])
                 receipt = {"path": args["path"], "sha256": digest, "bytes": len(content.encode())}
                 output = content
+            elif tool_name == "list_files":
+                entries = self.tools.list_files(args.get("path", "."))
+                receipt = {"entries": len(entries)}
+                output = json.dumps(entries, ensure_ascii=False)
+            elif tool_name == "search":
+                matches = self.tools.search(args["pattern"], args.get("path", "."))
+                receipt = {"matches": len(matches)}
+                output = json.dumps(matches, ensure_ascii=False)
             elif mutation_plan is not None:
                 result = self.tools.execute(mutation_plan)
                 receipt = asdict(result)
@@ -110,8 +118,8 @@ class DurableFileExecutor:
         tool_name: str,
         args: dict[str, Any],
     ) -> tuple[dict[str, Any], FileMutationPlan | None]:
-        if tool_name == "read_file":
-            return {"kind": "read_file", "path": args["path"]}, None
+        if tool_name in {"read_file", "list_files", "search"}:
+            return {"kind": tool_name, **args}, None
         if tool_name == "write_file":
             plan = self.tools.plan_write(args["path"], args["content"])
         elif tool_name == "patch_file":

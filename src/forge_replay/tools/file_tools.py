@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import secrets
 import stat
 from dataclasses import dataclass
@@ -71,6 +72,60 @@ class ReplaySafeFileTools:
         content = guarded.absolute.read_bytes()
         self._check_size(content)
         return content.decode("utf-8"), self._sha256(content)
+
+    def list_files(self, relative_path: str = ".", *, max_entries: int = 500) -> list[str]:
+        root = self._directory(relative_path)
+        entries = []
+        for path in sorted(root.rglob("*")):
+            if path.is_symlink() or ".git" in path.relative_to(self.guard.workspace_root).parts:
+                continue
+            if path.is_file():
+                entries.append(path.relative_to(self.guard.workspace_root).as_posix())
+                if len(entries) >= max_entries:
+                    break
+        return entries
+
+    def search(
+        self,
+        pattern: str,
+        relative_path: str = ".",
+        *,
+        max_results: int = 100,
+        max_scanned_files: int = 1_000,
+    ) -> list[dict[str, str | int]]:
+        if not pattern or len(pattern) > 256:
+            raise ValueError("search pattern length must be between 1 and 256")
+        expression = re.compile(pattern)
+        root = self._directory(relative_path)
+        results: list[dict[str, str | int]] = []
+        scanned = 0
+        for path in sorted(root.rglob("*")):
+            if scanned >= max_scanned_files or len(results) >= max_results:
+                break
+            if path.is_symlink() or not path.is_file():
+                continue
+            relative = path.relative_to(self.guard.workspace_root)
+            if ".git" in relative.parts:
+                continue
+            scanned += 1
+            try:
+                content = path.read_bytes()
+                self._check_size(content)
+                text = content.decode("utf-8")
+            except (OSError, UnicodeDecodeError, ValueError):
+                continue
+            for line_number, line in enumerate(text.splitlines(), 1):
+                if expression.search(line):
+                    results.append(
+                        {
+                            "path": relative.as_posix(),
+                            "line": line_number,
+                            "text": line[:500],
+                        }
+                    )
+                    if len(results) >= max_results:
+                        break
+        return results
 
     def plan_write(self, relative_path: str, content: str | bytes) -> FileMutationPlan:
         post_content = content.encode("utf-8") if isinstance(content, str) else bytes(content)
@@ -167,6 +222,14 @@ class ReplaySafeFileTools:
     def _check_size(self, content: bytes) -> None:
         if len(content) > self.max_file_bytes:
             raise ValueError(f"file exceeds {self.max_file_bytes} byte limit")
+
+    def _directory(self, relative_path: str) -> Path:
+        if relative_path in ("", "."):
+            return self.guard.workspace_root
+        guarded = self.guard.resolve_for_read(relative_path)
+        if not guarded.exists or not guarded.absolute.is_dir():
+            raise FileNotFoundError(relative_path)
+        return guarded.absolute
 
     @staticmethod
     def _sha256(content: bytes) -> str:

@@ -283,7 +283,7 @@ class DurableAgentRuntime:
         if call.state == ToolCallState.DENIED:
             return None
         if call.state == ToolCallState.READY:
-            if call.tool_name in {"read_file", "write_file", "patch_file"}:
+            if call.tool_name in {"read_file", "list_files", "search", "write_file", "patch_file"}:
                 result = self.file_executor.execute(tool_call_id)
             elif call.tool_name == "run_process":
                 result = self.shell_executor.execute(tool_call_id)
@@ -311,7 +311,7 @@ class DurableAgentRuntime:
                     tool_call_id=tool_call_id,
                     detail="dispatched tool has ambiguous attempt state",
                 )
-            if call.tool_name in {"read_file", "write_file", "patch_file"}:
+            if call.tool_name in {"read_file", "list_files", "search", "write_file", "patch_file"}:
                 result = self.file_executor.recover(attempts[0].attempt_id)
             else:
                 result = self.shell_executor.recover(attempts[0].attempt_id)
@@ -369,7 +369,8 @@ class DurableAgentRuntime:
                 transcript.append(f"approval: {payload.decision}")
         return (
             "You are ForgeReplay, a coding agent. Return exactly one JSON <tool> call or one "
-            "<final> answer. Available tools: read_file(path), write_file(path, content), "
+            "<final> answer. Available tools: list_files(path='.'), read_file(path), "
+            "search(pattern, path='.'), write_file(path, content), "
             "patch_file(path, old_text, new_text), run_process(argv, cwd='.', "
             "timeout_seconds=30). run_process argv must be a JSON list and is not a shell string.\n\n"
             f"User request:\n{self.store.get_run_user_message(run_id)}\n\n"
@@ -380,6 +381,9 @@ class DurableAgentRuntime:
     def _classify(name: str, args: dict) -> tuple[ToolEffectClass, tuple[str, ...]]:
         if name == "read_file":
             return ToolEffectClass.PURE, (args["path"],)
+        if name in {"list_files", "search"}:
+            path = args.get("path", ".")
+            return ToolEffectClass.PURE, (() if path in ("", ".") else (path,))
         if name in {"write_file", "patch_file"}:
             return ToolEffectClass.DETECTABLE_IDEMPOTENT, (args["path"],)
         if name == "run_process":
