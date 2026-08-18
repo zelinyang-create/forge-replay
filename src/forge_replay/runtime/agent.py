@@ -27,8 +27,8 @@ from forge_replay.events import (
 from forge_replay.persistence import (
     BudgetLimitError,
     LeaseConflictError,
-    SQLiteEventStore,
 )
+from forge_replay.ports import RuntimeStorePort
 from forge_replay.runtime.file_executor import DurableFileExecutor
 from forge_replay.runtime.model import ModelInvocationError, ModelPort
 from forge_replay.runtime.shell_executor import DurableShellExecutor
@@ -57,7 +57,7 @@ class DurableAgentRuntime:
 
     def __init__(
         self,
-        store: SQLiteEventStore,
+        store: RuntimeStorePort,
         model: ModelPort,
         file_executor: DurableFileExecutor,
         shell_executor: DurableShellExecutor,

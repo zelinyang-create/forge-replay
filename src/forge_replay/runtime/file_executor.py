@@ -7,7 +7,8 @@ from collections.abc import Callable
 from dataclasses import asdict
 from typing import Any
 
-from forge_replay.persistence import SQLiteEventStore, ToolAttemptRecord
+from forge_replay.persistence import ToolAttemptRecord
+from forge_replay.ports import ToolExecutionStorePort
 from forge_replay.tools import (
     FileConflictError,
     FileReconcileDecision,
@@ -23,7 +24,7 @@ class DurableFileExecutor:
 
     def __init__(
         self,
-        store: SQLiteEventStore,
+        store: ToolExecutionStorePort,
         tools: ReplaySafeFileTools,
         *,
         process_instance_id: str,

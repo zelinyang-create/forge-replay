@@ -7,7 +7,8 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
-from forge_replay.persistence import SQLiteEventStore, ToolAttemptRecord
+from forge_replay.persistence import ToolAttemptRecord
+from forge_replay.ports import ToolExecutionStorePort
 from forge_replay.runtime.file_executor import ExecutionHook
 from forge_replay.tools import ProcessSupervisor
 from forge_replay.workspace import WorkspacePathGuard
@@ -18,7 +19,7 @@ class DurableShellExecutor:
 
     def __init__(
         self,
-        store: SQLiteEventStore,
+        store: ToolExecutionStorePort,
         supervisor: ProcessSupervisor,
         guard: WorkspacePathGuard,
         *,

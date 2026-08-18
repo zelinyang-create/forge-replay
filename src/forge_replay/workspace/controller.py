@@ -5,7 +5,8 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Literal
 
-from forge_replay.persistence import RunWorkspaceRecord, SQLiteEventStore
+from forge_replay.persistence import RunWorkspaceRecord
+from forge_replay.ports import WorkspaceStorePort
 from forge_replay.workspace.git_worktree import GitWorktreeManager
 
 WorkspaceHook = Callable[[str], None]
@@ -14,7 +15,7 @@ WorkspaceHook = Callable[[str], None]
 class WorkspaceController:
     def __init__(
         self,
-        store: SQLiteEventStore,
+        store: WorkspaceStorePort,
         manager: GitWorktreeManager,
         *,
         process_instance_id: str,
