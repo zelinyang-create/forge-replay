@@ -171,3 +171,27 @@ def test_model_budget_exhaustion_becomes_explicit_terminal_state(tmp_path):
 
     assert outcome.status == "budget_exceeded"
     assert store.get_run_projection("run-1").execution_status.value == "budget_exceeded"
+
+
+def test_model_failure_is_recorded_and_becomes_needs_attention(tmp_path):
+    _, store, runtime = build_runtime(tmp_path, [])
+
+    outcome = runtime.run("run-1")
+
+    assert outcome.status == "needs_attention"
+    assert "RuntimeError" in outcome.detail
+    assert store.get_run_projection("run-1").execution_status.value == "needs_attention"
+
+
+def test_runtime_renews_lease_before_bounded_actions(tmp_path, monkeypatch):
+    _, store, runtime = build_runtime(tmp_path, ["<final>done</final>"])
+    original = store.acquire_run_lease
+    calls = []
+
+    def counting_acquire(**kwargs):
+        calls.append(kwargs["run_id"])
+        return original(**kwargs)
+
+    monkeypatch.setattr(store, "acquire_run_lease", counting_acquire)
+    assert runtime.run("run-1").status == "completed"
+    assert len(calls) >= 3

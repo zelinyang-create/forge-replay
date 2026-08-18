@@ -23,9 +23,13 @@ from forge_replay.events import (
     ToolExecutionSucceededPayload,
     ToolExecutionUncertainPayload,
 )
-from forge_replay.persistence import BudgetLimitError, SQLiteEventStore
+from forge_replay.persistence import (
+    BudgetLimitError,
+    LeaseConflictError,
+    SQLiteEventStore,
+)
 from forge_replay.runtime.file_executor import DurableFileExecutor
-from forge_replay.runtime.model import ModelPort
+from forge_replay.runtime.model import ModelInvocationError, ModelPort
 from forge_replay.runtime.shell_executor import DurableShellExecutor
 from forge_replay.runtime.tool_identity import new_uuid7
 from mini_coding_agent import MiniAgent
@@ -89,8 +93,21 @@ class DurableAgentRuntime:
                     process_instance_id=self.process_instance_id,
                 )
                 return AgentOutcome(status="budget_exceeded", detail=str(exc))
+            except ModelInvocationError as exc:
+                self.store.terminate_run(
+                    run_id=run_id,
+                    execution_status=ExecutionStatus.NEEDS_ATTENTION,
+                    reason=str(exc),
+                    process_instance_id=self.process_instance_id,
+                )
+                return AgentOutcome(status="needs_attention", detail=str(exc))
         finally:
-            self.store.release_run_lease(lease)
+            try:
+                self.store.release_run_lease(lease)
+            except LeaseConflictError:
+                # A newer fencing epoch owns the run; the stale worker must not
+                # mutate or release that lease.
+                pass
 
     def _run_with_lease(self, run_id: str) -> AgentOutcome:
         projection = self.store.get_run_projection(run_id)
@@ -115,6 +132,7 @@ class DurableAgentRuntime:
             )
 
         for step in range(self.max_steps):
+            self._renew_lease(run_id)
             if self.store.is_cancellation_requested(run_id):
                 self.store.terminate_run(
                     run_id=run_id,
@@ -172,6 +190,7 @@ class DurableAgentRuntime:
         return AgentOutcome(status="step_limit", detail=f"reached {self.max_steps} steps")
 
     def _call_model(self, run_id: str, step: int):
+        self._renew_lease(run_id)
         projection = self.store.get_run_projection(run_id)
         reservation_id = f"model-{new_uuid7()}"
         reserved = False
@@ -220,7 +239,9 @@ class DurableAgentRuntime:
                     consumed=1,
                     process_instance_id=self.process_instance_id,
                 )
-            raise
+            raise ModelInvocationError(
+                f"model provider failed after durable error recording: {type(exc).__name__}: {exc}"
+            ) from exc
         blob = self.store.put_blob(result.text, media_type="text/plain; charset=utf-8")
         event = self.store.append_event(
             session_id=projection.session_id,
@@ -244,6 +265,7 @@ class DurableAgentRuntime:
         return event, result.text
 
     def _continue_tool(self, run_id: str, tool_call_id: str) -> AgentOutcome | None:
+        self._renew_lease(run_id)
         call = self.store.get_tool_call(tool_call_id)
         if call.state == ToolCallState.PROPOSED:
             approval = self.store.request_tool_approval(
@@ -328,6 +350,14 @@ class DurableAgentRuntime:
                     detail="tool recovery is uncertain",
                 )
         return None
+
+    def _renew_lease(self, run_id: str) -> None:
+        """Renew before every bounded external action or loop iteration."""
+
+        self.store.acquire_run_lease(
+            run_id=run_id,
+            owner=self.process_instance_id,
+        )
 
     def _latest_unfinished_tool(self, run_id: str) -> str | None:
         events = self.store.load_run_events(run_id)

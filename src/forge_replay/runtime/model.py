@@ -19,6 +19,10 @@ class ModelPort(Protocol):
     def complete(self, prompt: str, *, max_output_tokens: int) -> ModelResult: ...
 
 
+class ModelInvocationError(RuntimeError):
+    """A provider failure already recorded in the durable run ledger."""
+
+
 class ScriptedModel:
     """Deterministic model used for conformance and fault tests."""
 
