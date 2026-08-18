@@ -36,11 +36,15 @@ class RunProjection:
         }
 
 
-def reduce_run_events(events: list[EventEnvelope]) -> RunProjection:
-    """Rebuild mutable run state from immutable facts."""
+def reduce_run_events(
+    events: list[EventEnvelope],
+    *,
+    initial: RunProjection | None = None,
+) -> RunProjection:
+    """Rebuild mutable run state from immutable facts, optionally after a checkpoint."""
 
-    projection = None
-    previous_seq = 0
+    projection = initial
+    previous_seq = initial.last_event_seq if initial else 0
     for event in events:
         if event.run_id is None:
             continue

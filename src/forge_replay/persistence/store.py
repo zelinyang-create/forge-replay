@@ -17,6 +17,7 @@ from forge_replay.domain import (
     can_transition_execution,
 )
 from forge_replay.events import (
+    CheckpointCommittedPayload,
     EventEnvelope,
     ProjectionRebuiltPayload,
     RunCompletedPayload,
@@ -28,6 +29,10 @@ from forge_replay.events import (
     new_event,
 )
 from forge_replay.persistence.schema import MIGRATIONS, SCHEMA_TABLE_SQL, Migration
+from forge_replay.runtime.checkpoint import (
+    CHECKPOINT_STATE_VERSION,
+    RunCheckpointSnapshot,
+)
 from forge_replay.runtime.projection import RunProjection, reduce_run_events
 
 
@@ -93,6 +98,23 @@ class CreatedRun:
     run_created_event: EventEnvelope
     phase_changed_event: EventEnvelope
     projection: RunProjection
+
+
+@dataclass(frozen=True)
+class CheckpointRecord:
+    checkpoint_id: str
+    run_id: str
+    through_seq: int
+    state_sha256: str
+    created_at: datetime
+    committed_event: EventEnvelope
+
+
+@dataclass(frozen=True)
+class RecoveredRun:
+    projection: RunProjection
+    checkpoint_id: str | None
+    rejected_checkpoint_ids: tuple[str, ...]
 
 
 def canonical_json(value: Any) -> str:
@@ -432,6 +454,155 @@ class SQLiteEventStore:
     def get_run_projection(self, run_id: str) -> RunProjection:
         return reduce_run_events(self.load_run_events(run_id))
 
+    def commit_run_checkpoint(
+        self,
+        *,
+        run_id: str,
+        checkpoint_id: str,
+        process_instance_id: str,
+    ) -> CheckpointRecord:
+        """Atomically persist a disposable snapshot and its audit event."""
+
+        if not checkpoint_id.strip():
+            raise ValueError("checkpoint_id must not be empty")
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._require_run_row(connection, run_id)
+                projection = reduce_run_events(
+                    self._load_run_events_in_transaction(connection, run_id)
+                )
+                snapshot = RunCheckpointSnapshot.from_projection(projection)
+                snapshot_json = canonical_json(snapshot.model_dump(mode="json"))
+                snapshot_sha256 = sha256_text(snapshot_json)
+                created_at = datetime.now(timezone.utc)
+                connection.execute(
+                    """
+                    INSERT INTO checkpoints(
+                        checkpoint_id, run_id, through_seq, state_version, phase,
+                        snapshot_json, snapshot_sha256, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        checkpoint_id,
+                        run_id,
+                        projection.last_event_seq,
+                        CHECKPOINT_STATE_VERSION,
+                        projection.phase.value if projection.phase else "terminal",
+                        snapshot_json,
+                        snapshot_sha256,
+                        created_at.isoformat(),
+                    ),
+                )
+                event = self._append_event_in_transaction(
+                    connection,
+                    session_id=row["session_id"],
+                    turn_id=row["turn_id"],
+                    run_id=run_id,
+                    process_instance_id=process_instance_id,
+                    correlation_id=run_id,
+                    payload=CheckpointCommittedPayload(
+                        checkpoint_id=checkpoint_id,
+                        through_seq=projection.last_event_seq,
+                        state_sha256=snapshot_sha256,
+                    ),
+                )
+                connection.execute(
+                    "UPDATE runs SET last_event_seq = ? WHERE run_id = ?",
+                    (event.seq, run_id),
+                )
+                connection.execute("COMMIT")
+            except BaseException:
+                connection.execute("ROLLBACK")
+                raise
+        return CheckpointRecord(
+            checkpoint_id=checkpoint_id,
+            run_id=run_id,
+            through_seq=projection.last_event_seq,
+            state_sha256=snapshot_sha256,
+            created_at=created_at,
+            committed_event=event,
+        )
+
+    def recover_run_projection(self, run_id: str) -> RecoveredRun:
+        """Use the newest valid cache, falling back to older caches or full replay."""
+
+        rejected: list[str] = []
+        with self.connect() as connection:
+            run_row = self._require_run_row(connection, run_id)
+            checkpoint_rows = connection.execute(
+                """
+                SELECT * FROM checkpoints
+                WHERE run_id = ?
+                ORDER BY through_seq DESC, created_at DESC
+                """,
+                (run_id,),
+            ).fetchall()
+            for checkpoint_row in checkpoint_rows:
+                try:
+                    checkpoint_projection = self._projection_from_checkpoint_row(
+                        checkpoint_row,
+                        run_row,
+                    )
+                    later_events = self._load_run_events_in_transaction(
+                        connection,
+                        run_id,
+                        after_seq=checkpoint_projection.last_event_seq,
+                    )
+                    projection = reduce_run_events(
+                        later_events,
+                        initial=checkpoint_projection,
+                    )
+                except (LedgerIntegrityError, ValueError):
+                    rejected.append(checkpoint_row["checkpoint_id"])
+                    continue
+                return RecoveredRun(
+                    projection=projection,
+                    checkpoint_id=checkpoint_row["checkpoint_id"],
+                    rejected_checkpoint_ids=tuple(rejected),
+                )
+
+            projection = reduce_run_events(
+                self._load_run_events_in_transaction(connection, run_id)
+            )
+        return RecoveredRun(
+            projection=projection,
+            checkpoint_id=None,
+            rejected_checkpoint_ids=tuple(rejected),
+        )
+
+    @staticmethod
+    def _projection_from_checkpoint_row(
+        checkpoint_row: sqlite3.Row,
+        run_row: sqlite3.Row,
+    ) -> RunProjection:
+        snapshot_json = checkpoint_row["snapshot_json"]
+        if sha256_text(snapshot_json) != checkpoint_row["snapshot_sha256"]:
+            raise LedgerIntegrityError(
+                f"checkpoint {checkpoint_row['checkpoint_id']} checksum mismatch"
+            )
+        if checkpoint_row["state_version"] != CHECKPOINT_STATE_VERSION:
+            raise LedgerIntegrityError(
+                f"checkpoint {checkpoint_row['checkpoint_id']} uses an unsupported version"
+            )
+        snapshot = RunCheckpointSnapshot.model_validate_json(snapshot_json)
+        expected_phase = snapshot.phase.value if snapshot.phase else "terminal"
+        if snapshot.state_version != checkpoint_row["state_version"]:
+            raise LedgerIntegrityError("checkpoint version metadata mismatch")
+        if snapshot.through_seq != checkpoint_row["through_seq"]:
+            raise LedgerIntegrityError("checkpoint sequence metadata mismatch")
+        if expected_phase != checkpoint_row["phase"]:
+            raise LedgerIntegrityError("checkpoint phase metadata mismatch")
+        if (
+            snapshot.run_id != run_row["run_id"]
+            or snapshot.session_id != run_row["session_id"]
+            or snapshot.turn_id != run_row["turn_id"]
+            or snapshot.base_repo_root != run_row["base_repo_root"]
+            or snapshot.base_commit_sha != run_row["base_commit_sha"]
+        ):
+            raise LedgerIntegrityError("checkpoint identity does not match its run")
+        return snapshot.to_projection()
+
     def transition_run_phase(
         self,
         *,
@@ -612,10 +783,12 @@ class SQLiteEventStore:
         self,
         connection: sqlite3.Connection,
         run_id: str,
+        *,
+        after_seq: int = 0,
     ) -> list[EventEnvelope]:
         rows = connection.execute(
-            "SELECT * FROM events WHERE run_id = ? ORDER BY seq",
-            (run_id,),
+            "SELECT * FROM events WHERE run_id = ? AND seq > ? ORDER BY seq",
+            (run_id, after_seq),
         ).fetchall()
         return [self._event_from_row(row) for row in rows]
 
