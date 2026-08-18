@@ -160,12 +160,25 @@ class ReplaySafeFileTools:
         new_text: str,
     ) -> FileMutationPlan:
         current, _ = self.read_text(relative_path)
-        occurrences = current.count(old_text)
+        effective_old = old_text
+        effective_new = new_text
+        occurrences = current.count(effective_old)
+        if occurrences == 0 and "\r\n" in current and "\r\n" not in old_text:
+            effective_old = old_text.replace("\n", "\r\n")
+            effective_new = new_text.replace("\n", "\r\n")
+            occurrences = current.count(effective_old)
+        elif occurrences == 0 and "\r\n" not in current and "\r\n" in old_text:
+            effective_old = old_text.replace("\r\n", "\n")
+            effective_new = new_text.replace("\r\n", "\n")
+            occurrences = current.count(effective_old)
         if occurrences != 1:
             raise FileConflictError(
                 f"patch old_text must occur exactly once; observed {occurrences}"
             )
-        return self.plan_write(relative_path, current.replace(old_text, new_text, 1))
+        return self.plan_write(
+            relative_path,
+            current.replace(effective_old, effective_new, 1),
+        )
 
     def execute(self, plan: FileMutationPlan) -> FileMutationReceipt:
         guarded = self.guard.resolve_for_write(plan.relative_path)

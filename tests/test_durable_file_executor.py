@@ -8,7 +8,13 @@ from forge_replay.tools import ReplaySafeFileTools
 from forge_replay.workspace import WorkspacePathGuard
 
 
-def build_executor(tmp_path, *, hook=None):
+def build_executor(
+    tmp_path,
+    *,
+    hook=None,
+    tool_name="write_file",
+    args=None,
+):
     workspace = tmp_path / "worktree"
     workspace.mkdir()
     (workspace / "app.py").write_text("old\n", encoding="utf-8")
@@ -43,9 +49,9 @@ def build_executor(tmp_path, *, hook=None):
         run_id="run-1",
         response_event_id=str(response.event_id),
         ordinal=0,
-        tool_name="write_file",
+        tool_name=tool_name,
         tool_version="1",
-        args={"path": "app.py", "content": "new\n"},
+        args=args or {"path": "app.py", "content": "new\n"},
         effect_class=ToolEffectClass.DETECTABLE_IDEMPOTENT,
         target_paths=("app.py",),
         process_instance_id="worker-1",
@@ -125,3 +131,18 @@ def test_human_edit_after_dispatch_becomes_uncertain_not_overwritten(tmp_path):
 
     assert recovered.state == ToolCallState.UNCERTAIN
     assert (workspace / "app.py").read_text(encoding="utf-8") == "human\n"
+
+
+def test_patch_planning_conflict_becomes_durable_failure_without_effect(tmp_path):
+    workspace, _, call, executor = build_executor(
+        tmp_path,
+        tool_name="patch_file",
+        args={"path": "app.py", "old_text": "missing", "new_text": "after"},
+    )
+    before = (workspace / "app.py").read_bytes()
+
+    result = executor.execute(call.tool_call_id)
+
+    assert result.state == ToolCallState.FAILED
+    assert result.error["class"] == "FileConflictError"
+    assert (workspace / "app.py").read_bytes() == before

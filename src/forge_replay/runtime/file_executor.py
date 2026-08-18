@@ -37,7 +37,25 @@ class DurableFileExecutor:
     def execute(self, tool_call_id: str) -> ToolAttemptRecord:
         call = self.store.get_tool_call(tool_call_id)
         args = json.loads(call.args_json)
-        action_plan, mutation_plan = self._plan(call.tool_name, args)
+        try:
+            action_plan, mutation_plan = self._plan(call.tool_name, args)
+        except Exception as exc:  # noqa: BLE001 - no effect happened; persist validation failure.
+            attempt = self.store.dispatch_tool_call(
+                tool_call_id=tool_call_id,
+                action_plan={
+                    "kind": "planning_failed",
+                    "error_class": type(exc).__name__,
+                },
+                executor_identity={"kind": "in_process_file_executor", "version": 1},
+                process_instance_id=self.process_instance_id,
+            )
+            return self.store.finish_tool_attempt(
+                attempt_id=attempt.attempt_id,
+                outcome="failed",
+                error={"class": type(exc).__name__, "message": str(exc)},
+                retryable=False,
+                process_instance_id=self.process_instance_id,
+            )
         attempt = self.store.dispatch_tool_call(
             tool_call_id=tool_call_id,
             action_plan=action_plan,

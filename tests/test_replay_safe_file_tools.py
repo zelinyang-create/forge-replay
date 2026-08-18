@@ -72,6 +72,23 @@ def test_patch_requires_one_exact_occurrence(tmp_path):
         tools.plan_patch("src/app.py", old_text="missing", new_text="x")
 
 
+def test_patch_accepts_lf_model_text_for_crlf_workspace_and_preserves_style(tmp_path):
+    workspace = tmp_path / "worktree"
+    workspace.mkdir()
+    target = workspace / "target.py"
+    target.write_bytes(b"def value():\r\n    return 1\r\n")
+    tools = ReplaySafeFileTools(WorkspacePathGuard(workspace))
+
+    plan = tools.plan_patch(
+        "target.py",
+        old_text="def value():\n    return 1",
+        new_text="def value():\n    return 2",
+    )
+    tools.execute(plan)
+
+    assert target.read_bytes() == b"def value():\r\n    return 2\r\n"
+
+
 def test_existing_mode_is_preserved_across_replace(tmp_path):
     if os.name == "nt":
         pytest.skip("Windows chmod exposes only a read-only compatibility bit")
