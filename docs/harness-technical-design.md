@@ -1,11 +1,13 @@
 # ForgeReplay Durable Coding Agent Harness 技术设计报告
 
-> 状态：Draft for implementation  
+> 状态：v0.2 implemented and reviewed（M0–M5 核心范围）
 > 设计基线：`rasbt/mini-coding-agent@717cae4`  
 > 开发仓库：`zelinyang-create/forge-replay`  
 > 开发分支：`codex/durable-agent-runtime`  
 > 目标读者：实现者、代码审查者、后续面试官  
 > 最后更新：2026-08-19
+
+> 实现说明：本报告保留了开工时的上游缺口审计和分阶段设计，便于复核“为什么这样改”。当前实现状态以 README、`docs/implementation-review.md`、测试和 `benchmarks/results/` 为准。M0–M5 的事件账本、恢复状态机、Worktree、文件恢复、进程监督、审批/预算/取消、故障评测和真实模型评测框架已经实现；操作系统级沙箱、远程 Worker、多 Agent DAG 属于明确延期范围。
 
 ## 1. 执行摘要
 
@@ -45,7 +47,7 @@ ForgeReplay 不是重写一个更大的 Coding Agent，也不以增加更多模�
 
 当前基线测试为 `18 passed, 1 skipped`。这只是上游基线验证结果，不应作为个人项目量化成果。
 
-### 2.2 本 Fork 计划新增的能力
+### 2.2 本 Fork 已新增的能力
 
 个人贡献必须能由独立 Commit、测试和 A/B 报告证明，重点包括：
 
@@ -62,7 +64,7 @@ ForgeReplay 不是重写一个更大的 Coding Agent，也不以增加更多模�
 
 README 应长期保留 `Based on rasbt/mini-coding-agent`，并分别列出 `Upstream capabilities` 与 `Added in this fork`。同时保留 Apache-2.0 的版权和 LICENSE；修改过的文件或发行说明应提供显著 Change Notice。若上游将来增加 NOTICE，应一并保留；当前上游没有 NOTICE 时不人为伪造。
 
-## 3. 当前实现审计
+## 3. 上游基线实现审计（开工时状态）
 
 ### 3.1 当前执行链
 
