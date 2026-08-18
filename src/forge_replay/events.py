@@ -26,6 +26,7 @@ class EventType(str, Enum):
     TOOL_EXECUTION_UNCERTAIN = "tool_execution_uncertain"
     CHECKPOINT_COMMITTED = "checkpoint_committed"
     BUDGET_RESERVED = "budget_reserved"
+    BUDGET_SETTLED = "budget_settled"
     CANCELLATION_REQUESTED = "cancellation_requested"
     RUN_COMPLETED = "run_completed"
     PROJECTION_REBUILT = "projection_rebuilt"
@@ -149,6 +150,14 @@ class BudgetReservedPayload(EventPayload):
     amount: int | float = Field(gt=0)
 
 
+class BudgetSettledPayload(EventPayload):
+    event_type: Literal[EventType.BUDGET_SETTLED] = EventType.BUDGET_SETTLED
+    reservation_id: str
+    category: str
+    reserved: int | float = Field(gt=0)
+    consumed: int | float = Field(ge=0)
+
+
 class CancellationRequestedPayload(EventPayload):
     event_type: Literal[EventType.CANCELLATION_REQUESTED] = EventType.CANCELLATION_REQUESTED
     actor: str
@@ -184,6 +193,7 @@ RuntimeEventPayload = Annotated[
     | ToolExecutionUncertainPayload
     | CheckpointCommittedPayload
     | BudgetReservedPayload
+    | BudgetSettledPayload
     | CancellationRequestedPayload
     | RunCompletedPayload
     | ProjectionRebuiltPayload,

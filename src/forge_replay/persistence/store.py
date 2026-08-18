@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import sqlite3
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
@@ -22,6 +23,9 @@ from forge_replay.domain import (
 from forge_replay.events import (
     ApprovalDecidedPayload,
     ApprovalRequestedPayload,
+    BudgetReservedPayload,
+    BudgetSettledPayload,
+    CancellationRequestedPayload,
     CheckpointCommittedPayload,
     EventEnvelope,
     ModelResponseReceivedPayload,
@@ -88,6 +92,10 @@ class ToolCallConflictError(LedgerError):
 
 class ApprovalConflictError(LedgerError):
     """Raised when an approval decision is stale or contradicts a durable decision."""
+
+
+class BudgetLimitError(LedgerError):
+    """Raised when a reservation would exceed a run's durable budget."""
 
 
 @dataclass(frozen=True)
@@ -169,6 +177,17 @@ class ApprovalRecord:
     decided_at: datetime | None
     actor: str | None
     reason: str | None
+    event: EventEnvelope | None
+
+
+@dataclass(frozen=True)
+class BudgetReservationRecord:
+    reservation_id: str
+    run_id: str
+    category: str
+    reserved: int | float
+    consumed: int | float | None
+    state: str
     event: EventEnvelope | None
 
 
@@ -981,6 +1000,229 @@ class SQLiteEventStore:
             ),
             actor=row["actor"],
             reason=row["reason"],
+            event=event,
+        )
+
+    def reserve_budget(
+        self,
+        *,
+        run_id: str,
+        reservation_id: str,
+        category: str,
+        amount: float,
+        process_instance_id: str,
+    ) -> BudgetReservationRecord:
+        """Reserve capacity before an external action without oversubscription."""
+
+        if not category.strip() or not reservation_id.strip():
+            raise ValueError("budget category and reservation ID must not be empty")
+        if isinstance(amount, bool) or not math.isfinite(amount) or amount <= 0:
+            raise ValueError("budget amount must be a positive finite number")
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                run_row = self._require_run_row(connection, run_id)
+                existing = connection.execute(
+                    "SELECT * FROM budget_reservations WHERE reservation_id = ?",
+                    (reservation_id,),
+                ).fetchone()
+                if existing is not None:
+                    record = self._budget_reservation_from_row(existing, event=None)
+                    if record.run_id != run_id or record.category != category or record.reserved != amount:
+                        raise BudgetLimitError("reservation ID already has different semantics")
+                    connection.execute("COMMIT")
+                    return record
+                limits = json.loads(run_row["budget_limits_json"])
+                if category not in limits:
+                    raise BudgetLimitError(f"run has no configured budget for {category}")
+                limit = limits[category]
+                consumed = json.loads(run_row["budget_consumed_json"]).get(category, 0)
+                outstanding_rows = connection.execute(
+                    """
+                    SELECT amount_json FROM budget_reservations
+                    WHERE run_id = ? AND category = ? AND state = 'reserved'
+                    """,
+                    (run_id, category),
+                ).fetchall()
+                outstanding = sum(json.loads(row["amount_json"])["reserved"] for row in outstanding_rows)
+                if consumed + outstanding + amount > limit:
+                    raise BudgetLimitError(
+                        f"{category} budget exceeded: {consumed + outstanding + amount} > {limit}"
+                    )
+                created_at = datetime.now(timezone.utc).isoformat()
+                connection.execute(
+                    """
+                    INSERT INTO budget_reservations(
+                        reservation_id, run_id, category, amount_json, state, created_at
+                    ) VALUES (?, ?, ?, ?, 'reserved', ?)
+                    """,
+                    (
+                        reservation_id,
+                        run_id,
+                        category,
+                        canonical_json({"consumed": None, "reserved": amount}),
+                        created_at,
+                    ),
+                )
+                event = self._append_event_in_transaction(
+                    connection,
+                    session_id=run_row["session_id"],
+                    turn_id=run_row["turn_id"],
+                    run_id=run_id,
+                    process_instance_id=process_instance_id,
+                    correlation_id=run_id,
+                    payload=BudgetReservedPayload(
+                        reservation_id=reservation_id,
+                        category=category,
+                        amount=amount,
+                    ),
+                )
+                connection.execute(
+                    "UPDATE runs SET last_event_seq = ? WHERE run_id = ?",
+                    (event.seq, run_id),
+                )
+                row = connection.execute(
+                    "SELECT * FROM budget_reservations WHERE reservation_id = ?",
+                    (reservation_id,),
+                ).fetchone()
+                connection.execute("COMMIT")
+            except BaseException:
+                connection.execute("ROLLBACK")
+                raise
+        return self._budget_reservation_from_row(row, event=event)
+
+    def settle_budget(
+        self,
+        *,
+        reservation_id: str,
+        consumed: float,
+        process_instance_id: str,
+    ) -> BudgetReservationRecord:
+        """Settle a reservation once and monotonically update consumed budget."""
+
+        if isinstance(consumed, bool) or not math.isfinite(consumed) or consumed < 0:
+            raise ValueError("consumed amount must be a non-negative finite number")
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                reservation_row = connection.execute(
+                    "SELECT * FROM budget_reservations WHERE reservation_id = ?",
+                    (reservation_id,),
+                ).fetchone()
+                if reservation_row is None:
+                    raise BudgetLimitError(f"unknown reservation: {reservation_id}")
+                record = self._budget_reservation_from_row(reservation_row, event=None)
+                if record.state == "settled":
+                    if record.consumed != consumed:
+                        raise BudgetLimitError("reservation already settled with a different amount")
+                    connection.execute("COMMIT")
+                    return record
+                if consumed > record.reserved:
+                    raise BudgetLimitError("consumed amount exceeds the reservation")
+                run_row = self._require_run_row(connection, record.run_id)
+                totals = json.loads(run_row["budget_consumed_json"])
+                totals[record.category] = totals.get(record.category, 0) + consumed
+                connection.execute(
+                    """
+                    UPDATE budget_reservations
+                    SET amount_json = ?, state = 'settled', settled_at = ?
+                    WHERE reservation_id = ?
+                    """,
+                    (
+                        canonical_json({"consumed": consumed, "reserved": record.reserved}),
+                        datetime.now(timezone.utc).isoformat(),
+                        reservation_id,
+                    ),
+                )
+                event = self._append_event_in_transaction(
+                    connection,
+                    session_id=run_row["session_id"],
+                    turn_id=run_row["turn_id"],
+                    run_id=record.run_id,
+                    process_instance_id=process_instance_id,
+                    correlation_id=record.run_id,
+                    payload=BudgetSettledPayload(
+                        reservation_id=reservation_id,
+                        category=record.category,
+                        reserved=record.reserved,
+                        consumed=consumed,
+                    ),
+                )
+                connection.execute(
+                    """
+                    UPDATE runs SET budget_consumed_json = ?, last_event_seq = ?
+                    WHERE run_id = ?
+                    """,
+                    (canonical_json(totals), event.seq, record.run_id),
+                )
+                row = connection.execute(
+                    "SELECT * FROM budget_reservations WHERE reservation_id = ?",
+                    (reservation_id,),
+                ).fetchone()
+                connection.execute("COMMIT")
+            except BaseException:
+                connection.execute("ROLLBACK")
+                raise
+        return self._budget_reservation_from_row(row, event=event)
+
+    def request_cancellation(
+        self,
+        *,
+        run_id: str,
+        actor: str,
+        reason: str,
+        process_instance_id: str,
+    ) -> EventEnvelope | None:
+        """Persist the first cancellation request; repeated delivery is a no-op."""
+
+        if not actor.strip() or not reason.strip():
+            raise ValueError("cancellation actor and reason must not be empty")
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                run_row = self._require_run_row(connection, run_id)
+                if run_row["cancel_requested_at"] is not None:
+                    connection.execute("COMMIT")
+                    return None
+                if run_row["execution_status"] != ExecutionStatus.ACTIVE.value:
+                    raise RunStateConflictError(f"run {run_id} is terminal")
+                event = self._append_event_in_transaction(
+                    connection,
+                    session_id=run_row["session_id"],
+                    turn_id=run_row["turn_id"],
+                    run_id=run_id,
+                    process_instance_id=process_instance_id,
+                    correlation_id=run_id,
+                    payload=CancellationRequestedPayload(actor=actor, reason=reason),
+                )
+                connection.execute(
+                    """
+                    UPDATE runs
+                    SET cancel_requested_at = ?, cancel_reason = ?, last_event_seq = ?
+                    WHERE run_id = ?
+                    """,
+                    (event.occurred_at.isoformat(), reason, event.seq, run_id),
+                )
+                connection.execute("COMMIT")
+            except BaseException:
+                connection.execute("ROLLBACK")
+                raise
+        return event
+
+    @staticmethod
+    def _budget_reservation_from_row(
+        row: sqlite3.Row,
+        *,
+        event: EventEnvelope | None,
+    ) -> BudgetReservationRecord:
+        amounts = json.loads(row["amount_json"])
+        return BudgetReservationRecord(
+            reservation_id=row["reservation_id"],
+            run_id=row["run_id"],
+            category=row["category"],
+            reserved=amounts["reserved"],
+            consumed=amounts.get("consumed"),
+            state=row["state"],
             event=event,
         )
 
