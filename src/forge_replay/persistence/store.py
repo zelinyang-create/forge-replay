@@ -41,6 +41,8 @@ from forge_replay.events import (
     ToolExecutionSucceededPayload,
     ToolExecutionUncertainPayload,
     UserMessageReceivedPayload,
+    WorkspaceProvisionedPayload,
+    WorkspaceProvisioningStartedPayload,
     new_event,
 )
 from forge_replay.persistence.schema import MIGRATIONS, SCHEMA_TABLE_SQL, Migration
@@ -207,6 +209,16 @@ class ToolAttemptRecord:
     output_blob_sha256: str | None
     error: dict[str, Any] | None
     event: EventEnvelope | None
+
+
+@dataclass(frozen=True)
+class RunWorkspaceRecord:
+    run_id: str
+    base_repo_root: str
+    base_commit_sha: str
+    worktree_path: str | None
+    worktree_branch: str | None
+    disposition: WorkspaceDisposition
 
 
 def canonical_json(value: Any) -> str:
@@ -545,6 +557,157 @@ class SQLiteEventStore:
 
     def get_run_projection(self, run_id: str) -> RunProjection:
         return reduce_run_events(self.load_run_events(run_id))
+
+    def get_run_workspace(self, run_id: str) -> RunWorkspaceRecord:
+        with self.connect() as connection:
+            row = self._require_run_row(connection, run_id)
+        return RunWorkspaceRecord(
+            run_id=run_id,
+            base_repo_root=row["base_repo_root"],
+            base_commit_sha=row["base_commit_sha"],
+            worktree_path=row["worktree_path"],
+            worktree_branch=row["worktree_branch"],
+            disposition=WorkspaceDisposition(row["workspace_disposition"]),
+        )
+
+    def begin_workspace_provisioning(
+        self,
+        *,
+        run_id: str,
+        dirty_mode: Literal["refuse", "head-only"],
+        process_instance_id: str,
+    ) -> EventEnvelope | None:
+        """Commit workspace provisioning intent before invoking Git."""
+
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._require_run_row(connection, run_id)
+                projection = reduce_run_events(
+                    self._load_run_events_in_transaction(connection, run_id)
+                )
+                if projection.phase == RunPhase.PROVISIONING:
+                    connection.execute("COMMIT")
+                    return None
+                if projection.phase != RunPhase.PREFLIGHTING:
+                    raise RunStateConflictError("run is not ready for workspace provisioning")
+                intent = self._append_event_in_transaction(
+                    connection,
+                    session_id=row["session_id"],
+                    turn_id=row["turn_id"],
+                    run_id=run_id,
+                    process_instance_id=process_instance_id,
+                    correlation_id=run_id,
+                    payload=WorkspaceProvisioningStartedPayload(
+                        base_repo_root=row["base_repo_root"],
+                        base_commit_sha=row["base_commit_sha"],
+                        dirty_mode=dirty_mode,
+                    ),
+                )
+                phase_event = self._append_event_in_transaction(
+                    connection,
+                    session_id=row["session_id"],
+                    turn_id=row["turn_id"],
+                    run_id=run_id,
+                    process_instance_id=process_instance_id,
+                    causation_event_id=str(intent.event_id),
+                    correlation_id=run_id,
+                    payload=RunPhaseChangedPayload(
+                        previous_phase=RunPhase.PREFLIGHTING,
+                        next_phase=RunPhase.PROVISIONING,
+                        reason="workspace provisioning intent committed",
+                    ),
+                )
+                connection.execute(
+                    "UPDATE runs SET phase = ?, last_event_seq = ? WHERE run_id = ?",
+                    (RunPhase.PROVISIONING.value, phase_event.seq, run_id),
+                )
+                connection.execute("COMMIT")
+            except BaseException:
+                connection.execute("ROLLBACK")
+                raise
+        return intent
+
+    def attach_provisioned_workspace(
+        self,
+        *,
+        run_id: str,
+        worktree_path: str | Path,
+        branch: str,
+        base_commit_sha: str,
+        ownership_marker: str | Path,
+        ownership_token: str,
+        process_instance_id: str,
+    ) -> RunWorkspaceRecord:
+        """Commit an externally created worktree after identity validation."""
+
+        resolved_worktree = str(Path(worktree_path).resolve(strict=True))
+        resolved_marker = str(Path(ownership_marker).resolve(strict=True))
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._require_run_row(connection, run_id)
+                if row["base_commit_sha"] != base_commit_sha:
+                    raise RunStateConflictError("worktree base commit does not match the run")
+                if row["worktree_path"] is not None:
+                    if row["worktree_path"] != resolved_worktree:
+                        raise RunStateConflictError("run already owns a different worktree")
+                    connection.execute("COMMIT")
+                    return self.get_run_workspace(run_id)
+                projection = reduce_run_events(
+                    self._load_run_events_in_transaction(connection, run_id)
+                )
+                if projection.phase != RunPhase.PROVISIONING:
+                    raise RunStateConflictError("run has no durable provisioning intent")
+                provisioned = self._append_event_in_transaction(
+                    connection,
+                    session_id=row["session_id"],
+                    turn_id=row["turn_id"],
+                    run_id=run_id,
+                    process_instance_id=process_instance_id,
+                    correlation_id=run_id,
+                    payload=WorkspaceProvisionedPayload(
+                        worktree_path=resolved_worktree,
+                        branch=branch,
+                        ownership_marker=resolved_marker,
+                        ownership_token_sha256=sha256_text(ownership_token),
+                    ),
+                )
+                phase_event = self._append_event_in_transaction(
+                    connection,
+                    session_id=row["session_id"],
+                    turn_id=row["turn_id"],
+                    run_id=run_id,
+                    process_instance_id=process_instance_id,
+                    causation_event_id=str(provisioned.event_id),
+                    correlation_id=run_id,
+                    payload=RunPhaseChangedPayload(
+                        previous_phase=RunPhase.PROVISIONING,
+                        next_phase=RunPhase.AWAITING_MODEL,
+                        reason="owned worktree attached",
+                    ),
+                )
+                connection.execute(
+                    """
+                    UPDATE runs
+                    SET worktree_path = ?, worktree_branch = ?, workspace_disposition = ?,
+                        phase = ?, last_event_seq = ?
+                    WHERE run_id = ?
+                    """,
+                    (
+                        resolved_worktree,
+                        branch,
+                        WorkspaceDisposition.ACTIVE.value,
+                        RunPhase.AWAITING_MODEL.value,
+                        phase_event.seq,
+                        run_id,
+                    ),
+                )
+                connection.execute("COMMIT")
+            except BaseException:
+                connection.execute("ROLLBACK")
+                raise
+        return self.get_run_workspace(run_id)
 
     def get_run_user_message(self, run_id: str) -> str:
         with self.connect() as connection:

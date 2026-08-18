@@ -8,6 +8,7 @@ from forge_replay.events import (
     RunCompletedPayload,
     RunCreatedPayload,
     RunPhaseChangedPayload,
+    WorkspaceProvisionedPayload,
 )
 
 
@@ -89,6 +90,12 @@ def reduce_run_events(
                 projection,
                 execution_status=ExecutionStatus.COMPLETED,
                 phase=None,
+                last_event_seq=event.seq,
+            )
+        elif isinstance(event.payload, WorkspaceProvisionedPayload):
+            projection = replace(
+                projection,
+                workspace_disposition=WorkspaceDisposition.ACTIVE,
                 last_event_seq=event.seq,
             )
         else:

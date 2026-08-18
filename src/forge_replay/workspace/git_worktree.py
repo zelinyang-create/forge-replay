@@ -142,6 +142,40 @@ class GitWorktreeManager:
             raise
         return provisioned
 
+    def load_owned(self, run_id: str) -> ProvisionedWorktree | None:
+        """Validate an ownership marker and its linked Git worktree."""
+
+        marker = (self.state_root / "ownership" / f"{run_id}.json").resolve()
+        if not marker.exists():
+            return None
+        try:
+            payload = json.loads(marker.read_text(encoding="utf-8"))
+            provisioned = ProvisionedWorktree(
+                run_id=payload["run_id"],
+                repo_root=Path(payload["repo_root"]).resolve(),
+                common_dir=Path(payload["common_dir"]).resolve(),
+                base_commit_sha=payload["base_commit_sha"],
+                worktree_path=Path(payload["worktree_path"]).resolve(),
+                branch=payload["branch"],
+                ownership_marker=marker,
+                ownership_token=payload["ownership_token"],
+                dirty_source_ignored=bool(payload["dirty_source_ignored"]),
+            )
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise WorktreeError("ownership marker is invalid") from exc
+        if provisioned.run_id != run_id or len(provisioned.ownership_token) != 64:
+            raise WorktreeError("ownership marker identity is invalid")
+        expected_root = self.state_root / "worktrees"
+        if not self._is_within(provisioned.worktree_path, expected_root):
+            raise WorktreeError("owned worktree path escapes the state root")
+        if not provisioned.worktree_path.is_dir():
+            raise WorktreeError("owned worktree directory is missing")
+        if self._git(provisioned.worktree_path, "rev-parse", "HEAD") != provisioned.base_commit_sha:
+            raise WorktreeError("owned worktree HEAD no longer matches the base commit")
+        if self._git(provisioned.worktree_path, "branch", "--show-current") != provisioned.branch:
+            raise WorktreeError("owned worktree branch no longer matches its marker")
+        return provisioned
+
     @staticmethod
     def _is_within(candidate: Path, parent: Path) -> bool:
         try:

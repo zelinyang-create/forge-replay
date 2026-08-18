@@ -15,6 +15,8 @@ class EventType(str, Enum):
     USER_MESSAGE_RECEIVED = "user_message_received"
     RUN_CREATED = "run_created"
     RUN_PHASE_CHANGED = "run_phase_changed"
+    WORKSPACE_PROVISIONING_STARTED = "workspace_provisioning_started"
+    WORKSPACE_PROVISIONED = "workspace_provisioned"
     MODEL_CALL_STARTED = "model_call_started"
     MODEL_RESPONSE_RECEIVED = "model_response_received"
     MODEL_CALL_FAILED = "model_call_failed"
@@ -63,6 +65,23 @@ class RunPhaseChangedPayload(EventPayload):
     previous_phase: RunPhase | None
     next_phase: RunPhase
     reason: str
+
+
+class WorkspaceProvisioningStartedPayload(EventPayload):
+    event_type: Literal[EventType.WORKSPACE_PROVISIONING_STARTED] = (
+        EventType.WORKSPACE_PROVISIONING_STARTED
+    )
+    base_repo_root: str
+    base_commit_sha: str
+    dirty_mode: Literal["refuse", "head-only"]
+
+
+class WorkspaceProvisionedPayload(EventPayload):
+    event_type: Literal[EventType.WORKSPACE_PROVISIONED] = EventType.WORKSPACE_PROVISIONED
+    worktree_path: str
+    branch: str
+    ownership_marker: str
+    ownership_token_sha256: str
 
 
 class ModelCallStartedPayload(EventPayload):
@@ -196,6 +215,8 @@ RuntimeEventPayload = Annotated[
     | UserMessageReceivedPayload
     | RunCreatedPayload
     | RunPhaseChangedPayload
+    | WorkspaceProvisioningStartedPayload
+    | WorkspaceProvisionedPayload
     | ModelCallStartedPayload
     | ModelResponseReceivedPayload
     | ModelCallFailedPayload
