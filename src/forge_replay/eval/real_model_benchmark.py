@@ -20,6 +20,7 @@ from forge_replay.eval.coding_tasks import (
     catalog_sha256,
     public_manifest,
 )
+from forge_replay.eval.publish_report import build_public_report
 from forge_replay.events import ModelResponseReceivedPayload
 from forge_replay.persistence import SQLiteEventStore
 from forge_replay.runtime.agent import DurableAgentRuntime
@@ -94,6 +95,7 @@ def run_suite(
             )
     report = _report(results, model, provider, split, repeats)
     _write_json(output / "report.json", report)
+    _write_json(output / "public-report.json", build_public_report(report))
     return report
 
 
