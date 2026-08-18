@@ -13,18 +13,22 @@ from typing import Any, Literal
 from forge_replay.domain import (
     ExecutionStatus,
     RunPhase,
+    ToolCallState,
+    ToolEffectClass,
     WorkspaceDisposition,
     can_transition_execution,
 )
 from forge_replay.events import (
     CheckpointCommittedPayload,
     EventEnvelope,
+    ModelResponseReceivedPayload,
     ProjectionRebuiltPayload,
     RunCompletedPayload,
     RunCreatedPayload,
     RunPhaseChangedPayload,
     RuntimeEventPayload,
     SessionCreatedPayload,
+    ToolCallProposedPayload,
     UserMessageReceivedPayload,
     new_event,
 )
@@ -34,6 +38,13 @@ from forge_replay.runtime.checkpoint import (
     RunCheckpointSnapshot,
 )
 from forge_replay.runtime.projection import RunProjection, reduce_run_events
+from forge_replay.runtime.tool_identity import (
+    ApprovalFingerprintInput,
+    build_approval_fingerprint,
+    canonicalize_tool_args,
+    new_uuid7,
+    normalize_target_path,
+)
 
 
 class LedgerError(RuntimeError):
@@ -66,6 +77,10 @@ class RunNotFoundError(LedgerError):
 
 class RunStateConflictError(LedgerError):
     """Raised when a command was based on a stale or terminal run projection."""
+
+
+class ToolCallConflictError(LedgerError):
+    """Raised when one model response ordinal is reused with different content."""
 
 
 @dataclass(frozen=True)
@@ -115,6 +130,24 @@ class RecoveredRun:
     projection: RunProjection
     checkpoint_id: str | None
     rejected_checkpoint_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ToolCallRecord:
+    tool_call_id: str
+    run_id: str
+    response_event_id: str
+    ordinal: int
+    tool_name: str
+    tool_version: str
+    args_json: str
+    args_sha256: str
+    approval_fingerprint: str
+    effect_class: ToolEffectClass
+    state: ToolCallState
+    target_paths: tuple[str, ...]
+    policy_version: str
+    proposal_event: EventEnvelope | None
 
 
 def canonical_json(value: Any) -> str:
@@ -569,6 +602,190 @@ class SQLiteEventStore:
             projection=projection,
             checkpoint_id=None,
             rejected_checkpoint_ids=tuple(rejected),
+        )
+
+    def propose_tool_call(
+        self,
+        *,
+        run_id: str,
+        response_event_id: str,
+        ordinal: int,
+        tool_name: str,
+        tool_version: str,
+        args: dict[str, Any],
+        effect_class: ToolEffectClass,
+        target_paths: tuple[str, ...] = (),
+        policy_version: str = "policy-v1",
+        process_instance_id: str,
+    ) -> ToolCallRecord:
+        """Persist one logical tool proposal, idempotent by response and ordinal."""
+
+        if ordinal < 0:
+            raise ValueError("ordinal must be non-negative")
+        if not tool_name.strip() or not tool_version.strip():
+            raise ValueError("tool name and version must not be empty")
+        canonical_args = canonicalize_tool_args(args)
+        normalized_targets = tuple(sorted({normalize_target_path(path) for path in target_paths}))
+
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                run_row = self._require_run_row(connection, run_id)
+                if run_row["execution_status"] != ExecutionStatus.ACTIVE.value:
+                    raise RunStateConflictError(f"run {run_id} is terminal")
+                response_row = connection.execute(
+                    "SELECT * FROM events WHERE event_id = ?",
+                    (response_event_id,),
+                ).fetchone()
+                if response_row is None:
+                    raise ToolCallConflictError(f"unknown model response event: {response_event_id}")
+                response_event = self._event_from_row(response_row)
+                if (
+                    response_event.run_id != run_id
+                    or not isinstance(response_event.payload, ModelResponseReceivedPayload)
+                ):
+                    raise ToolCallConflictError(
+                        "tool proposal must reference a model response from the same run"
+                    )
+
+                existing = connection.execute(
+                    """
+                    SELECT * FROM tool_calls
+                    WHERE run_id = ? AND response_event_id = ? AND ordinal = ?
+                    """,
+                    (run_id, response_event_id, ordinal),
+                ).fetchone()
+                if existing is not None:
+                    record = self._tool_call_from_row(existing, proposal_event=None)
+                    expected_fingerprint = build_approval_fingerprint(
+                        ApprovalFingerprintInput(
+                            run_id=run_id,
+                            tool_call_id=record.tool_call_id,
+                            tool_name=tool_name,
+                            tool_version=tool_version,
+                            args_sha256=canonical_args.sha256,
+                            effect_class=effect_class,
+                            base_repo_root=run_row["base_repo_root"],
+                            base_commit_sha=run_row["base_commit_sha"],
+                            worktree_path=run_row["worktree_path"],
+                            target_paths=normalized_targets,
+                            policy_version=policy_version,
+                        )
+                    )
+                    if (
+                        record.tool_name != tool_name
+                        or record.tool_version != tool_version
+                        or record.args_json != canonical_args.json
+                        or record.effect_class != effect_class
+                        or record.target_paths != normalized_targets
+                        or record.policy_version != policy_version
+                        or record.approval_fingerprint != expected_fingerprint
+                    ):
+                        raise ToolCallConflictError(
+                            "model response ordinal already belongs to a different tool proposal"
+                        )
+                    connection.execute("COMMIT")
+                    return record
+
+                tool_call_id = str(new_uuid7())
+                approval_fingerprint = build_approval_fingerprint(
+                    ApprovalFingerprintInput(
+                        run_id=run_id,
+                        tool_call_id=tool_call_id,
+                        tool_name=tool_name,
+                        tool_version=tool_version,
+                        args_sha256=canonical_args.sha256,
+                        effect_class=effect_class,
+                        base_repo_root=run_row["base_repo_root"],
+                        base_commit_sha=run_row["base_commit_sha"],
+                        worktree_path=run_row["worktree_path"],
+                        target_paths=normalized_targets,
+                        policy_version=policy_version,
+                    )
+                )
+                identity_json = canonical_json(
+                    {
+                        "policy_version": policy_version,
+                        "target_paths": normalized_targets,
+                    }
+                )
+                connection.execute(
+                    """
+                    INSERT INTO tool_calls(
+                        tool_call_id, run_id, response_event_id, ordinal,
+                        tool_name, tool_version, args_json, args_sha256,
+                        approval_fingerprint, effect_class, state, precondition_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        tool_call_id,
+                        run_id,
+                        response_event_id,
+                        ordinal,
+                        tool_name,
+                        tool_version,
+                        canonical_args.json,
+                        canonical_args.sha256,
+                        approval_fingerprint,
+                        effect_class.value,
+                        ToolCallState.PROPOSED.value,
+                        identity_json,
+                    ),
+                )
+                proposal_event = self._append_event_in_transaction(
+                    connection,
+                    session_id=run_row["session_id"],
+                    turn_id=run_row["turn_id"],
+                    run_id=run_id,
+                    process_instance_id=process_instance_id,
+                    causation_event_id=response_event_id,
+                    correlation_id=run_id,
+                    payload=ToolCallProposedPayload(
+                        tool_call_id=tool_call_id,
+                        tool_name=tool_name,
+                        tool_version=tool_version,
+                        args_sha256=canonical_args.sha256,
+                        effect_class=effect_class,
+                    ),
+                )
+                connection.execute(
+                    "UPDATE runs SET last_event_seq = ? WHERE run_id = ?",
+                    (proposal_event.seq, run_id),
+                )
+                row = connection.execute(
+                    "SELECT * FROM tool_calls WHERE tool_call_id = ?",
+                    (tool_call_id,),
+                ).fetchone()
+                connection.execute("COMMIT")
+            except BaseException:
+                connection.execute("ROLLBACK")
+                raise
+        return self._tool_call_from_row(row, proposal_event=proposal_event)
+
+    @staticmethod
+    def _tool_call_from_row(
+        row: sqlite3.Row,
+        *,
+        proposal_event: EventEnvelope | None,
+    ) -> ToolCallRecord:
+        if sha256_text(row["args_json"]) != row["args_sha256"]:
+            raise LedgerIntegrityError(f"tool call {row['tool_call_id']} args checksum mismatch")
+        identity = json.loads(row["precondition_json"] or "{}")
+        return ToolCallRecord(
+            tool_call_id=row["tool_call_id"],
+            run_id=row["run_id"],
+            response_event_id=row["response_event_id"],
+            ordinal=row["ordinal"],
+            tool_name=row["tool_name"],
+            tool_version=row["tool_version"],
+            args_json=row["args_json"],
+            args_sha256=row["args_sha256"],
+            approval_fingerprint=row["approval_fingerprint"],
+            effect_class=ToolEffectClass(row["effect_class"]),
+            state=ToolCallState(row["state"]),
+            target_paths=tuple(identity.get("target_paths", ())),
+            policy_version=identity.get("policy_version", ""),
+            proposal_event=proposal_event,
         )
 
     @staticmethod
