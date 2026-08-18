@@ -113,6 +113,21 @@ class ExecutionContext:
         self.lease_expires_at = expires_at
 
 
+@dataclass(frozen=True)
+class ControlCommandContext:
+    """Authenticated, optimistic idempotency envelope for control-plane writes."""
+
+    command_id: str
+    actor: str
+    expected_stream_version: int
+
+    def __post_init__(self) -> None:
+        if not self.command_id or not self.actor:
+            raise ValueError("control command identity is invalid")
+        if self.expected_stream_version < 0:
+            raise ValueError("expected stream version must be non-negative")
+
+
 TERMINAL_EXECUTION_STATUSES = frozenset(
     {
         ExecutionStatus.COMPLETED,

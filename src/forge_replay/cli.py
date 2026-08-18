@@ -7,7 +7,11 @@ import json
 import os
 from pathlib import Path
 
-from forge_replay.domain import ApprovalDecision, WorkspaceDisposition
+from forge_replay.domain import (
+    ApprovalDecision,
+    ControlCommandContext,
+    WorkspaceDisposition,
+)
 from forge_replay.persistence import SQLiteEventStore
 from forge_replay.runtime.agent import AgentOutcome, DurableAgentRuntime
 from forge_replay.runtime.file_executor import DurableFileExecutor
@@ -51,11 +55,13 @@ def build_parser() -> argparse.ArgumentParser:
     approve.add_argument("decision", choices=("allow", "deny"))
     approve.add_argument("--actor", default="cli-user")
     approve.add_argument("--reason", required=True)
+    approve.add_argument("--command-id")
 
     cancel = subparsers.add_parser("cancel", help="Persist a cancellation request")
     cancel.add_argument("run_id")
     cancel.add_argument("--actor", default="cli-user")
     cancel.add_argument("--reason", required=True)
+    cancel.add_argument("--command-id")
 
     status = subparsers.add_parser("status", help="Inspect durable run state")
     status.add_argument("run_id")
@@ -120,6 +126,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "approve":
         approval = store.get_approval(args.approval_id)
+        projection = store.get_run_projection(approval.run_id)
         decision = (
             ApprovalDecision.ALLOW_ONCE if args.decision == "allow" else ApprovalDecision.DENY
         )
@@ -130,18 +137,36 @@ def main(argv: list[str] | None = None) -> int:
             actor=args.actor,
             reason=args.reason,
             process_instance_id=process_instance_id,
+            control_context=ControlCommandContext(
+                command_id=args.command_id or str(new_uuid7()),
+                actor=args.actor,
+                expected_stream_version=projection.last_event_seq,
+            ),
         )
         print(json.dumps({"approval_id": decided.approval_id, "decision": decision.value}))
         return 0
 
     if args.command == "cancel":
+        projection = store.get_run_projection(args.run_id)
         event = store.request_cancellation(
             run_id=args.run_id,
             actor=args.actor,
             reason=args.reason,
             process_instance_id=process_instance_id,
+            control_context=ControlCommandContext(
+                command_id=args.command_id or str(new_uuid7()),
+                actor=args.actor,
+                expected_stream_version=projection.last_event_seq,
+            ),
         )
-        print(json.dumps({"run_id": args.run_id, "event_id": str(event.event_id)}))
+        print(
+            json.dumps(
+                {
+                    "run_id": args.run_id,
+                    "event_id": str(event.event_id) if event is not None else None,
+                }
+            )
+        )
         return 0
 
     if args.command in {"export", "cleanup-clean"}:

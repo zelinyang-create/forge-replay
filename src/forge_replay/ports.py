@@ -13,6 +13,7 @@ from typing import Any, Literal, Protocol
 
 from forge_replay.domain import (
     ApprovalDecision,
+    ControlCommandContext,
     ExecutionContext,
     ExecutionStatus,
     RunPhase,
@@ -170,6 +171,7 @@ class RuntimeStorePort(BlobStorePort, Protocol):
         reason: str,
         process_instance_id: str,
         execution_context: ExecutionContext | None = None,
+        control_context: ControlCommandContext | None = None,
     ) -> ApprovalRecord: ...
 
     def get_pending_approval_for_tool(

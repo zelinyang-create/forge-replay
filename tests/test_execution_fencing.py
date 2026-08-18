@@ -2,7 +2,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from forge_replay.domain import ExecutionContext, RunPhase
+from forge_replay.domain import ControlCommandContext, ExecutionContext, RunPhase
 from forge_replay.persistence import (
     LeaseConflictError,
     RunStateConflictError,
@@ -136,3 +136,65 @@ def test_control_command_can_advance_stream_and_worker_synchronizes(tmp_path):
 
     store.synchronize_execution_context(context)
     assert context.stream_version == event.seq
+
+
+def test_cancellation_command_is_idempotent_and_version_checked(tmp_path):
+    store = build_store(tmp_path)
+    projection = store.get_run_projection("run-1")
+    command = ControlCommandContext(
+        command_id="cancel-1",
+        actor="user-1",
+        expected_stream_version=projection.last_event_seq,
+    )
+
+    first = store.request_cancellation(
+        run_id="run-1",
+        actor="user-1",
+        reason="stop",
+        process_instance_id="api-1",
+        control_context=command,
+    )
+    replay = store.request_cancellation(
+        run_id="run-1",
+        actor="user-1",
+        reason="stop",
+        process_instance_id="api-2",
+        control_context=command,
+    )
+
+    assert first is not None
+    assert replay is not None
+    assert replay.event_id == first.event_id
+
+    with pytest.raises(RunStateConflictError, match="different semantics"):
+        store.request_cancellation(
+            run_id="run-1",
+            actor="user-1",
+            reason="different reason",
+            process_instance_id="api-3",
+            control_context=command,
+        )
+
+
+def test_new_control_command_rejects_stale_stream_version(tmp_path):
+    store = build_store(tmp_path)
+    before = store.get_run_projection("run-1").last_event_seq
+    store.request_cancellation(
+        run_id="run-1",
+        actor="user-1",
+        reason="stop",
+        process_instance_id="api-1",
+    )
+
+    with pytest.raises(RunStateConflictError, match="stream version is stale"):
+        store.request_cancellation(
+            run_id="run-1",
+            actor="user-1",
+            reason="stop",
+            process_instance_id="api-2",
+            control_context=ControlCommandContext(
+                command_id="cancel-stale",
+                actor="user-1",
+                expected_stream_version=before,
+            ),
+        )

@@ -193,6 +193,24 @@ MIGRATIONS = (
             """,
         ),
     ),
+    Migration(
+        version=3,
+        statements=(
+            """
+            CREATE TABLE control_commands (
+                command_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL REFERENCES runs(run_id),
+                command_type TEXT NOT NULL,
+                actor TEXT NOT NULL,
+                expected_stream_version INTEGER NOT NULL,
+                payload_sha256 TEXT NOT NULL,
+                committed_event_id TEXT REFERENCES events(event_id),
+                created_at TEXT NOT NULL
+            )
+            """,
+            "CREATE INDEX control_commands_by_run ON control_commands(run_id, created_at)",
+        ),
+    ),
 )
 
 

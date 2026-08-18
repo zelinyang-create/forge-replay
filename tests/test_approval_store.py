@@ -1,6 +1,11 @@
 import pytest
 
-from forge_replay.domain import ApprovalDecision, ToolCallState, ToolEffectClass
+from forge_replay.domain import (
+    ApprovalDecision,
+    ControlCommandContext,
+    ToolCallState,
+    ToolEffectClass,
+)
 from forge_replay.events import ModelResponseReceivedPayload
 from forge_replay.persistence import ApprovalConflictError, SQLiteEventStore
 
@@ -78,6 +83,44 @@ def test_request_and_allow_once_are_durable_and_fingerprint_bound(tmp_path):
     assert decided.decision == ApprovalDecision.ALLOW_ONCE
     assert decided.actor == "user:test"
     assert tool_state(store, proposal.tool_call_id) == ToolCallState.READY.value
+
+
+def test_approval_control_command_replays_the_committed_decision(tmp_path):
+    store, proposal = build_proposal(tmp_path)
+    requested = store.request_tool_approval(
+        tool_call_id=proposal.tool_call_id,
+        policy="ask-mutating-v1",
+        process_instance_id="worker-1",
+    )
+    command = ControlCommandContext(
+        command_id="approve-1",
+        actor="user:test",
+        expected_stream_version=store.get_run_projection("run-1").last_event_seq,
+    )
+
+    first = store.decide_tool_approval(
+        approval_id=requested.approval_id,
+        expected_fingerprint=proposal.approval_fingerprint,
+        decision=ApprovalDecision.ALLOW_ONCE,
+        actor="user:test",
+        reason="approved once",
+        process_instance_id="api-1",
+        control_context=command,
+    )
+    replay = store.decide_tool_approval(
+        approval_id=requested.approval_id,
+        expected_fingerprint=proposal.approval_fingerprint,
+        decision=ApprovalDecision.ALLOW_ONCE,
+        actor="user:test",
+        reason="approved once",
+        process_instance_id="api-2",
+        control_context=command,
+    )
+
+    assert first.event is not None
+    assert replay.event is not None
+    assert replay.event.event_id == first.event.event_id
+    assert replay.decision == ApprovalDecision.ALLOW_ONCE
 
 
 def test_repeated_request_and_same_decision_do_not_append_duplicate_events(tmp_path):

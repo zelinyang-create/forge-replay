@@ -13,6 +13,7 @@ from typing import Any, Literal
 
 from forge_replay.domain import (
     ApprovalDecision,
+    ControlCommandContext,
     ExecutionContext,
     ExecutionStatus,
     RunPhase,
@@ -780,6 +781,84 @@ class SQLiteEventStore:
         if execution_context is not None:
             execution_context.observe(stream_version)
 
+    def _begin_control_command(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        run_id: str,
+        command_type: str,
+        semantic_payload: dict[str, Any],
+        control_context: ControlCommandContext,
+    ) -> tuple[bool, EventEnvelope | None]:
+        """Validate optimistic concurrency or replay an identical command."""
+
+        payload_sha256 = sha256_text(canonical_json(semantic_payload))
+        existing = connection.execute(
+            "SELECT * FROM control_commands WHERE command_id = ?",
+            (control_context.command_id,),
+        ).fetchone()
+        if existing is not None:
+            if (
+                existing["run_id"] != run_id
+                or existing["command_type"] != command_type
+                or existing["actor"] != control_context.actor
+                or existing["payload_sha256"] != payload_sha256
+            ):
+                raise RunStateConflictError(
+                    "control command ID already has different semantics"
+                )
+            event = None
+            if existing["committed_event_id"] is not None:
+                event_row = connection.execute(
+                    "SELECT * FROM events WHERE event_id = ?",
+                    (existing["committed_event_id"],),
+                ).fetchone()
+                if event_row is None:
+                    raise LedgerIntegrityError(
+                        "control command references a missing event"
+                    )
+                event = self._event_from_row(event_row)
+            return True, event
+
+        run_row = self._require_run_row(connection, run_id)
+        if run_row["last_event_seq"] != control_context.expected_stream_version:
+            raise RunStateConflictError(
+                "control command stream version is stale: "
+                f"expected {control_context.expected_stream_version}, "
+                f"stored {run_row['last_event_seq']}"
+            )
+        return False, None
+
+    def _record_control_command(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        run_id: str,
+        command_type: str,
+        semantic_payload: dict[str, Any],
+        control_context: ControlCommandContext,
+        event: EventEnvelope | None,
+    ) -> None:
+        connection.execute(
+            """
+            INSERT INTO control_commands(
+                command_id, run_id, command_type, actor,
+                expected_stream_version, payload_sha256,
+                committed_event_id, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                control_context.command_id,
+                run_id,
+                command_type,
+                control_context.actor,
+                control_context.expected_stream_version,
+                sha256_text(canonical_json(semantic_payload)),
+                str(event.event_id) if event is not None else None,
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+
     def begin_workspace_provisioning(
         self,
         *,
@@ -1447,6 +1526,7 @@ class SQLiteEventStore:
         reason: str,
         process_instance_id: str,
         execution_context: ExecutionContext | None = None,
+        control_context: ControlCommandContext | None = None,
     ) -> ApprovalRecord:
         """Apply one durable decision without allowing stale UI approvals."""
 
@@ -1454,6 +1534,8 @@ class SQLiteEventStore:
             raise ApprovalConflictError("run-scoped grants require a separate capability grant")
         if not actor.strip() or not reason.strip():
             raise ValueError("approval actor and reason must not be empty")
+        if control_context is not None and control_context.actor != actor:
+            raise ApprovalConflictError("control command actor does not match decision actor")
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
@@ -1463,6 +1545,27 @@ class SQLiteEventStore:
                 ).fetchone()
                 if approval_row is None:
                     raise ApprovalConflictError(f"unknown approval: {approval_id}")
+                semantic_payload = {
+                    "approval_id": approval_id,
+                    "expected_fingerprint": expected_fingerprint,
+                    "decision": decision.value,
+                    "reason": reason,
+                }
+                if control_context is not None:
+                    replayed, replay_event = self._begin_control_command(
+                        connection,
+                        run_id=approval_row["run_id"],
+                        command_type="decide_tool_approval",
+                        semantic_payload=semantic_payload,
+                        control_context=control_context,
+                    )
+                    if replayed:
+                        current_row = connection.execute(
+                            "SELECT * FROM approvals WHERE approval_id = ?",
+                            (approval_id,),
+                        ).fetchone()
+                        connection.execute("COMMIT")
+                        return self._approval_from_row(current_row, event=replay_event)
                 if execution_context is not None:
                     self._require_execution_context(
                         connection,
@@ -1475,6 +1578,15 @@ class SQLiteEventStore:
                     existing_decision = ApprovalDecision(approval_row["decision"])
                     if existing_decision != decision:
                         raise ApprovalConflictError("approval already has a different decision")
+                    if control_context is not None:
+                        self._record_control_command(
+                            connection,
+                            run_id=approval_row["run_id"],
+                            command_type="decide_tool_approval",
+                            semantic_payload=semantic_payload,
+                            control_context=control_context,
+                            event=None,
+                        )
                     connection.execute("COMMIT")
                     return self._approval_from_row(approval_row, event=None)
 
@@ -1529,6 +1641,15 @@ class SQLiteEventStore:
                     "SELECT * FROM approvals WHERE approval_id = ?",
                     (approval_id,),
                 ).fetchone()
+                if control_context is not None:
+                    self._record_control_command(
+                        connection,
+                        run_id=run_row["run_id"],
+                        command_type="decide_tool_approval",
+                        semantic_payload=semantic_payload,
+                        control_context=control_context,
+                        event=event,
+                    )
                 connection.execute("COMMIT")
             except BaseException:
                 connection.execute("ROLLBACK")
@@ -1739,16 +1860,40 @@ class SQLiteEventStore:
         actor: str,
         reason: str,
         process_instance_id: str,
+        control_context: ControlCommandContext | None = None,
     ) -> EventEnvelope | None:
         """Persist the first cancellation request; repeated delivery is a no-op."""
 
         if not actor.strip() or not reason.strip():
             raise ValueError("cancellation actor and reason must not be empty")
+        if control_context is not None and control_context.actor != actor:
+            raise RunStateConflictError("control command actor does not match cancellation actor")
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
                 run_row = self._require_run_row(connection, run_id)
+                semantic_payload = {"actor": actor, "reason": reason}
+                if control_context is not None:
+                    replayed, replay_event = self._begin_control_command(
+                        connection,
+                        run_id=run_id,
+                        command_type="request_cancellation",
+                        semantic_payload=semantic_payload,
+                        control_context=control_context,
+                    )
+                    if replayed:
+                        connection.execute("COMMIT")
+                        return replay_event
                 if run_row["cancel_requested_at"] is not None:
+                    if control_context is not None:
+                        self._record_control_command(
+                            connection,
+                            run_id=run_id,
+                            command_type="request_cancellation",
+                            semantic_payload=semantic_payload,
+                            control_context=control_context,
+                            event=None,
+                        )
                     connection.execute("COMMIT")
                     return None
                 if run_row["execution_status"] != ExecutionStatus.ACTIVE.value:
@@ -1770,6 +1915,15 @@ class SQLiteEventStore:
                     """,
                     (event.occurred_at.isoformat(), reason, event.seq, run_id),
                 )
+                if control_context is not None:
+                    self._record_control_command(
+                        connection,
+                        run_id=run_id,
+                        command_type="request_cancellation",
+                        semantic_payload=semantic_payload,
+                        control_context=control_context,
+                        event=event,
+                    )
                 connection.execute("COMMIT")
             except BaseException:
                 connection.execute("ROLLBACK")
