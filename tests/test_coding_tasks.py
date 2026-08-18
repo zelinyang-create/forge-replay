@@ -28,3 +28,4 @@ def test_all_seed_fixtures_are_git_repositories_and_evaluators_fail_before_fix(t
         repo = _seed_repo(task, tmp_path / task.task_id)
         passed, _ = _evaluate(task, repo, tmp_path / f"eval-{task.task_id}")
         assert not passed, task.task_id
+        assert not list(repo.rglob("__pycache__")), task.task_id

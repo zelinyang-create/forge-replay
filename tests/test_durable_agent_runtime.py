@@ -203,3 +203,22 @@ def test_runtime_can_remove_process_tool_from_model_contract(tmp_path):
     assert runtime.run("run-1").status == "completed"
     assert "Process execution is disabled" in runtime.model.prompts[0]
     assert "run_process(argv" not in runtime.model.prompts[0]
+
+
+def test_invalid_tool_args_are_recorded_and_model_can_self_correct(tmp_path):
+    _, store, runtime = build_runtime(
+        tmp_path,
+        [
+            '<tool>{"name":"read_file","args":{}}</tool>',
+            '<tool>{"name":"read_file","arguments":{"path":"README.md"}}</tool>',
+            "<final>corrected</final>",
+        ],
+    )
+    outcome = runtime.run("run-1")
+    assert outcome.status == "completed"
+    assert outcome.final_answer == "corrected"
+    assert any(
+        event.payload.event_type.value == "model_output_rejected"
+        for event in store.load_run_events("run-1")
+    )
+    assert "previous model tool call was rejected" in runtime.model.prompts[1]

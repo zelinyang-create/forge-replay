@@ -18,6 +18,7 @@ from forge_replay.events import (
     FinalAnswerCommittedPayload,
     ModelCallFailedPayload,
     ModelCallStartedPayload,
+    ModelOutputRejectedPayload,
     ModelResponseReceivedPayload,
     ToolExecutionFailedPayload,
     ToolExecutionSucceededPayload,
@@ -172,9 +173,26 @@ class DurableAgentRuntime:
                 )
                 return AgentOutcome(status="completed", final_answer=answer)
 
-            name = payload["name"]
-            args = payload.get("args", {})
-            effect, targets = self._classify(name, args)
+            try:
+                name = payload["name"]
+                args = payload.get("args", payload.get("arguments", {}))
+                if not isinstance(name, str) or not isinstance(args, dict):
+                    raise TypeError("tool name and args must be an object")
+                effect, targets = self._classify(name, args)
+            except (KeyError, TypeError, ValueError) as exc:
+                projection = self.store.get_run_projection(run_id)
+                self.store.append_event(
+                    session_id=projection.session_id,
+                    turn_id=projection.turn_id,
+                    run_id=run_id,
+                    process_instance_id=self.process_instance_id,
+                    causation_event_id=str(response_event.event_id),
+                    payload=ModelOutputRejectedPayload(
+                        response_event_id=str(response_event.event_id),
+                        reason=f"invalid tool call: {type(exc).__name__}: {exc}",
+                    ),
+                )
+                continue
             call = self.store.propose_tool_call(
                 run_id=run_id,
                 response_event_id=str(response_event.event_id),
@@ -397,6 +415,10 @@ class DurableAgentRuntime:
                 transcript.append(f"tool: {output}")
             elif isinstance(payload, (ToolExecutionFailedPayload, ToolExecutionUncertainPayload)):
                 transcript.append(f"tool: {payload.model_dump_json()}")
+            elif isinstance(payload, ModelOutputRejectedPayload):
+                transcript.append(
+                    "tool: the previous model tool call was rejected; " + payload.reason
+                )
             elif isinstance(payload, ApprovalDecidedPayload):
                 transcript.append(f"approval: {payload.decision}")
         process_tool = (

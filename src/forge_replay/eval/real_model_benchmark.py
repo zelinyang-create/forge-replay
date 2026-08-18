@@ -19,6 +19,7 @@ from forge_replay.eval.coding_tasks import (
     catalog_sha256,
     public_manifest,
 )
+from forge_replay.events import ModelResponseReceivedPayload
 from forge_replay.persistence import SQLiteEventStore
 from forge_replay.runtime.agent import DurableAgentRuntime
 from forge_replay.runtime.file_executor import DurableFileExecutor
@@ -171,6 +172,19 @@ def _run_one(
         event_dump = [event.model_dump(mode="json") for event in events]
         _write_json(run_artifacts / "events.json", event_dump)
         _write_json(
+            run_artifacts / "model-outputs.json",
+            [
+                {
+                    "event_id": str(event.event_id),
+                    "text": store.get_blob(event.payload.response_blob_sha256).content.decode(
+                        "utf-8", errors="replace"
+                    ),
+                }
+                for event in events
+                if isinstance(event.payload, ModelResponseReceivedPayload)
+            ],
+        )
+        _write_json(
             run_artifacts / "run.json",
             {
                 "task_id": task.task_id,
@@ -241,9 +255,13 @@ def _evaluate(task: CodingTask, worktree: Path, evaluator_root: Path) -> tuple[b
     evaluator = evaluator_root / "hidden_test.py"
     evaluator.write_text(task.evaluator_source, encoding="utf-8")
     completed = subprocess.run(
-        [sys.executable, "-I", str(evaluator), str(worktree)],
+        [sys.executable, "-I", "-B", str(evaluator), str(worktree)],
         cwd=evaluator_root,
-        env={"PATH": os.environ.get("PATH", ""), "PYTHONIOENCODING": "utf-8"},
+        env={
+            "PATH": os.environ.get("PATH", ""),
+            "PYTHONIOENCODING": "utf-8",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        },
         check=False,
         capture_output=True,
         text=True,

@@ -26,6 +26,7 @@ class EventType(str, Enum):
     MODEL_CALL_STARTED = "model_call_started"
     MODEL_RESPONSE_RECEIVED = "model_response_received"
     MODEL_CALL_FAILED = "model_call_failed"
+    MODEL_OUTPUT_REJECTED = "model_output_rejected"
     TOOL_CALL_PROPOSED = "tool_call_proposed"
     APPROVAL_REQUESTED = "approval_requested"
     APPROVAL_DECIDED = "approval_decided"
@@ -120,6 +121,12 @@ class ModelCallFailedPayload(EventPayload):
     model_call_id: str
     error_class: str
     retryable: bool
+
+
+class ModelOutputRejectedPayload(EventPayload):
+    event_type: Literal[EventType.MODEL_OUTPUT_REJECTED] = EventType.MODEL_OUTPUT_REJECTED
+    response_event_id: str
+    reason: str
 
 
 class ToolCallProposedPayload(EventPayload):
@@ -248,6 +255,7 @@ RuntimeEventPayload = Annotated[
     | ModelCallStartedPayload
     | ModelResponseReceivedPayload
     | ModelCallFailedPayload
+    | ModelOutputRejectedPayload
     | ToolCallProposedPayload
     | ApprovalRequestedPayload
     | ApprovalDecidedPayload
