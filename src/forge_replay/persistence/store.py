@@ -1127,6 +1127,28 @@ class SQLiteEventStore:
                 raise
         return self._approval_from_row(row, event=event)
 
+    def get_approval(self, approval_id: str) -> ApprovalRecord:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM approvals WHERE approval_id = ?",
+                (approval_id,),
+            ).fetchone()
+        if row is None:
+            raise ApprovalConflictError(f"unknown approval: {approval_id}")
+        return self._approval_from_row(row, event=None)
+
+    def get_pending_approval_for_tool(self, tool_call_id: str) -> ApprovalRecord | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM approvals
+                WHERE subject_type = 'tool_call' AND subject_id = ? AND decision IS NULL
+                ORDER BY requested_at DESC LIMIT 1
+                """,
+                (tool_call_id,),
+            ).fetchone()
+        return self._approval_from_row(row, event=None) if row is not None else None
+
     def decide_tool_approval(
         self,
         *,

@@ -230,7 +230,12 @@ class DurableAgentRuntime:
             )
             call = self.store.get_tool_call(tool_call_id)
         if call.state == ToolCallState.WAITING_APPROVAL:
-            return AgentOutcome(status="waiting_approval", tool_call_id=tool_call_id)
+            pending = self.store.get_pending_approval_for_tool(tool_call_id)
+            return AgentOutcome(
+                status="waiting_approval",
+                approval_id=pending.approval_id if pending else None,
+                tool_call_id=tool_call_id,
+            )
         if call.state == ToolCallState.DENIED:
             return None
         if call.state == ToolCallState.READY:

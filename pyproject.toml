@@ -14,6 +14,7 @@ dependencies = [
 
 [project.scripts]
 mini-coding-agent = "mini_coding_agent:main"
+forge-replay = "forge_replay.cli:main"
 
 [dependency-groups]
 dev = [
