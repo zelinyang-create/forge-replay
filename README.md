@@ -17,6 +17,36 @@ It is a minimal local agent loop with:
 
 The model backend is currently based on Ollama.
 
+## About This Fork
+
+This repository is an Apache-2.0 fork of
+[`rasbt/mini-coding-agent`](https://github.com/rasbt/mini-coding-agent). The
+upstream project provides the minimal model-tool loop, workspace context,
+structured tools, approval modes, JSON session resumption, context reduction,
+and bounded read-only delegation.
+
+ForgeReplay extends that teaching-oriented baseline toward a durable coding
+agent harness. The work is being implemented incrementally and is expected to
+add typed runtime events, a SQLite execution ledger, checkpoint recovery,
+replay-safe file tools, per-run Git worktrees, supervised processes, and
+fault-injection evaluation.
+
+These capabilities are currently a roadmap, not completed performance claims.
+Measured reliability and performance numbers will only be published together
+with fixed task manifests, baseline commits, and raw evaluation artifacts.
+
+The upstream baseline is tagged `upstream-baseline-717cae4`. See the
+[durable harness technical design](docs/harness-technical-design.md) for the
+architecture, implementation sequence, safety boundaries, and evaluation
+methodology.
+
+### Modification Notice
+
+Compared with the upstream baseline, this fork currently adds its ownership
+boundary, implementation roadmap, and technical design documentation. Future
+changes to upstream-derived files will be recorded in commit bodies and release
+notes while retaining the upstream copyright and Apache-2.0 license.
+
 <a href="https://magazine.sebastianraschka.com/p/components-of-a-coding-agent">
   <img src="https://substack-post-media.s3.amazonaws.com/public/images/49b97718-57f4-4977-99c8-8ad5c4d32af3_1548x862.png" width="500px">
 </a>
