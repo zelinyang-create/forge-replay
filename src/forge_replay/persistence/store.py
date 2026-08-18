@@ -36,6 +36,10 @@ from forge_replay.events import (
     RuntimeEventPayload,
     SessionCreatedPayload,
     ToolCallProposedPayload,
+    ToolExecutionDispatchedPayload,
+    ToolExecutionFailedPayload,
+    ToolExecutionSucceededPayload,
+    ToolExecutionUncertainPayload,
     UserMessageReceivedPayload,
     new_event,
 )
@@ -188,6 +192,19 @@ class BudgetReservationRecord:
     reserved: int | float
     consumed: int | float | None
     state: str
+    event: EventEnvelope | None
+
+
+@dataclass(frozen=True)
+class ToolAttemptRecord:
+    attempt_id: str
+    tool_call_id: str
+    attempt_no: int
+    state: ToolCallState
+    action_digest: str | None
+    receipt: dict[str, Any] | None
+    output_blob_sha256: str | None
+    error: dict[str, Any] | None
     event: EventEnvelope | None
 
 
@@ -750,6 +767,11 @@ class SQLiteEventStore:
                         "target_paths": normalized_targets,
                     }
                 )
+                initial_state = (
+                    ToolCallState.READY
+                    if effect_class == ToolEffectClass.PURE
+                    else ToolCallState.PROPOSED
+                )
                 connection.execute(
                     """
                     INSERT INTO tool_calls(
@@ -769,7 +791,7 @@ class SQLiteEventStore:
                         canonical_args.sha256,
                         approval_fingerprint,
                         effect_class.value,
-                        ToolCallState.PROPOSED.value,
+                        initial_state.value,
                         identity_json,
                     ),
                 )
@@ -1208,6 +1230,251 @@ class SQLiteEventStore:
                 connection.execute("ROLLBACK")
                 raise
         return event
+
+    def dispatch_tool_call(
+        self,
+        *,
+        tool_call_id: str,
+        action_plan: dict[str, Any],
+        executor_identity: dict[str, Any],
+        process_instance_id: str,
+        attempt_id: str | None = None,
+    ) -> ToolAttemptRecord:
+        """Persist dispatch intent before any tool side effect occurs."""
+
+        action_json = canonical_json(action_plan)
+        action_digest = sha256_text(action_json)
+        attempt_id = attempt_id or str(new_uuid7())
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                tool_row = connection.execute(
+                    "SELECT * FROM tool_calls WHERE tool_call_id = ?",
+                    (tool_call_id,),
+                ).fetchone()
+                if tool_row is None:
+                    raise ToolCallConflictError(f"unknown tool call: {tool_call_id}")
+                existing = connection.execute(
+                    "SELECT * FROM tool_attempts WHERE attempt_id = ?",
+                    (attempt_id,),
+                ).fetchone()
+                if existing is not None:
+                    record = self._tool_attempt_from_row(existing, event=None)
+                    if record.tool_call_id != tool_call_id or record.action_digest != action_digest:
+                        raise ToolCallConflictError("attempt ID already has different semantics")
+                    connection.execute("COMMIT")
+                    return record
+                if ToolCallState(tool_row["state"]) != ToolCallState.READY:
+                    raise ToolCallConflictError("tool call is not ready for dispatch")
+                run_row = self._require_run_row(connection, tool_row["run_id"])
+                if run_row["cancel_requested_at"] is not None:
+                    raise ToolCallConflictError("run cancellation was requested")
+                attempt_no = connection.execute(
+                    """
+                    SELECT COALESCE(MAX(attempt_no), 0) + 1 FROM tool_attempts
+                    WHERE tool_call_id = ?
+                    """,
+                    (tool_call_id,),
+                ).fetchone()[0]
+                precondition = json.loads(tool_row["precondition_json"] or "{}")
+                precondition["action_plan"] = action_plan
+                dispatch_identity = dict(executor_identity)
+                dispatch_identity["action_digest"] = action_digest
+                dispatched_at = datetime.now(timezone.utc).isoformat()
+                connection.execute(
+                    """
+                    INSERT INTO tool_attempts(
+                        attempt_id, tool_call_id, attempt_no, state,
+                        executor_identity_json, dispatched_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        attempt_id,
+                        tool_call_id,
+                        attempt_no,
+                        ToolCallState.DISPATCHED.value,
+                        canonical_json(dispatch_identity),
+                        dispatched_at,
+                    ),
+                )
+                connection.execute(
+                    """
+                    UPDATE tool_calls SET state = ?, precondition_json = ?
+                    WHERE tool_call_id = ?
+                    """,
+                    (
+                        ToolCallState.DISPATCHED.value,
+                        canonical_json(precondition),
+                        tool_call_id,
+                    ),
+                )
+                event = self._append_event_in_transaction(
+                    connection,
+                    session_id=run_row["session_id"],
+                    turn_id=run_row["turn_id"],
+                    run_id=run_row["run_id"],
+                    process_instance_id=process_instance_id,
+                    correlation_id=run_row["run_id"],
+                    payload=ToolExecutionDispatchedPayload(
+                        tool_call_id=tool_call_id,
+                        attempt_id=attempt_id,
+                        attempt_no=attempt_no,
+                        action_digest=action_digest,
+                    ),
+                )
+                connection.execute(
+                    "UPDATE runs SET last_event_seq = ? WHERE run_id = ?",
+                    (event.seq, run_row["run_id"]),
+                )
+                row = connection.execute(
+                    "SELECT * FROM tool_attempts WHERE attempt_id = ?",
+                    (attempt_id,),
+                ).fetchone()
+                connection.execute("COMMIT")
+            except BaseException:
+                connection.execute("ROLLBACK")
+                raise
+        return self._tool_attempt_from_row(row, event=event)
+
+    def finish_tool_attempt(
+        self,
+        *,
+        attempt_id: str,
+        outcome: Literal["succeeded", "failed", "uncertain"],
+        process_instance_id: str,
+        receipt: dict[str, Any] | None = None,
+        output: bytes | str | None = None,
+        output_media_type: str = "text/plain; charset=utf-8",
+        error: dict[str, Any] | None = None,
+        retryable: bool = False,
+    ) -> ToolAttemptRecord:
+        """Commit one terminal attempt result and the tool-call projection together."""
+
+        if outcome not in ("succeeded", "failed", "uncertain"):
+            raise ValueError("invalid tool attempt outcome")
+        if outcome == "succeeded" and receipt is None:
+            raise ValueError("successful attempts require a receipt")
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                attempt_row = connection.execute(
+                    "SELECT * FROM tool_attempts WHERE attempt_id = ?",
+                    (attempt_id,),
+                ).fetchone()
+                if attempt_row is None:
+                    raise ToolCallConflictError(f"unknown tool attempt: {attempt_id}")
+                existing = self._tool_attempt_from_row(attempt_row, event=None)
+                target_state = ToolCallState(outcome)
+                if existing.state != ToolCallState.DISPATCHED:
+                    if existing.state != target_state:
+                        raise ToolCallConflictError("attempt already has a different outcome")
+                    connection.execute("COMMIT")
+                    return existing
+                tool_row = connection.execute(
+                    "SELECT * FROM tool_calls WHERE tool_call_id = ?",
+                    (existing.tool_call_id,),
+                ).fetchone()
+                run_row = self._require_run_row(connection, tool_row["run_id"])
+                output_blob = None
+                if output is not None:
+                    raw = output.encode("utf-8") if isinstance(output, str) else bytes(output)
+                    output_blob = self._put_blob_in_transaction(
+                        connection,
+                        content=raw,
+                        media_type=output_media_type,
+                    )
+                receipt_json = canonical_json(receipt) if receipt is not None else None
+                error_json = canonical_json(error) if error is not None else None
+                connection.execute(
+                    """
+                    UPDATE tool_attempts
+                    SET state = ?, completed_at = ?, receipt_json = ?,
+                        output_blob_sha256 = ?, error_json = ?
+                    WHERE attempt_id = ?
+                    """,
+                    (
+                        target_state.value,
+                        datetime.now(timezone.utc).isoformat(),
+                        receipt_json,
+                        output_blob.sha256 if output_blob else None,
+                        error_json,
+                        attempt_id,
+                    ),
+                )
+                connection.execute(
+                    """
+                    UPDATE tool_calls
+                    SET state = ?, final_output_blob_sha256 = ?, final_error_json = ?
+                    WHERE tool_call_id = ?
+                    """,
+                    (
+                        target_state.value,
+                        output_blob.sha256 if output_blob else None,
+                        error_json,
+                        existing.tool_call_id,
+                    ),
+                )
+                if outcome == "succeeded":
+                    payload = ToolExecutionSucceededPayload(
+                        tool_call_id=existing.tool_call_id,
+                        attempt_id=attempt_id,
+                        receipt_sha256=sha256_text(receipt_json),
+                        output_blob_sha256=output_blob.sha256 if output_blob else None,
+                    )
+                elif outcome == "failed":
+                    payload = ToolExecutionFailedPayload(
+                        tool_call_id=existing.tool_call_id,
+                        attempt_id=attempt_id,
+                        error_class=(error or {}).get("class", "ToolError"),
+                        retryable=retryable,
+                    )
+                else:
+                    payload = ToolExecutionUncertainPayload(
+                        tool_call_id=existing.tool_call_id,
+                        attempt_id=attempt_id,
+                        evidence=(error or {}).get("evidence", "outcome could not be proven"),
+                    )
+                event = self._append_event_in_transaction(
+                    connection,
+                    session_id=run_row["session_id"],
+                    turn_id=run_row["turn_id"],
+                    run_id=run_row["run_id"],
+                    process_instance_id=process_instance_id,
+                    correlation_id=run_row["run_id"],
+                    payload=payload,
+                )
+                connection.execute(
+                    "UPDATE runs SET last_event_seq = ? WHERE run_id = ?",
+                    (event.seq, run_row["run_id"]),
+                )
+                row = connection.execute(
+                    "SELECT * FROM tool_attempts WHERE attempt_id = ?",
+                    (attempt_id,),
+                ).fetchone()
+                connection.execute("COMMIT")
+            except BaseException:
+                connection.execute("ROLLBACK")
+                raise
+        return self._tool_attempt_from_row(row, event=event)
+
+    @staticmethod
+    def _tool_attempt_from_row(
+        row: sqlite3.Row,
+        *,
+        event: EventEnvelope | None,
+    ) -> ToolAttemptRecord:
+        executor = json.loads(row["executor_identity_json"] or "{}")
+        return ToolAttemptRecord(
+            attempt_id=row["attempt_id"],
+            tool_call_id=row["tool_call_id"],
+            attempt_no=row["attempt_no"],
+            state=ToolCallState(row["state"]),
+            action_digest=executor.get("action_digest"),
+            receipt=json.loads(row["receipt_json"]) if row["receipt_json"] else None,
+            output_blob_sha256=row["output_blob_sha256"],
+            error=json.loads(row["error_json"]) if row["error_json"] else None,
+            event=event,
+        )
 
     @staticmethod
     def _budget_reservation_from_row(

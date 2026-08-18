@@ -18,6 +18,7 @@ from forge_replay.persistence.store import (
     SessionNotFoundError,
     SQLiteEventStore,
     StoredBlob,
+    ToolAttemptRecord,
     ToolCallConflictError,
     ToolCallRecord,
 )
@@ -40,6 +41,7 @@ __all__ = [
     "SQLiteEventStore",
     "SessionNotFoundError",
     "StoredBlob",
+    "ToolAttemptRecord",
     "ToolCallConflictError",
     "ToolCallRecord",
 ]

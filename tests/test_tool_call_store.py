@@ -65,7 +65,7 @@ def test_tool_proposal_persists_uuid7_identity_and_audit_event(tmp_path):
 
     record = propose(store, response)
 
-    assert record.state == ToolCallState.PROPOSED
+    assert record.state == ToolCallState.READY
     assert record.proposal_event is not None
     assert record.proposal_event.payload.tool_call_id == record.tool_call_id
     assert record.proposal_event.causation_event_id == response.event_id
