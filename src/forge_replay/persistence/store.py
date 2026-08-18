@@ -885,9 +885,9 @@ class SQLiteEventStore:
             connection.execute("BEGIN IMMEDIATE")
             try:
                 row = self._require_run_row(connection, run_id)
-                projection = reduce_run_events(
-                    self._load_run_events_in_transaction(connection, run_id)
-                )
+                projection = self._recover_run_projection_in_transaction(
+                    connection, run_id=run_id, run_row=row
+                ).projection
                 if projection.phase == RunPhase.PROVISIONING:
                     connection.execute("COMMIT")
                     return None
@@ -1173,55 +1173,70 @@ class SQLiteEventStore:
 
     def latest_checkpoint_through_seq(self, run_id: str) -> int:
         with self.connect() as connection:
-            self._require_run_row(connection, run_id)
+            run_row = self._require_run_row(connection, run_id)
+            recovered = self._recover_run_projection_in_transaction(
+                connection, run_id=run_id, run_row=run_row
+            )
+            if recovered.checkpoint_id is None:
+                return 0
             row = connection.execute(
-                "SELECT COALESCE(MAX(through_seq), 0) AS through_seq "
-                "FROM checkpoints WHERE run_id = ?",
-                (run_id,),
+                "SELECT through_seq FROM checkpoints WHERE checkpoint_id = ?",
+                (recovered.checkpoint_id,),
             ).fetchone()
         return int(row["through_seq"])
 
     def recover_run_projection(self, run_id: str) -> RecoveredRun:
         """Use the newest valid cache, falling back to older caches or full replay."""
 
-        rejected: list[str] = []
         with self.connect() as connection:
             run_row = self._require_run_row(connection, run_id)
-            checkpoint_rows = connection.execute(
-                """
-                SELECT * FROM checkpoints
-                WHERE run_id = ?
-                ORDER BY through_seq DESC, created_at DESC
-                """,
-                (run_id,),
-            ).fetchall()
-            for checkpoint_row in checkpoint_rows:
-                try:
-                    checkpoint_projection = self._projection_from_checkpoint_row(
-                        checkpoint_row,
-                        run_row,
-                    )
-                    later_events = self._load_run_events_in_transaction(
-                        connection,
-                        run_id,
-                        after_seq=checkpoint_projection.last_event_seq,
-                    )
-                    projection = reduce_run_events(
-                        later_events,
-                        initial=checkpoint_projection,
-                    )
-                except (LedgerIntegrityError, ValueError):
-                    rejected.append(checkpoint_row["checkpoint_id"])
-                    continue
-                return RecoveredRun(
-                    projection=projection,
-                    checkpoint_id=checkpoint_row["checkpoint_id"],
-                    rejected_checkpoint_ids=tuple(rejected),
-                )
-
-            projection = reduce_run_events(
-                self._load_run_events_in_transaction(connection, run_id)
+            return self._recover_run_projection_in_transaction(
+                connection, run_id=run_id, run_row=run_row
             )
+
+    def _recover_run_projection_in_transaction(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        run_id: str,
+        run_row: sqlite3.Row,
+    ) -> RecoveredRun:
+        rejected: list[str] = []
+        checkpoint_rows = connection.execute(
+            """
+            SELECT * FROM checkpoints
+            WHERE run_id = ?
+            ORDER BY through_seq DESC, created_at DESC
+            """,
+            (run_id,),
+        ).fetchall()
+        for checkpoint_row in checkpoint_rows:
+            try:
+                checkpoint_projection = self._projection_from_checkpoint_row(
+                    checkpoint_row,
+                    run_row,
+                )
+                later_events = self._load_run_events_in_transaction(
+                    connection,
+                    run_id,
+                    after_seq=checkpoint_projection.last_event_seq,
+                )
+                projection = reduce_run_events(
+                    later_events,
+                    initial=checkpoint_projection,
+                )
+            except (LedgerIntegrityError, ValueError):
+                rejected.append(checkpoint_row["checkpoint_id"])
+                continue
+            return RecoveredRun(
+                projection=projection,
+                checkpoint_id=checkpoint_row["checkpoint_id"],
+                rejected_checkpoint_ids=tuple(rejected),
+            )
+
+        projection = reduce_run_events(
+            self._load_run_events_in_transaction(connection, run_id)
+        )
         return RecoveredRun(
             projection=projection,
             checkpoint_id=None,

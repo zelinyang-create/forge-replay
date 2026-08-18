@@ -75,11 +75,13 @@ class _DurableModelAttemptObserver(ModelAttemptObserver):
         self.attempt_offset = attempt_offset
         self.execution_context = execution_context
         self.last_started = None
+        self.last_attempt_no: int | None = None
         self.failed_attempts: set[int] = set()
 
     def started(self, attempt_no: int) -> None:
         projection = self.runtime.store.get_run_projection(self.run_id)
         durable_attempt = self.attempt_offset + attempt_no
+        self.last_attempt_no = durable_attempt
         self.last_started = self.runtime.store.append_event(
             session_id=projection.session_id,
             turn_id=projection.turn_id,
@@ -366,9 +368,14 @@ class DurableAgentRuntime:
                 attempt_observer=observer,
             )
         except Exception as exc:
-            last_attempt = previous_attempts + 1
-            if last_attempt not in observer.failed_attempts:
-                observer.failed(last_attempt - previous_attempts, exc, retryable=False)
+            if observer.last_attempt_no is None:
+                observer.started(1)
+            if observer.last_attempt_no not in observer.failed_attempts:
+                observer.failed(
+                    observer.last_attempt_no - previous_attempts,
+                    exc,
+                    retryable=False,
+                )
             if reserved:
                 self.store.settle_budget(
                     reservation_id=reservation_id,
