@@ -13,6 +13,7 @@ from typing import Any, Literal, Protocol
 
 from forge_replay.domain import (
     ApprovalDecision,
+    ExecutionContext,
     ExecutionStatus,
     RunPhase,
     ToolEffectClass,
@@ -52,6 +53,19 @@ class RuntimeStorePort(BlobStorePort, Protocol):
 
     def release_run_lease(self, lease: RunLease) -> None: ...
 
+    def renew_run_lease(
+        self,
+        execution_context: ExecutionContext,
+        *,
+        ttl_seconds: float = 300,
+        now: Any | None = None,
+    ) -> RunLease: ...
+
+    def synchronize_execution_context(
+        self,
+        execution_context: ExecutionContext,
+    ) -> int: ...
+
     def get_run_projection(self, run_id: str) -> RunProjection: ...
 
     def transition_run_phase(
@@ -62,6 +76,7 @@ class RuntimeStorePort(BlobStorePort, Protocol):
         next_phase: RunPhase,
         reason: str,
         process_instance_id: str,
+        execution_context: ExecutionContext | None = None,
     ) -> RunProjection: ...
 
     def is_cancellation_requested(self, run_id: str) -> bool: ...
@@ -73,6 +88,7 @@ class RuntimeStorePort(BlobStorePort, Protocol):
         execution_status: ExecutionStatus,
         reason: str,
         process_instance_id: str,
+        execution_context: ExecutionContext | None = None,
     ) -> RunProjection: ...
 
     def append_event(
@@ -85,6 +101,7 @@ class RuntimeStorePort(BlobStorePort, Protocol):
         run_id: str | None = None,
         causation_event_id: str | None = None,
         correlation_id: str | None = None,
+        execution_context: ExecutionContext | None = None,
     ) -> EventEnvelope: ...
 
     def complete_run(
@@ -93,6 +110,7 @@ class RuntimeStorePort(BlobStorePort, Protocol):
         run_id: str,
         verification_status: Literal["passed", "failed", "not_configured"],
         process_instance_id: str,
+        execution_context: ExecutionContext | None = None,
     ) -> RunProjection: ...
 
     def propose_tool_call(
@@ -108,6 +126,7 @@ class RuntimeStorePort(BlobStorePort, Protocol):
         target_paths: tuple[str, ...] = (),
         policy_version: str = "policy-v1",
         process_instance_id: str,
+        execution_context: ExecutionContext | None = None,
     ) -> ToolCallRecord: ...
 
     def reserve_budget(
@@ -118,6 +137,7 @@ class RuntimeStorePort(BlobStorePort, Protocol):
         category: str,
         amount: float,
         process_instance_id: str,
+        execution_context: ExecutionContext | None = None,
     ) -> BudgetReservationRecord: ...
 
     def settle_budget(
@@ -126,6 +146,7 @@ class RuntimeStorePort(BlobStorePort, Protocol):
         reservation_id: str,
         consumed: float,
         process_instance_id: str,
+        execution_context: ExecutionContext | None = None,
     ) -> BudgetReservationRecord: ...
 
     def get_tool_call(self, tool_call_id: str) -> ToolCallRecord: ...
@@ -136,6 +157,7 @@ class RuntimeStorePort(BlobStorePort, Protocol):
         tool_call_id: str,
         policy: str,
         process_instance_id: str,
+        execution_context: ExecutionContext | None = None,
     ) -> ApprovalRecord: ...
 
     def decide_tool_approval(
@@ -147,6 +169,7 @@ class RuntimeStorePort(BlobStorePort, Protocol):
         actor: str,
         reason: str,
         process_instance_id: str,
+        execution_context: ExecutionContext | None = None,
     ) -> ApprovalRecord: ...
 
     def get_pending_approval_for_tool(
@@ -175,6 +198,7 @@ class ToolExecutionStorePort(BlobStorePort, Protocol):
         executor_identity: dict[str, Any],
         process_instance_id: str,
         attempt_id: str | None = None,
+        execution_context: ExecutionContext | None = None,
     ) -> ToolAttemptRecord: ...
 
     def finish_tool_attempt(
@@ -188,6 +212,7 @@ class ToolExecutionStorePort(BlobStorePort, Protocol):
         output_media_type: str = "text/plain; charset=utf-8",
         error: dict[str, Any] | None = None,
         retryable: bool = False,
+        execution_context: ExecutionContext | None = None,
     ) -> ToolAttemptRecord: ...
 
 
@@ -220,9 +245,19 @@ class WorkspaceStorePort(Protocol):
 class RunnerPort(Protocol):
     """Stable tool-attempt execution boundary."""
 
-    def execute(self, tool_call_id: str) -> ToolAttemptRecord: ...
+    def execute(
+        self,
+        tool_call_id: str,
+        *,
+        execution_context: ExecutionContext | None = None,
+    ) -> ToolAttemptRecord: ...
 
-    def recover(self, attempt_id: str) -> ToolAttemptRecord: ...
+    def recover(
+        self,
+        attempt_id: str,
+        *,
+        execution_context: ExecutionContext | None = None,
+    ) -> ToolAttemptRecord: ...
 
 
 @dataclass(frozen=True)
@@ -255,4 +290,3 @@ class PolicyEvaluator(Protocol):
     """Deterministic policy decision boundary independent of model text."""
 
     def evaluate(self, request: dict[str, Any]) -> PolicyDecision: ...
-

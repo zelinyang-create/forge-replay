@@ -13,6 +13,7 @@ from typing import Any, Literal
 
 from forge_replay.domain import (
     ApprovalDecision,
+    ExecutionContext,
     ExecutionStatus,
     RunPhase,
     ToolCallState,
@@ -644,6 +645,74 @@ class SQLiteEventStore:
                 raise
         return RunLease(run_id=run_id, owner=owner, epoch=epoch, expires_at=expires_at)
 
+    def renew_run_lease(
+        self,
+        execution_context: ExecutionContext,
+        *,
+        ttl_seconds: float = 300,
+        now: datetime | None = None,
+    ) -> RunLease:
+        """Renew only the exact owner/epoch without touching the event stream."""
+
+        if not 1 <= ttl_seconds <= 3600:
+            raise ValueError("lease TTL is invalid")
+        observed_at = now or datetime.now(timezone.utc)
+        expires_at = observed_at + timedelta(seconds=ttl_seconds)
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = connection.execute(
+                    """
+                    UPDATE runs SET lease_expires_at = ?
+                    WHERE run_id = ? AND lease_owner = ? AND lease_epoch = ?
+                      AND lease_expires_at > ?
+                    """,
+                    (
+                        expires_at.isoformat(),
+                        execution_context.run_id,
+                        execution_context.worker_id,
+                        execution_context.lease_epoch,
+                        observed_at.isoformat(),
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise LeaseConflictError("lease fencing token is stale or expired")
+                connection.execute("COMMIT")
+            except BaseException:
+                connection.execute("ROLLBACK")
+                raise
+        return RunLease(
+            run_id=execution_context.run_id,
+            owner=execution_context.worker_id,
+            epoch=execution_context.lease_epoch,
+            expires_at=expires_at,
+        )
+
+    def synchronize_execution_context(
+        self,
+        execution_context: ExecutionContext,
+    ) -> int:
+        """Observe control-plane events without weakening owner/epoch fencing."""
+
+        with self.connect() as connection:
+            row = self._require_run_row(connection, execution_context.run_id)
+            now = datetime.now(timezone.utc)
+            expiry = (
+                datetime.fromisoformat(row["lease_expires_at"])
+                if row["lease_expires_at"]
+                else None
+            )
+            if (
+                row["lease_owner"] != execution_context.worker_id
+                or row["lease_epoch"] != execution_context.lease_epoch
+                or expiry is None
+                or expiry <= now
+            ):
+                raise LeaseConflictError("execution context lease is stale or expired")
+            stream_version = int(row["last_event_seq"])
+        execution_context.observe(stream_version)
+        return stream_version
+
     def release_run_lease(self, lease: RunLease) -> None:
         """Release only when owner and fencing epoch still match."""
 
@@ -663,6 +732,53 @@ class SQLiteEventStore:
             except BaseException:
                 connection.execute("ROLLBACK")
                 raise
+
+    def _require_execution_context(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        run_id: str,
+        execution_context: ExecutionContext | None,
+    ) -> sqlite3.Row:
+        """Fence mutations whenever a live worker lease exists."""
+
+        row = self._require_run_row(connection, run_id)
+        now = datetime.now(timezone.utc)
+        expiry = (
+            datetime.fromisoformat(row["lease_expires_at"])
+            if row["lease_expires_at"]
+            else None
+        )
+        if execution_context is None:
+            if row["lease_owner"] and expiry is not None and expiry > now:
+                raise LeaseConflictError(
+                    "a live leased run mutation requires an execution context"
+                )
+            return row
+        if execution_context.run_id != run_id:
+            raise LeaseConflictError("execution context targets a different run")
+        if (
+            row["lease_owner"] != execution_context.worker_id
+            or row["lease_epoch"] != execution_context.lease_epoch
+            or expiry is None
+            or expiry <= now
+        ):
+            raise LeaseConflictError("execution context lease is stale or expired")
+        if row["last_event_seq"] != execution_context.stream_version:
+            raise RunStateConflictError(
+                "execution context stream version is stale: "
+                f"expected {execution_context.stream_version}, "
+                f"stored {row['last_event_seq']}"
+            )
+        return row
+
+    @staticmethod
+    def _advance_execution_context(
+        execution_context: ExecutionContext | None,
+        stream_version: int,
+    ) -> None:
+        if execution_context is not None:
+            execution_context.observe(stream_version)
 
     def begin_workspace_provisioning(
         self,
@@ -1017,6 +1133,7 @@ class SQLiteEventStore:
         target_paths: tuple[str, ...] = (),
         policy_version: str = "policy-v1",
         process_instance_id: str,
+        execution_context: ExecutionContext | None = None,
     ) -> ToolCallRecord:
         """Persist one logical tool proposal, idempotent by response and ordinal."""
 
@@ -1030,7 +1147,11 @@ class SQLiteEventStore:
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
-                run_row = self._require_run_row(connection, run_id)
+                run_row = self._require_execution_context(
+                    connection,
+                    run_id=run_id,
+                    execution_context=execution_context,
+                )
                 if run_row["execution_status"] != ExecutionStatus.ACTIVE.value:
                     raise RunStateConflictError(f"run {run_id} is terminal")
                 response_row = connection.execute(
@@ -1165,6 +1286,7 @@ class SQLiteEventStore:
             except BaseException:
                 connection.execute("ROLLBACK")
                 raise
+        self._advance_execution_context(execution_context, proposal_event.seq)
         return self._tool_call_from_row(row, proposal_event=proposal_event)
 
     def get_tool_call(self, tool_call_id: str) -> ToolCallRecord:
@@ -1206,6 +1328,7 @@ class SQLiteEventStore:
         tool_call_id: str,
         policy: str,
         process_instance_id: str,
+        execution_context: ExecutionContext | None = None,
     ) -> ApprovalRecord:
         """Create at most one pending approval for the call's exact fingerprint."""
 
@@ -1220,6 +1343,11 @@ class SQLiteEventStore:
                 ).fetchone()
                 if tool_row is None:
                     raise ToolCallConflictError(f"unknown tool call: {tool_call_id}")
+                run_row = self._require_execution_context(
+                    connection,
+                    run_id=tool_row["run_id"],
+                    execution_context=execution_context,
+                )
                 existing = connection.execute(
                     """
                     SELECT * FROM approvals
@@ -1236,7 +1364,6 @@ class SQLiteEventStore:
                         f"tool call {tool_call_id} is not awaiting a new approval request"
                     )
 
-                run_row = self._require_run_row(connection, tool_row["run_id"])
                 approval_id = str(new_uuid7())
                 requested_at = datetime.now(timezone.utc)
                 connection.execute(
@@ -1285,6 +1412,7 @@ class SQLiteEventStore:
             except BaseException:
                 connection.execute("ROLLBACK")
                 raise
+        self._advance_execution_context(execution_context, event.seq)
         return self._approval_from_row(row, event=event)
 
     def get_approval(self, approval_id: str) -> ApprovalRecord:
@@ -1318,6 +1446,7 @@ class SQLiteEventStore:
         actor: str,
         reason: str,
         process_instance_id: str,
+        execution_context: ExecutionContext | None = None,
     ) -> ApprovalRecord:
         """Apply one durable decision without allowing stale UI approvals."""
 
@@ -1334,6 +1463,12 @@ class SQLiteEventStore:
                 ).fetchone()
                 if approval_row is None:
                     raise ApprovalConflictError(f"unknown approval: {approval_id}")
+                if execution_context is not None:
+                    self._require_execution_context(
+                        connection,
+                        run_id=approval_row["run_id"],
+                        execution_context=execution_context,
+                    )
                 if approval_row["fingerprint"] != expected_fingerprint:
                     raise ApprovalConflictError("approval fingerprint is stale")
                 if approval_row["decision"] is not None:
@@ -1398,6 +1533,7 @@ class SQLiteEventStore:
             except BaseException:
                 connection.execute("ROLLBACK")
                 raise
+        self._advance_execution_context(execution_context, event.seq)
         return self._approval_from_row(row, event=event)
 
     @staticmethod
@@ -1430,6 +1566,7 @@ class SQLiteEventStore:
         category: str,
         amount: float,
         process_instance_id: str,
+        execution_context: ExecutionContext | None = None,
     ) -> BudgetReservationRecord:
         """Reserve capacity before an external action without oversubscription."""
 
@@ -1440,7 +1577,11 @@ class SQLiteEventStore:
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
-                run_row = self._require_run_row(connection, run_id)
+                run_row = self._require_execution_context(
+                    connection,
+                    run_id=run_id,
+                    execution_context=execution_context,
+                )
                 existing = connection.execute(
                     "SELECT * FROM budget_reservations WHERE reservation_id = ?",
                     (reservation_id,),
@@ -1508,6 +1649,7 @@ class SQLiteEventStore:
             except BaseException:
                 connection.execute("ROLLBACK")
                 raise
+        self._advance_execution_context(execution_context, event.seq)
         return self._budget_reservation_from_row(row, event=event)
 
     def settle_budget(
@@ -1516,6 +1658,7 @@ class SQLiteEventStore:
         reservation_id: str,
         consumed: float,
         process_instance_id: str,
+        execution_context: ExecutionContext | None = None,
     ) -> BudgetReservationRecord:
         """Settle a reservation once and monotonically update consumed budget."""
 
@@ -1531,6 +1674,11 @@ class SQLiteEventStore:
                 if reservation_row is None:
                     raise BudgetLimitError(f"unknown reservation: {reservation_id}")
                 record = self._budget_reservation_from_row(reservation_row, event=None)
+                run_row = self._require_execution_context(
+                    connection,
+                    run_id=record.run_id,
+                    execution_context=execution_context,
+                )
                 if record.state == "settled":
                     if record.consumed != consumed:
                         raise BudgetLimitError("reservation already settled with a different amount")
@@ -1538,7 +1686,6 @@ class SQLiteEventStore:
                     return record
                 if consumed > record.reserved:
                     raise BudgetLimitError("consumed amount exceeds the reservation")
-                run_row = self._require_run_row(connection, record.run_id)
                 totals = json.loads(run_row["budget_consumed_json"])
                 totals[record.category] = totals.get(record.category, 0) + consumed
                 connection.execute(
@@ -1582,6 +1729,7 @@ class SQLiteEventStore:
             except BaseException:
                 connection.execute("ROLLBACK")
                 raise
+        self._advance_execution_context(execution_context, event.seq)
         return self._budget_reservation_from_row(row, event=event)
 
     def request_cancellation(
@@ -1636,6 +1784,7 @@ class SQLiteEventStore:
         executor_identity: dict[str, Any],
         process_instance_id: str,
         attempt_id: str | None = None,
+        execution_context: ExecutionContext | None = None,
     ) -> ToolAttemptRecord:
         """Persist dispatch intent before any tool side effect occurs."""
 
@@ -1663,7 +1812,11 @@ class SQLiteEventStore:
                     return record
                 if ToolCallState(tool_row["state"]) != ToolCallState.READY:
                     raise ToolCallConflictError("tool call is not ready for dispatch")
-                run_row = self._require_run_row(connection, tool_row["run_id"])
+                run_row = self._require_execution_context(
+                    connection,
+                    run_id=tool_row["run_id"],
+                    execution_context=execution_context,
+                )
                 if run_row["cancel_requested_at"] is not None:
                     raise ToolCallConflictError("run cancellation was requested")
                 attempt_no = connection.execute(
@@ -1731,6 +1884,7 @@ class SQLiteEventStore:
             except BaseException:
                 connection.execute("ROLLBACK")
                 raise
+        self._advance_execution_context(execution_context, event.seq)
         return self._tool_attempt_from_row(row, event=event)
 
     def finish_tool_attempt(
@@ -1744,6 +1898,7 @@ class SQLiteEventStore:
         output_media_type: str = "text/plain; charset=utf-8",
         error: dict[str, Any] | None = None,
         retryable: bool = False,
+        execution_context: ExecutionContext | None = None,
     ) -> ToolAttemptRecord:
         """Commit one terminal attempt result and the tool-call projection together."""
 
@@ -1771,7 +1926,11 @@ class SQLiteEventStore:
                     "SELECT * FROM tool_calls WHERE tool_call_id = ?",
                     (existing.tool_call_id,),
                 ).fetchone()
-                run_row = self._require_run_row(connection, tool_row["run_id"])
+                run_row = self._require_execution_context(
+                    connection,
+                    run_id=tool_row["run_id"],
+                    execution_context=execution_context,
+                )
                 output_blob = None
                 if output is not None:
                     raw = output.encode("utf-8") if isinstance(output, str) else bytes(output)
@@ -1852,6 +2011,7 @@ class SQLiteEventStore:
             except BaseException:
                 connection.execute("ROLLBACK")
                 raise
+        self._advance_execution_context(execution_context, event.seq)
         return self._tool_attempt_from_row(row, event=event)
 
     @staticmethod
@@ -1957,6 +2117,7 @@ class SQLiteEventStore:
         next_phase: RunPhase,
         reason: str,
         process_instance_id: str,
+        execution_context: ExecutionContext | None = None,
     ) -> RunProjection:
         """Append a phase fact only if the caller observed the current projection."""
 
@@ -1965,7 +2126,11 @@ class SQLiteEventStore:
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
-                row = self._require_run_row(connection, run_id)
+                row = self._require_execution_context(
+                    connection,
+                    run_id=run_id,
+                    execution_context=execution_context,
+                )
                 projection = reduce_run_events(
                     self._load_run_events_in_transaction(connection, run_id)
                 )
@@ -2000,6 +2165,7 @@ class SQLiteEventStore:
             except BaseException:
                 connection.execute("ROLLBACK")
                 raise
+        self._advance_execution_context(execution_context, event.seq)
         return replace(projection, phase=next_phase, last_event_seq=event.seq)
 
     def complete_run(
@@ -2008,13 +2174,18 @@ class SQLiteEventStore:
         run_id: str,
         verification_status: Literal["passed", "failed", "not_configured"],
         process_instance_id: str,
+        execution_context: ExecutionContext | None = None,
     ) -> RunProjection:
         """Persist the single successful terminal transition for a run."""
 
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
-                row = self._require_run_row(connection, run_id)
+                row = self._require_execution_context(
+                    connection,
+                    run_id=run_id,
+                    execution_context=execution_context,
+                )
                 projection = reduce_run_events(
                     self._load_run_events_in_transaction(connection, run_id)
                 )
@@ -2052,6 +2223,7 @@ class SQLiteEventStore:
             except BaseException:
                 connection.execute("ROLLBACK")
                 raise
+        self._advance_execution_context(execution_context, event.seq)
         return replace(
             projection,
             execution_status=ExecutionStatus.COMPLETED,
@@ -2066,6 +2238,7 @@ class SQLiteEventStore:
         execution_status: ExecutionStatus,
         reason: str,
         process_instance_id: str,
+        execution_context: ExecutionContext | None = None,
     ) -> RunProjection:
         """Commit one non-success terminal or needs-attention outcome."""
 
@@ -2080,7 +2253,11 @@ class SQLiteEventStore:
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
-                row = self._require_run_row(connection, run_id)
+                row = self._require_execution_context(
+                    connection,
+                    run_id=run_id,
+                    execution_context=execution_context,
+                )
                 projection = reduce_run_events(
                     self._load_run_events_in_transaction(connection, run_id)
                 )
@@ -2125,6 +2302,7 @@ class SQLiteEventStore:
             except BaseException:
                 connection.execute("ROLLBACK")
                 raise
+        self._advance_execution_context(execution_context, event.seq)
         return replace(
             projection,
             execution_status=execution_status,
@@ -2226,10 +2404,17 @@ class SQLiteEventStore:
         run_id: str | None = None,
         causation_event_id: str | None = None,
         correlation_id: str | None = None,
+        execution_context: ExecutionContext | None = None,
     ) -> EventEnvelope:
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
+                if run_id is not None:
+                    self._require_execution_context(
+                        connection,
+                        run_id=run_id,
+                        execution_context=execution_context,
+                    )
                 event = self._append_event_in_transaction(
                     connection,
                     session_id=session_id,
@@ -2240,10 +2425,17 @@ class SQLiteEventStore:
                     causation_event_id=causation_event_id,
                     correlation_id=correlation_id,
                 )
+                if run_id is not None:
+                    connection.execute(
+                        "UPDATE runs SET last_event_seq = ? WHERE run_id = ?",
+                        (event.seq, run_id),
+                    )
                 connection.execute("COMMIT")
             except BaseException:
                 connection.execute("ROLLBACK")
                 raise
+        if run_id is not None:
+            self._advance_execution_context(execution_context, event.seq)
         return event
 
     def _append_event_in_transaction(

@@ -8,6 +8,7 @@ from typing import Literal
 
 from forge_replay.domain import (
     ApprovalDecision,
+    ExecutionContext,
     ExecutionStatus,
     RunPhase,
     ToolCallState,
@@ -85,15 +86,24 @@ class DurableAgentRuntime:
             run_id=run_id,
             owner=self.process_instance_id,
         )
+        projection = self.store.get_run_projection(run_id)
+        execution_context = ExecutionContext(
+            run_id=run_id,
+            worker_id=self.process_instance_id,
+            lease_epoch=lease.epoch,
+            lease_expires_at=lease.expires_at,
+            stream_version=projection.last_event_seq,
+        )
         try:
             try:
-                return self._run_with_lease(run_id)
+                return self._run_with_lease(run_id, execution_context)
             except BudgetLimitError as exc:
                 self.store.terminate_run(
                     run_id=run_id,
                     execution_status=ExecutionStatus.BUDGET_EXCEEDED,
                     reason=str(exc),
                     process_instance_id=self.process_instance_id,
+                    execution_context=execution_context,
                 )
                 return AgentOutcome(status="budget_exceeded", detail=str(exc))
             except ModelInvocationError as exc:
@@ -102,6 +112,7 @@ class DurableAgentRuntime:
                     execution_status=ExecutionStatus.NEEDS_ATTENTION,
                     reason=str(exc),
                     process_instance_id=self.process_instance_id,
+                    execution_context=execution_context,
                 )
                 return AgentOutcome(status="needs_attention", detail=str(exc))
         finally:
@@ -112,7 +123,11 @@ class DurableAgentRuntime:
                 # mutate or release that lease.
                 pass
 
-    def _run_with_lease(self, run_id: str) -> AgentOutcome:
+    def _run_with_lease(
+        self,
+        run_id: str,
+        execution_context: ExecutionContext,
+    ) -> AgentOutcome:
         projection = self.store.get_run_projection(run_id)
         if projection.execution_status.value == "completed":
             return AgentOutcome(status="completed", detail="run was already completed")
@@ -132,26 +147,28 @@ class DurableAgentRuntime:
                 next_phase=RunPhase.AWAITING_MODEL,
                 reason="runtime ready for model",
                 process_instance_id=self.process_instance_id,
+                execution_context=execution_context,
             )
 
         for step in range(self.max_steps):
-            self._renew_lease(run_id)
+            self._renew_lease(execution_context)
             if self.store.is_cancellation_requested(run_id):
                 self.store.terminate_run(
                     run_id=run_id,
                     execution_status=ExecutionStatus.CANCELLED,
                     reason="durable cancellation observed by runtime",
                     process_instance_id=self.process_instance_id,
+                    execution_context=execution_context,
                 )
                 return AgentOutcome(status="cancelled", detail="cancellation requested")
             pending = self._latest_unfinished_tool(run_id)
             if pending is not None:
-                outcome = self._continue_tool(run_id, pending)
+                outcome = self._continue_tool(run_id, pending, execution_context)
                 if outcome is not None:
                     return outcome
                 continue
 
-            response_event, raw = self._call_model(run_id, step)
+            response_event, raw = self._call_model(run_id, step, execution_context)
             kind, payload = MiniAgent.parse(raw)
             if kind == "retry":
                 projection = self.store.get_run_projection(run_id)
@@ -165,6 +182,7 @@ class DurableAgentRuntime:
                         response_event_id=str(response_event.event_id),
                         reason=str(payload)[:1000],
                     ),
+                    execution_context=execution_context,
                 )
                 continue
             if kind == "final":
@@ -177,11 +195,13 @@ class DurableAgentRuntime:
                     run_id=run_id,
                     process_instance_id=self.process_instance_id,
                     payload=FinalAnswerCommittedPayload(answer_blob_sha256=blob.sha256),
+                    execution_context=execution_context,
                 )
                 self.store.complete_run(
                     run_id=run_id,
                     verification_status="not_configured",
                     process_instance_id=self.process_instance_id,
+                    execution_context=execution_context,
                 )
                 return AgentOutcome(status="completed", final_answer=answer)
 
@@ -203,6 +223,7 @@ class DurableAgentRuntime:
                         response_event_id=str(response_event.event_id),
                         reason=f"invalid tool call: {type(exc).__name__}: {exc}",
                     ),
+                    execution_context=execution_context,
                 )
                 continue
             call = self.store.propose_tool_call(
@@ -215,14 +236,24 @@ class DurableAgentRuntime:
                 effect_class=effect,
                 target_paths=targets,
                 process_instance_id=self.process_instance_id,
+                execution_context=execution_context,
             )
-            outcome = self._continue_tool(run_id, call.tool_call_id)
+            outcome = self._continue_tool(
+                run_id,
+                call.tool_call_id,
+                execution_context,
+            )
             if outcome is not None:
                 return outcome
         return AgentOutcome(status="step_limit", detail=f"reached {self.max_steps} steps")
 
-    def _call_model(self, run_id: str, step: int):
-        self._renew_lease(run_id)
+    def _call_model(
+        self,
+        run_id: str,
+        step: int,
+        execution_context: ExecutionContext,
+    ):
+        self._renew_lease(execution_context)
         projection = self.store.get_run_projection(run_id)
         reservation_id = f"model-{new_uuid7()}"
         reserved = False
@@ -233,6 +264,7 @@ class DurableAgentRuntime:
                 category="model_calls",
                 amount=1,
                 process_instance_id=self.process_instance_id,
+                execution_context=execution_context,
             )
             reserved = True
         model_call_id = str(new_uuid7())
@@ -246,6 +278,7 @@ class DurableAgentRuntime:
                 model_name=self.model.name,
                 attempt_no=1,
             ),
+            execution_context=execution_context,
         )
         try:
             result = self.model.complete(
@@ -264,12 +297,14 @@ class DurableAgentRuntime:
                     error_class=type(exc).__name__,
                     retryable=False,
                 ),
+                execution_context=execution_context,
             )
             if reserved:
                 self.store.settle_budget(
                     reservation_id=reservation_id,
                     consumed=1,
                     process_instance_id=self.process_instance_id,
+                    execution_context=execution_context,
                 )
             raise ModelInvocationError(
                 f"model provider failed after durable error recording: {type(exc).__name__}: {exc}"
@@ -287,23 +322,31 @@ class DurableAgentRuntime:
                 input_tokens=result.input_tokens,
                 output_tokens=result.output_tokens,
             ),
+            execution_context=execution_context,
         )
         if reserved:
             self.store.settle_budget(
                 reservation_id=reservation_id,
                 consumed=1,
                 process_instance_id=self.process_instance_id,
+                execution_context=execution_context,
             )
         return event, result.text
 
-    def _continue_tool(self, run_id: str, tool_call_id: str) -> AgentOutcome | None:
-        self._renew_lease(run_id)
+    def _continue_tool(
+        self,
+        run_id: str,
+        tool_call_id: str,
+        execution_context: ExecutionContext,
+    ) -> AgentOutcome | None:
+        self._renew_lease(execution_context)
         call = self.store.get_tool_call(tool_call_id)
         if call.state == ToolCallState.PROPOSED:
             approval = self.store.request_tool_approval(
                 tool_call_id=tool_call_id,
                 policy="runtime-policy-v1",
                 process_instance_id=self.process_instance_id,
+                execution_context=execution_context,
             )
             auto = (
                 call.effect_class == ToolEffectClass.DETECTABLE_IDEMPOTENT
@@ -325,6 +368,7 @@ class DurableAgentRuntime:
                 actor="runtime:auto-policy",
                 reason="explicit runtime auto-approval configuration",
                 process_instance_id=self.process_instance_id,
+                execution_context=execution_context,
             )
             call = self.store.get_tool_call(tool_call_id)
         if call.state == ToolCallState.WAITING_APPROVAL:
@@ -338,9 +382,15 @@ class DurableAgentRuntime:
             return None
         if call.state == ToolCallState.READY:
             if call.tool_name in {"read_file", "list_files", "search", "write_file", "patch_file"}:
-                result = self.file_executor.execute(tool_call_id)
+                result = self.file_executor.execute(
+                    tool_call_id,
+                    execution_context=execution_context,
+                )
             elif call.tool_name == "run_process":
-                result = self.shell_executor.execute(tool_call_id)
+                result = self.shell_executor.execute(
+                    tool_call_id,
+                    execution_context=execution_context,
+                )
             else:
                 return AgentOutcome(status="needs_attention", detail="unsupported tool")
             if result.state == ToolCallState.UNCERTAIN:
@@ -349,6 +399,7 @@ class DurableAgentRuntime:
                     execution_status=ExecutionStatus.NEEDS_ATTENTION,
                     reason="tool outcome is uncertain",
                     process_instance_id=self.process_instance_id,
+                    execution_context=execution_context,
                 )
                 return AgentOutcome(
                     status="needs_attention", tool_call_id=tool_call_id, detail="tool uncertain"
@@ -366,15 +417,22 @@ class DurableAgentRuntime:
                     detail="dispatched tool has ambiguous attempt state",
                 )
             if call.tool_name in {"read_file", "list_files", "search", "write_file", "patch_file"}:
-                result = self.file_executor.recover(attempts[0].attempt_id)
+                result = self.file_executor.recover(
+                    attempts[0].attempt_id,
+                    execution_context=execution_context,
+                )
             else:
-                result = self.shell_executor.recover(attempts[0].attempt_id)
+                result = self.shell_executor.recover(
+                    attempts[0].attempt_id,
+                    execution_context=execution_context,
+                )
             if result.state == ToolCallState.UNCERTAIN:
                 self.store.terminate_run(
                     run_id=run_id,
                     execution_status=ExecutionStatus.NEEDS_ATTENTION,
                     reason="recovered tool outcome is uncertain",
                     process_instance_id=self.process_instance_id,
+                    execution_context=execution_context,
                 )
                 return AgentOutcome(
                     status="needs_attention",
@@ -383,13 +441,15 @@ class DurableAgentRuntime:
                 )
         return None
 
-    def _renew_lease(self, run_id: str) -> None:
+    def _renew_lease(self, execution_context: ExecutionContext) -> None:
         """Renew before every bounded external action or loop iteration."""
 
-        self.store.acquire_run_lease(
-            run_id=run_id,
-            owner=self.process_instance_id,
+        renewed = self.store.renew_run_lease(execution_context)
+        execution_context.renew(
+            expires_at=renewed.expires_at,
+            lease_epoch=renewed.epoch,
         )
+        self.store.synchronize_execution_context(execution_context)
 
     def _latest_unfinished_tool(self, run_id: str) -> str | None:
         events = self.store.load_run_events(run_id)

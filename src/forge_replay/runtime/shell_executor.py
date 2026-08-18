@@ -7,6 +7,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
+from forge_replay.domain import ExecutionContext
 from forge_replay.persistence import ToolAttemptRecord
 from forge_replay.ports import ToolExecutionStorePort
 from forge_replay.runtime.file_executor import ExecutionHook
@@ -32,7 +33,12 @@ class DurableShellExecutor:
         self.process_instance_id = process_instance_id
         self.hook = hook
 
-    def execute(self, tool_call_id: str) -> ToolAttemptRecord:
+    def execute(
+        self,
+        tool_call_id: str,
+        *,
+        execution_context: ExecutionContext | None = None,
+    ) -> ToolAttemptRecord:
         call = self.store.get_tool_call(tool_call_id)
         if call.tool_name != "run_process":
             raise ValueError(f"unsupported process tool: {call.tool_name}")
@@ -49,6 +55,7 @@ class DurableShellExecutor:
             action_plan=action_plan,
             executor_identity={"kind": "process_supervisor", "version": 1},
             process_instance_id=self.process_instance_id,
+            execution_context=execution_context,
         )
         self._hook("after_dispatch_before_process_start", {"attempt_id": attempt.attempt_id})
         try:
@@ -76,6 +83,7 @@ class DurableShellExecutor:
                 output=output,
                 output_media_type="application/json",
                 process_instance_id=self.process_instance_id,
+                execution_context=execution_context,
             )
         except Exception as exc:  # noqa: BLE001 - process failures become durable results.
             return self.store.finish_tool_attempt(
@@ -83,9 +91,15 @@ class DurableShellExecutor:
                 outcome="failed",
                 error={"class": type(exc).__name__, "message": str(exc)},
                 process_instance_id=self.process_instance_id,
+                execution_context=execution_context,
             )
 
-    def recover(self, attempt_id: str) -> ToolAttemptRecord:
+    def recover(
+        self,
+        attempt_id: str,
+        *,
+        execution_context: ExecutionContext | None = None,
+    ) -> ToolAttemptRecord:
         attempt = self.store.get_tool_attempt(attempt_id)
         if attempt.state.value != "dispatched":
             return attempt
@@ -99,6 +113,7 @@ class DurableShellExecutor:
                 )
             },
             process_instance_id=self.process_instance_id,
+            execution_context=execution_context,
         )
 
     def _cwd(self, relative: str | None) -> Path:

@@ -185,16 +185,24 @@ def test_model_failure_is_recorded_and_becomes_needs_attention(tmp_path):
 
 def test_runtime_renews_lease_before_bounded_actions(tmp_path, monkeypatch):
     _, store, runtime = build_runtime(tmp_path, ["<final>done</final>"])
-    original = store.acquire_run_lease
-    calls = []
+    original_acquire = store.acquire_run_lease
+    original_renew = store.renew_run_lease
+    acquisitions = []
+    renewals = []
 
     def counting_acquire(**kwargs):
-        calls.append(kwargs["run_id"])
-        return original(**kwargs)
+        acquisitions.append(kwargs["run_id"])
+        return original_acquire(**kwargs)
+
+    def counting_renew(execution_context, **kwargs):
+        renewals.append(execution_context.run_id)
+        return original_renew(execution_context, **kwargs)
 
     monkeypatch.setattr(store, "acquire_run_lease", counting_acquire)
+    monkeypatch.setattr(store, "renew_run_lease", counting_renew)
     assert runtime.run("run-1").status == "completed"
-    assert len(calls) >= 3
+    assert acquisitions == ["run-1"]
+    assert len(renewals) >= 2
 
 
 def test_runtime_can_remove_process_tool_from_model_contract(tmp_path):

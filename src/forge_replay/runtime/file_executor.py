@@ -7,6 +7,7 @@ from collections.abc import Callable
 from dataclasses import asdict
 from typing import Any
 
+from forge_replay.domain import ExecutionContext
 from forge_replay.persistence import ToolAttemptRecord
 from forge_replay.ports import ToolExecutionStorePort
 from forge_replay.tools import (
@@ -35,7 +36,12 @@ class DurableFileExecutor:
         self.process_instance_id = process_instance_id
         self.hook = hook
 
-    def execute(self, tool_call_id: str) -> ToolAttemptRecord:
+    def execute(
+        self,
+        tool_call_id: str,
+        *,
+        execution_context: ExecutionContext | None = None,
+    ) -> ToolAttemptRecord:
         call = self.store.get_tool_call(tool_call_id)
         args = json.loads(call.args_json)
         try:
@@ -49,6 +55,7 @@ class DurableFileExecutor:
                 },
                 executor_identity={"kind": "in_process_file_executor", "version": 1},
                 process_instance_id=self.process_instance_id,
+                execution_context=execution_context,
             )
             return self.store.finish_tool_attempt(
                 attempt_id=attempt.attempt_id,
@@ -56,31 +63,64 @@ class DurableFileExecutor:
                 error={"class": type(exc).__name__, "message": str(exc)},
                 retryable=False,
                 process_instance_id=self.process_instance_id,
+                execution_context=execution_context,
             )
         attempt = self.store.dispatch_tool_call(
             tool_call_id=tool_call_id,
             action_plan=action_plan,
             executor_identity={"kind": "in_process_file_executor", "version": 1},
             process_instance_id=self.process_instance_id,
+            execution_context=execution_context,
         )
         self._hook("after_dispatch_before_effect", {"attempt_id": attempt.attempt_id})
-        return self._execute_dispatched(attempt, call.tool_name, args, mutation_plan)
+        return self._execute_dispatched(
+            attempt,
+            call.tool_name,
+            args,
+            mutation_plan,
+            execution_context,
+        )
 
-    def recover(self, attempt_id: str) -> ToolAttemptRecord:
+    def recover(
+        self,
+        attempt_id: str,
+        *,
+        execution_context: ExecutionContext | None = None,
+    ) -> ToolAttemptRecord:
         attempt = self.store.get_tool_attempt(attempt_id)
         call = self.store.get_tool_call(attempt.tool_call_id)
         if attempt.state.value != "dispatched":
             return attempt
         args = json.loads(call.args_json)
         if call.tool_name in {"read_file", "list_files", "search"}:
-            return self._execute_dispatched(attempt, call.tool_name, args, None)
+            return self._execute_dispatched(
+                attempt,
+                call.tool_name,
+                args,
+                None,
+                execution_context,
+            )
         if call.action_plan is None:
-            return self._uncertain(attempt, "durable file action plan is missing")
+            return self._uncertain(
+                attempt,
+                "durable file action plan is missing",
+                execution_context,
+            )
         plan = self._restore_plan(call.action_plan)
         decision = self.tools.reconcile(plan)
         if decision == FileReconcileDecision.CONFLICT:
-            return self._uncertain(attempt, "workspace no longer matches pre or post hash")
-        return self._execute_dispatched(attempt, call.tool_name, args, plan)
+            return self._uncertain(
+                attempt,
+                "workspace no longer matches pre or post hash",
+                execution_context,
+            )
+        return self._execute_dispatched(
+            attempt,
+            call.tool_name,
+            args,
+            plan,
+            execution_context,
+        )
 
     def _execute_dispatched(
         self,
@@ -88,6 +128,7 @@ class DurableFileExecutor:
         tool_name: str,
         args: dict[str, Any],
         mutation_plan: FileMutationPlan | None,
+        execution_context: ExecutionContext | None,
     ) -> ToolAttemptRecord:
         try:
             if tool_name == "read_file":
@@ -115,6 +156,7 @@ class DurableFileExecutor:
                 receipt=receipt,
                 output=output,
                 process_instance_id=self.process_instance_id,
+                execution_context=execution_context,
             )
         except FileConflictError as exc:
             return self.store.finish_tool_attempt(
@@ -122,6 +164,7 @@ class DurableFileExecutor:
                 outcome="uncertain",
                 error={"evidence": str(exc)},
                 process_instance_id=self.process_instance_id,
+                execution_context=execution_context,
             )
         except Exception as exc:  # noqa: BLE001 - tool failures become durable typed results.
             return self.store.finish_tool_attempt(
@@ -130,6 +173,7 @@ class DurableFileExecutor:
                 error={"class": type(exc).__name__, "message": str(exc)},
                 retryable=False,
                 process_instance_id=self.process_instance_id,
+                execution_context=execution_context,
             )
 
     def _plan(
@@ -175,12 +219,18 @@ class DurableFileExecutor:
             parent_identity=FileIdentity(**serialized["parent_identity"]),
         )
 
-    def _uncertain(self, attempt: ToolAttemptRecord, evidence: str) -> ToolAttemptRecord:
+    def _uncertain(
+        self,
+        attempt: ToolAttemptRecord,
+        evidence: str,
+        execution_context: ExecutionContext | None,
+    ) -> ToolAttemptRecord:
         return self.store.finish_tool_attempt(
             attempt_id=attempt.attempt_id,
             outcome="uncertain",
             error={"evidence": evidence},
             process_instance_id=self.process_instance_id,
+            execution_context=execution_context,
         )
 
     def _hook(self, stage: str, context: dict[str, Any]) -> None:
