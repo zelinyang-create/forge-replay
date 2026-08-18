@@ -18,6 +18,8 @@ class EventType(str, Enum):
     MODEL_CALL_STARTED = "model_call_started"
     MODEL_RESPONSE_RECEIVED = "model_response_received"
     TOOL_CALL_PROPOSED = "tool_call_proposed"
+    APPROVAL_REQUESTED = "approval_requested"
+    APPROVAL_DECIDED = "approval_decided"
     TOOL_EXECUTION_DISPATCHED = "tool_execution_dispatched"
     TOOL_EXECUTION_SUCCEEDED = "tool_execution_succeeded"
     TOOL_EXECUTION_FAILED = "tool_execution_failed"
@@ -82,6 +84,23 @@ class ToolCallProposedPayload(EventPayload):
     tool_version: str
     args_sha256: str
     effect_class: ToolEffectClass
+
+
+class ApprovalRequestedPayload(EventPayload):
+    event_type: Literal[EventType.APPROVAL_REQUESTED] = EventType.APPROVAL_REQUESTED
+    approval_id: str
+    tool_call_id: str
+    fingerprint: str
+    policy: str
+
+
+class ApprovalDecidedPayload(EventPayload):
+    event_type: Literal[EventType.APPROVAL_DECIDED] = EventType.APPROVAL_DECIDED
+    approval_id: str
+    tool_call_id: str
+    fingerprint: str
+    decision: str
+    actor: str
 
 
 class ToolExecutionDispatchedPayload(EventPayload):
@@ -157,6 +176,8 @@ RuntimeEventPayload = Annotated[
     | ModelCallStartedPayload
     | ModelResponseReceivedPayload
     | ToolCallProposedPayload
+    | ApprovalRequestedPayload
+    | ApprovalDecidedPayload
     | ToolExecutionDispatchedPayload
     | ToolExecutionSucceededPayload
     | ToolExecutionFailedPayload

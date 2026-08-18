@@ -1,6 +1,8 @@
 """SQLite-backed durable event storage."""
 
 from forge_replay.persistence.store import (
+    ApprovalConflictError,
+    ApprovalRecord,
     BlobLimits,
     BlobMetadataConflictError,
     BlobQuotaExceededError,
@@ -19,6 +21,8 @@ from forge_replay.persistence.store import (
 )
 
 __all__ = [
+    "ApprovalConflictError",
+    "ApprovalRecord",
     "BlobLimits",
     "BlobMetadataConflictError",
     "BlobQuotaExceededError",

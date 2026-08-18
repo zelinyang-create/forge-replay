@@ -131,6 +131,7 @@ def test_schema_initialization_is_idempotent(tmp_path):
         ).fetchall()
 
     assert first.path == second.path
-    assert len(migrations) == 1
+    assert len(migrations) == 2
     assert migrations[0]["version"] == 1
     assert len(migrations[0]["checksum"]) == 64
+    assert migrations[1]["version"] == 2

@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from forge_replay.domain import (
+    ApprovalDecision,
     ExecutionStatus,
     RunPhase,
     ToolCallState,
@@ -19,6 +20,8 @@ from forge_replay.domain import (
     can_transition_execution,
 )
 from forge_replay.events import (
+    ApprovalDecidedPayload,
+    ApprovalRequestedPayload,
     CheckpointCommittedPayload,
     EventEnvelope,
     ModelResponseReceivedPayload,
@@ -81,6 +84,10 @@ class RunStateConflictError(LedgerError):
 
 class ToolCallConflictError(LedgerError):
     """Raised when one model response ordinal is reused with different content."""
+
+
+class ApprovalConflictError(LedgerError):
+    """Raised when an approval decision is stale or contradicts a durable decision."""
 
 
 @dataclass(frozen=True)
@@ -148,6 +155,21 @@ class ToolCallRecord:
     target_paths: tuple[str, ...]
     policy_version: str
     proposal_event: EventEnvelope | None
+
+
+@dataclass(frozen=True)
+class ApprovalRecord:
+    approval_id: str
+    run_id: str
+    tool_call_id: str
+    fingerprint: str
+    policy: str
+    decision: ApprovalDecision | None
+    requested_at: datetime
+    decided_at: datetime | None
+    actor: str | None
+    reason: str | None
+    event: EventEnvelope | None
 
 
 def canonical_json(value: Any) -> str:
@@ -761,6 +783,206 @@ class SQLiteEventStore:
                 connection.execute("ROLLBACK")
                 raise
         return self._tool_call_from_row(row, proposal_event=proposal_event)
+
+    def request_tool_approval(
+        self,
+        *,
+        tool_call_id: str,
+        policy: str,
+        process_instance_id: str,
+    ) -> ApprovalRecord:
+        """Create at most one pending approval for the call's exact fingerprint."""
+
+        if not policy.strip():
+            raise ValueError("policy must not be empty")
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                tool_row = connection.execute(
+                    "SELECT * FROM tool_calls WHERE tool_call_id = ?",
+                    (tool_call_id,),
+                ).fetchone()
+                if tool_row is None:
+                    raise ToolCallConflictError(f"unknown tool call: {tool_call_id}")
+                existing = connection.execute(
+                    """
+                    SELECT * FROM approvals
+                    WHERE run_id = ? AND subject_type = 'tool_call'
+                      AND subject_id = ? AND fingerprint = ?
+                    """,
+                    (tool_row["run_id"], tool_call_id, tool_row["approval_fingerprint"]),
+                ).fetchone()
+                if existing is not None:
+                    connection.execute("COMMIT")
+                    return self._approval_from_row(existing, event=None)
+                if ToolCallState(tool_row["state"]) != ToolCallState.PROPOSED:
+                    raise ApprovalConflictError(
+                        f"tool call {tool_call_id} is not awaiting a new approval request"
+                    )
+
+                run_row = self._require_run_row(connection, tool_row["run_id"])
+                approval_id = str(new_uuid7())
+                requested_at = datetime.now(timezone.utc)
+                connection.execute(
+                    """
+                    INSERT INTO approvals(
+                        approval_id, run_id, subject_type, subject_id, fingerprint,
+                        policy, requested_at
+                    ) VALUES (?, ?, 'tool_call', ?, ?, ?, ?)
+                    """,
+                    (
+                        approval_id,
+                        tool_row["run_id"],
+                        tool_call_id,
+                        tool_row["approval_fingerprint"],
+                        policy,
+                        requested_at.isoformat(),
+                    ),
+                )
+                connection.execute(
+                    "UPDATE tool_calls SET state = ? WHERE tool_call_id = ?",
+                    (ToolCallState.WAITING_APPROVAL.value, tool_call_id),
+                )
+                event = self._append_event_in_transaction(
+                    connection,
+                    session_id=run_row["session_id"],
+                    turn_id=run_row["turn_id"],
+                    run_id=run_row["run_id"],
+                    process_instance_id=process_instance_id,
+                    correlation_id=run_row["run_id"],
+                    payload=ApprovalRequestedPayload(
+                        approval_id=approval_id,
+                        tool_call_id=tool_call_id,
+                        fingerprint=tool_row["approval_fingerprint"],
+                        policy=policy,
+                    ),
+                )
+                connection.execute(
+                    "UPDATE runs SET last_event_seq = ? WHERE run_id = ?",
+                    (event.seq, run_row["run_id"]),
+                )
+                row = connection.execute(
+                    "SELECT * FROM approvals WHERE approval_id = ?",
+                    (approval_id,),
+                ).fetchone()
+                connection.execute("COMMIT")
+            except BaseException:
+                connection.execute("ROLLBACK")
+                raise
+        return self._approval_from_row(row, event=event)
+
+    def decide_tool_approval(
+        self,
+        *,
+        approval_id: str,
+        expected_fingerprint: str,
+        decision: ApprovalDecision,
+        actor: str,
+        reason: str,
+        process_instance_id: str,
+    ) -> ApprovalRecord:
+        """Apply one durable decision without allowing stale UI approvals."""
+
+        if decision == ApprovalDecision.ALLOW_RUN_SCOPE:
+            raise ApprovalConflictError("run-scoped grants require a separate capability grant")
+        if not actor.strip() or not reason.strip():
+            raise ValueError("approval actor and reason must not be empty")
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                approval_row = connection.execute(
+                    "SELECT * FROM approvals WHERE approval_id = ?",
+                    (approval_id,),
+                ).fetchone()
+                if approval_row is None:
+                    raise ApprovalConflictError(f"unknown approval: {approval_id}")
+                if approval_row["fingerprint"] != expected_fingerprint:
+                    raise ApprovalConflictError("approval fingerprint is stale")
+                if approval_row["decision"] is not None:
+                    existing_decision = ApprovalDecision(approval_row["decision"])
+                    if existing_decision != decision:
+                        raise ApprovalConflictError("approval already has a different decision")
+                    connection.execute("COMMIT")
+                    return self._approval_from_row(approval_row, event=None)
+
+                tool_row = connection.execute(
+                    "SELECT * FROM tool_calls WHERE tool_call_id = ?",
+                    (approval_row["subject_id"],),
+                ).fetchone()
+                if tool_row is None or tool_row["approval_fingerprint"] != expected_fingerprint:
+                    raise ApprovalConflictError("tool call approval context has changed")
+                if ToolCallState(tool_row["state"]) != ToolCallState.WAITING_APPROVAL:
+                    raise ApprovalConflictError("tool call is not waiting for approval")
+
+                next_state = (
+                    ToolCallState.READY
+                    if decision == ApprovalDecision.ALLOW_ONCE
+                    else ToolCallState.DENIED
+                )
+                decided_at = datetime.now(timezone.utc)
+                connection.execute(
+                    """
+                    UPDATE approvals
+                    SET decision = ?, decided_at = ?, actor = ?, reason = ?
+                    WHERE approval_id = ?
+                    """,
+                    (decision.value, decided_at.isoformat(), actor, reason, approval_id),
+                )
+                connection.execute(
+                    "UPDATE tool_calls SET state = ? WHERE tool_call_id = ?",
+                    (next_state.value, tool_row["tool_call_id"]),
+                )
+                run_row = self._require_run_row(connection, approval_row["run_id"])
+                event = self._append_event_in_transaction(
+                    connection,
+                    session_id=run_row["session_id"],
+                    turn_id=run_row["turn_id"],
+                    run_id=run_row["run_id"],
+                    process_instance_id=process_instance_id,
+                    correlation_id=run_row["run_id"],
+                    payload=ApprovalDecidedPayload(
+                        approval_id=approval_id,
+                        tool_call_id=tool_row["tool_call_id"],
+                        fingerprint=expected_fingerprint,
+                        decision=decision.value,
+                        actor=actor,
+                    ),
+                )
+                connection.execute(
+                    "UPDATE runs SET last_event_seq = ? WHERE run_id = ?",
+                    (event.seq, run_row["run_id"]),
+                )
+                row = connection.execute(
+                    "SELECT * FROM approvals WHERE approval_id = ?",
+                    (approval_id,),
+                ).fetchone()
+                connection.execute("COMMIT")
+            except BaseException:
+                connection.execute("ROLLBACK")
+                raise
+        return self._approval_from_row(row, event=event)
+
+    @staticmethod
+    def _approval_from_row(
+        row: sqlite3.Row,
+        *,
+        event: EventEnvelope | None,
+    ) -> ApprovalRecord:
+        return ApprovalRecord(
+            approval_id=row["approval_id"],
+            run_id=row["run_id"],
+            tool_call_id=row["subject_id"],
+            fingerprint=row["fingerprint"],
+            policy=row["policy"],
+            decision=ApprovalDecision(row["decision"]) if row["decision"] else None,
+            requested_at=datetime.fromisoformat(row["requested_at"]),
+            decided_at=(
+                datetime.fromisoformat(row["decided_at"]) if row["decided_at"] else None
+            ),
+            actor=row["actor"],
+            reason=row["reason"],
+            event=event,
+        )
 
     @staticmethod
     def _tool_call_from_row(

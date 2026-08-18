@@ -184,6 +184,15 @@ MIGRATIONS = (
             """,
         ),
     ),
+    Migration(
+        version=2,
+        statements=(
+            """
+            CREATE UNIQUE INDEX approvals_by_subject_fingerprint
+            ON approvals(run_id, subject_type, subject_id, fingerprint)
+            """,
+        ),
+    ),
 )
 
 
