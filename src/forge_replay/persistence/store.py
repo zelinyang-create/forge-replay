@@ -546,6 +546,24 @@ class SQLiteEventStore:
     def get_run_projection(self, run_id: str) -> RunProjection:
         return reduce_run_events(self.load_run_events(run_id))
 
+    def get_run_user_message(self, run_id: str) -> str:
+        with self.connect() as connection:
+            run_row = self._require_run_row(connection, run_id)
+            row = connection.execute(
+                """
+                SELECT events.* FROM turns
+                JOIN events ON events.event_id = turns.user_event_id
+                WHERE turns.turn_id = ?
+                """,
+                (run_row["turn_id"],),
+            ).fetchone()
+        if row is None:
+            raise LedgerIntegrityError(f"run {run_id} has no durable user message")
+        event = self._event_from_row(row)
+        if not isinstance(event.payload, UserMessageReceivedPayload):
+            raise LedgerIntegrityError("turn user event has the wrong payload type")
+        return self.get_blob(event.payload.message_blob_sha256).content.decode("utf-8")
+
     def commit_run_checkpoint(
         self,
         *,

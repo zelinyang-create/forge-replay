@@ -17,6 +17,7 @@ class EventType(str, Enum):
     RUN_PHASE_CHANGED = "run_phase_changed"
     MODEL_CALL_STARTED = "model_call_started"
     MODEL_RESPONSE_RECEIVED = "model_response_received"
+    MODEL_CALL_FAILED = "model_call_failed"
     TOOL_CALL_PROPOSED = "tool_call_proposed"
     APPROVAL_REQUESTED = "approval_requested"
     APPROVAL_DECIDED = "approval_decided"
@@ -29,6 +30,7 @@ class EventType(str, Enum):
     BUDGET_SETTLED = "budget_settled"
     CANCELLATION_REQUESTED = "cancellation_requested"
     RUN_COMPLETED = "run_completed"
+    FINAL_ANSWER_COMMITTED = "final_answer_committed"
     PROJECTION_REBUILT = "projection_rebuilt"
 
 
@@ -76,6 +78,13 @@ class ModelResponseReceivedPayload(EventPayload):
     response_blob_sha256: str
     input_tokens: int | None = Field(default=None, ge=0)
     output_tokens: int | None = Field(default=None, ge=0)
+
+
+class ModelCallFailedPayload(EventPayload):
+    event_type: Literal[EventType.MODEL_CALL_FAILED] = EventType.MODEL_CALL_FAILED
+    model_call_id: str
+    error_class: str
+    retryable: bool
 
 
 class ToolCallProposedPayload(EventPayload):
@@ -170,6 +179,11 @@ class RunCompletedPayload(EventPayload):
     verification_status: Literal["passed", "failed", "not_configured"]
 
 
+class FinalAnswerCommittedPayload(EventPayload):
+    event_type: Literal[EventType.FINAL_ANSWER_COMMITTED] = EventType.FINAL_ANSWER_COMMITTED
+    answer_blob_sha256: str
+
+
 class ProjectionRebuiltPayload(EventPayload):
     event_type: Literal[EventType.PROJECTION_REBUILT] = EventType.PROJECTION_REBUILT
     through_seq: int = Field(ge=1)
@@ -184,6 +198,7 @@ RuntimeEventPayload = Annotated[
     | RunPhaseChangedPayload
     | ModelCallStartedPayload
     | ModelResponseReceivedPayload
+    | ModelCallFailedPayload
     | ToolCallProposedPayload
     | ApprovalRequestedPayload
     | ApprovalDecidedPayload
@@ -196,6 +211,7 @@ RuntimeEventPayload = Annotated[
     | BudgetSettledPayload
     | CancellationRequestedPayload
     | RunCompletedPayload
+    | FinalAnswerCommittedPayload
     | ProjectionRebuiltPayload,
     Field(discriminator="event_type"),
 ]
