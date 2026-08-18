@@ -1,0 +1,593 @@
+{
+  "analysis_population": "all_started_runs_intent_to_treat",
+  "faults": [
+    "before_effect",
+    "after_effect_before_persist"
+  ],
+  "git_sha": "57d9965574ebc390723a1e46e4ff483db54a9e17",
+  "platform": "Windows-11-10.0.26200-SP0",
+  "python": "3.13.12",
+  "raw_runs": [
+    {
+      "duplicate_effects": 0,
+      "fault": "before_effect",
+      "fault_triggered": true,
+      "physical_effects": 0,
+      "recovery_ms": null,
+      "safe_terminal": false,
+      "task_id": "task-000",
+      "tests_passed": false,
+      "variant": "upstream_baseline_adapter"
+    },
+    {
+      "duplicate_effects": 0,
+      "fault": "before_effect",
+      "fault_triggered": true,
+      "physical_effects": 1,
+      "recovery_ms": 23.8717999891378,
+      "safe_terminal": true,
+      "task_id": "task-000",
+      "tests_passed": true,
+      "variant": "hardened"
+    },
+    {
+      "duplicate_effects": 0,
+      "fault": "after_effect_before_persist",
+      "fault_triggered": true,
+      "physical_effects": 1,
+      "recovery_ms": null,
+      "safe_terminal": false,
+      "task_id": "task-000",
+      "tests_passed": true,
+      "variant": "upstream_baseline_adapter"
+    },
+    {
+      "duplicate_effects": 0,
+      "fault": "after_effect_before_persist",
+      "fault_triggered": true,
+      "physical_effects": 1,
+      "recovery_ms": 14.29590000770986,
+      "safe_terminal": true,
+      "task_id": "task-000",
+      "tests_passed": true,
+      "variant": "hardened"
+    },
+    {
+      "duplicate_effects": 0,
+      "fault": "before_effect",
+      "fault_triggered": true,
+      "physical_effects": 0,
+      "recovery_ms": null,
+      "safe_terminal": false,
+      "task_id": "task-001",
+      "tests_passed": false,
+      "variant": "upstream_baseline_adapter"
+    },
+    {
+      "duplicate_effects": 0,
+      "fault": "before_effect",
+      "fault_triggered": true,
+      "physical_effects": 1,
+      "recovery_ms": 21.172399981878698,
+      "safe_terminal": true,
+      "task_id": "task-001",
+      "tests_passed": true,
+      "variant": "hardened"
+    },
+    {
+      "duplicate_effects": 0,
+      "fault": "after_effect_before_persist",
+      "fault_triggered": true,
+      "physical_effects": 1,
+      "recovery_ms": null,
+      "safe_terminal": false,
+      "task_id": "task-001",
+      "tests_passed": true,
+      "variant": "upstream_baseline_adapter"
+    },
+    {
+      "duplicate_effects": 0,
+      "fault": "after_effect_before_persist",
+      "fault_triggered": true,
+      "physical_effects": 1,
+      "recovery_ms": 14.636500010965392,
+      "safe_terminal": true,
+      "task_id": "task-001",
+      "tests_passed": true,
+      "variant": "hardened"
+    },
+    {
+      "duplicate_effects": 0,
+      "fault": "before_effect",
+      "fault_triggered": true,
+      "physical_effects": 0,
+      "recovery_ms": null,
+      "safe_terminal": false,
+      "task_id": "task-002",
+      "tests_passed": false,
+      "variant": "upstream_baseline_adapter"
+    },
+    {
+      "duplicate_effects": 0,
+      "fault": "before_effect",
+      "fault_triggered": true,
+      "physical_effects": 1,
+      "recovery_ms": 24.033399997279048,
+      "safe_terminal": true,
+      "task_id": "task-002",
+      "tests_passed": true,
+      "variant": "hardened"
+    },
+    {
+      "duplicate_effects": 0,
+      "fault": "after_effect_before_persist",
+      "fault_triggered": true,
+      "physical_effects": 1,
+      "recovery_ms": null,
+      "safe_terminal": false,
+      "task_id": "task-002",
+      "tests_passed": true,
+      "variant": "upstream_baseline_adapter"
+    },
+    {
+      "duplicate_effects": 0,
+      "fault": "after_effect_before_persist",
+      "fault_triggered": true,
+      "physical_effects": 1,
+      "recovery_ms": 13.630000001285225,
+      "safe_terminal": true,
+      "task_id": "task-002",
+      "tests_passed": true,
+      "variant": "hardened"
+    },
+    {
+      "duplicate_effects": 0,
+      "fault": "before_effect",
+      "fault_triggered": true,
+      "physical_effects": 0,
+      "recovery_ms": null,
+      "safe_terminal": false,
+      "task_id": "task-003",
+      "tests_passed": false,
+      "variant": "upstream_baseline_adapter"
+    },
+    {
+      "duplicate_effects": 0,
+      "fault": "before_effect",
+      "fault_triggered": true,
+      "physical_effects": 1,
+      "recovery_ms": 20.804400002816692,
+      "safe_terminal": true,
+      "task_id": "task-003",
+      "tests_passed": true,
+      "variant": "hardened"
+    },
+    {
+      "duplicate_effects": 0,
+      "fault": "after_effect_before_persist",
+      "fault_triggered": true,
+      "physical_effects": 1,
+      "recovery_ms": null,
+      "safe_terminal": false,
+      "task_id": "task-003",
+      "tests_passed": true,
+      "variant": "upstream_baseline_adapter"
+    },
+    {
+      "duplicate_effects": 0,
+      "fault": "after_effect_before_persist",
+      "fault_triggered": true,
+      "physical_effects": 1,
+      "recovery_ms": 16.981499997200444,
+      "safe_terminal": true,
+      "task_id": "task-003",
+      "tests_passed": true,
+      "variant": "hardened"
+    },
+    {
+      "duplicate_effects": 0,
+      "fault": "before_effect",
+      "fault_triggered": true,
+      "physical_effects": 0,
+      "recovery_ms": null,
+      "safe_terminal": false,
+      "task_id": "task-004",
+      "tests_passed": false,
+      "variant": "upstream_baseline_adapter"
+    },
+    {
+      "duplicate_effects": 0,
+      "fault": "before_effect",
+      "fault_triggered": true,
+      "physical_effects": 1,
+      "recovery_ms": 23.016099992673844,
+      "safe_terminal": true,
+      "task_id": "task-004",
+      "tests_passed": true,
+      "variant": "hardened"
+    },
+    {
+      "duplicate_effects": 0,
+      "fault": "after_effect_before_persist",
+      "fault_triggered": true,
+      "physical_effects": 1,
+      "recovery_ms": null,
+      "safe_terminal": false,
+      "task_id": "task-004",
+      "tests_passed": true,
+      "variant": "upstream_baseline_adapter"
+    },
+    {
+      "duplicate_effects": 0,
+      "fault": "after_effect_before_persist",
+      "fault_triggered": true,
+      "physical_effects": 1,
+      "recovery_ms": 14.415599987842143,
+      "safe_terminal": true,
+      "task_id": "task-004",
+      "tests_passed": true,
+      "variant": "hardened"
+    },
+    {
+      "duplicate_effects": 0,
+      "fault": "before_effect",
+      "fault_triggered": true,
+      "physical_effects": 0,
+      "recovery_ms": null,
+      "safe_terminal": false,
+      "task_id": "task-005",
+      "tests_passed": false,
+      "variant": "upstream_baseline_adapter"
+    },
+    {
+      "duplicate_effects": 0,
+      "fault": "before_effect",
+      "fault_triggered": true,
+      "physical_effects": 1,
+      "recovery_ms": 19.494200008921325,
+      "safe_terminal": true,
+      "task_id": "task-005",
+      "tests_passed": true,
+      "variant": "hardened"
+    },
+    {
+      "duplicate_effects": 0,
+      "fault": "after_effect_before_persist",
+      "fault_triggered": true,
+      "physical_effects": 1,
+      "recovery_ms": null,
+      "safe_terminal": false,
+      "task_id": "task-005",
+      "tests_passed": true,
+      "variant": "upstream_baseline_adapter"
+    },
+    {
+      "duplicate_effects": 0,
+      "fault": "after_effect_before_persist",
+      "fault_triggered": true,
+      "physical_effects": 1,
+      "recovery_ms": 18.22679999168031,
+      "safe_terminal": true,
+      "task_id": "task-005",
+      "tests_passed": true,
+      "variant": "hardened"
+    },
+    {
+      "duplicate_effects": 0,
+      "fault": "before_effect",
+      "fault_triggered": true,
+      "physical_effects": 0,
+      "recovery_ms": null,
+      "safe_terminal": false,
+      "task_id": "task-006",
+      "tests_passed": false,
+      "variant": "upstream_baseline_adapter"
+    },
+    {
+      "duplicate_effects": 0,
+      "fault": "before_effect",
+      "fault_triggered": true,
+      "physical_effects": 1,
+      "recovery_ms": 20.659099973272532,
+      "safe_terminal": true,
+      "task_id": "task-006",
+      "tests_passed": true,
+      "variant": "hardened"
+    },
+    {
+      "duplicate_effects": 0,
+      "fault": "after_effect_before_persist",
+      "fault_triggered": true,
+      "physical_effects": 1,
+      "recovery_ms": null,
+      "safe_terminal": false,
+      "task_id": "task-006",
+      "tests_passed": true,
+      "variant": "upstream_baseline_adapter"
+    },
+    {
+      "duplicate_effects": 0,
+      "fault": "after_effect_before_persist",
+      "fault_triggered": true,
+      "physical_effects": 1,
+      "recovery_ms": 17.25629999418743,
+      "safe_terminal": true,
+      "task_id": "task-006",
+      "tests_passed": true,
+      "variant": "hardened"
+    },
+    {
+      "duplicate_effects": 0,
+      "fault": "before_effect",
+      "fault_triggered": true,
+      "physical_effects": 0,
+      "recovery_ms": null,
+      "safe_terminal": false,
+      "task_id": "task-007",
+      "tests_passed": false,
+      "variant": "upstream_baseline_adapter"
+    },
+    {
+      "duplicate_effects": 0,
+      "fault": "before_effect",
+      "fault_triggered": true,
+      "physical_effects": 1,
+      "recovery_ms": 18.790400004945695,
+      "safe_terminal": true,
+      "task_id": "task-007",
+      "tests_passed": true,
+      "variant": "hardened"
+    },
+    {
+      "duplicate_effects": 0,
+      "fault": "after_effect_before_persist",
+      "fault_triggered": true,
+      "physical_effects": 1,
+      "recovery_ms": null,
+      "safe_terminal": false,
+      "task_id": "task-007",
+      "tests_passed": true,
+      "variant": "upstream_baseline_adapter"
+    },
+    {
+      "duplicate_effects": 0,
+      "fault": "after_effect_before_persist",
+      "fault_triggered": true,
+      "physical_effects": 1,
+      "recovery_ms": 16.73940001637675,
+      "safe_terminal": true,
+      "task_id": "task-007",
+      "tests_passed": true,
+      "variant": "hardened"
+    },
+    {
+      "duplicate_effects": 0,
+      "fault": "before_effect",
+      "fault_triggered": true,
+      "physical_effects": 0,
+      "recovery_ms": null,
+      "safe_terminal": false,
+      "task_id": "task-008",
+      "tests_passed": false,
+      "variant": "upstream_baseline_adapter"
+    },
+    {
+      "duplicate_effects": 0,
+      "fault": "before_effect",
+      "fault_triggered": true,
+      "physical_effects": 1,
+      "recovery_ms": 32.910200010519475,
+      "safe_terminal": true,
+      "task_id": "task-008",
+      "tests_passed": true,
+      "variant": "hardened"
+    },
+    {
+      "duplicate_effects": 0,
+      "fault": "after_effect_before_persist",
+      "fault_triggered": true,
+      "physical_effects": 1,
+      "recovery_ms": null,
+      "safe_terminal": false,
+      "task_id": "task-008",
+      "tests_passed": true,
+      "variant": "upstream_baseline_adapter"
+    },
+    {
+      "duplicate_effects": 0,
+      "fault": "after_effect_before_persist",
+      "fault_triggered": true,
+      "physical_effects": 1,
+      "recovery_ms": 16.120399988722056,
+      "safe_terminal": true,
+      "task_id": "task-008",
+      "tests_passed": true,
+      "variant": "hardened"
+    },
+    {
+      "duplicate_effects": 0,
+      "fault": "before_effect",
+      "fault_triggered": true,
+      "physical_effects": 0,
+      "recovery_ms": null,
+      "safe_terminal": false,
+      "task_id": "task-009",
+      "tests_passed": false,
+      "variant": "upstream_baseline_adapter"
+    },
+    {
+      "duplicate_effects": 0,
+      "fault": "before_effect",
+      "fault_triggered": true,
+      "physical_effects": 1,
+      "recovery_ms": 36.787500022910535,
+      "safe_terminal": true,
+      "task_id": "task-009",
+      "tests_passed": true,
+      "variant": "hardened"
+    },
+    {
+      "duplicate_effects": 0,
+      "fault": "after_effect_before_persist",
+      "fault_triggered": true,
+      "physical_effects": 1,
+      "recovery_ms": null,
+      "safe_terminal": false,
+      "task_id": "task-009",
+      "tests_passed": true,
+      "variant": "upstream_baseline_adapter"
+    },
+    {
+      "duplicate_effects": 0,
+      "fault": "after_effect_before_persist",
+      "fault_triggered": true,
+      "physical_effects": 1,
+      "recovery_ms": 16.162200015969574,
+      "safe_terminal": true,
+      "task_id": "task-009",
+      "tests_passed": true,
+      "variant": "hardened"
+    },
+    {
+      "duplicate_effects": 0,
+      "fault": "before_effect",
+      "fault_triggered": true,
+      "physical_effects": 0,
+      "recovery_ms": null,
+      "safe_terminal": false,
+      "task_id": "task-010",
+      "tests_passed": false,
+      "variant": "upstream_baseline_adapter"
+    },
+    {
+      "duplicate_effects": 0,
+      "fault": "before_effect",
+      "fault_triggered": true,
+      "physical_effects": 1,
+      "recovery_ms": 50.16689997864887,
+      "safe_terminal": true,
+      "task_id": "task-010",
+      "tests_passed": true,
+      "variant": "hardened"
+    },
+    {
+      "duplicate_effects": 0,
+      "fault": "after_effect_before_persist",
+      "fault_triggered": true,
+      "physical_effects": 1,
+      "recovery_ms": null,
+      "safe_terminal": false,
+      "task_id": "task-010",
+      "tests_passed": true,
+      "variant": "upstream_baseline_adapter"
+    },
+    {
+      "duplicate_effects": 0,
+      "fault": "after_effect_before_persist",
+      "fault_triggered": true,
+      "physical_effects": 1,
+      "recovery_ms": 29.256100009661168,
+      "safe_terminal": true,
+      "task_id": "task-010",
+      "tests_passed": true,
+      "variant": "hardened"
+    },
+    {
+      "duplicate_effects": 0,
+      "fault": "before_effect",
+      "fault_triggered": true,
+      "physical_effects": 0,
+      "recovery_ms": null,
+      "safe_terminal": false,
+      "task_id": "task-011",
+      "tests_passed": false,
+      "variant": "upstream_baseline_adapter"
+    },
+    {
+      "duplicate_effects": 0,
+      "fault": "before_effect",
+      "fault_triggered": true,
+      "physical_effects": 1,
+      "recovery_ms": 51.05780001031235,
+      "safe_terminal": true,
+      "task_id": "task-011",
+      "tests_passed": true,
+      "variant": "hardened"
+    },
+    {
+      "duplicate_effects": 0,
+      "fault": "after_effect_before_persist",
+      "fault_triggered": true,
+      "physical_effects": 1,
+      "recovery_ms": null,
+      "safe_terminal": false,
+      "task_id": "task-011",
+      "tests_passed": true,
+      "variant": "upstream_baseline_adapter"
+    },
+    {
+      "duplicate_effects": 0,
+      "fault": "after_effect_before_persist",
+      "fault_triggered": true,
+      "physical_effects": 1,
+      "recovery_ms": 38.96160001750104,
+      "safe_terminal": true,
+      "task_id": "task-011",
+      "tests_passed": true,
+      "variant": "hardened"
+    }
+  ],
+  "schema_version": 1,
+  "suite": "deterministic_harness_conformance_not_coding_ability",
+  "task_count": 12,
+  "variants": {
+    "hardened": {
+      "by_fault": {
+        "after_effect_before_persist": {
+          "runs": 12,
+          "safe_terminal": 12,
+          "tests_passed": 12
+        },
+        "before_effect": {
+          "runs": 12,
+          "safe_terminal": 12,
+          "tests_passed": 12
+        }
+      },
+      "duplicate_effects": 0,
+      "evaluable": 24,
+      "faults_triggered": 24,
+      "planned": 24,
+      "recovery_ms_p50": 20.07664999109693,
+      "recovery_ms_p95": 38.96160001750104,
+      "runs": 24,
+      "safe_terminal": 24,
+      "started": 24,
+      "tests_passed": 24
+    },
+    "upstream_baseline_adapter": {
+      "by_fault": {
+        "after_effect_before_persist": {
+          "runs": 12,
+          "safe_terminal": 0,
+          "tests_passed": 12
+        },
+        "before_effect": {
+          "runs": 12,
+          "safe_terminal": 0,
+          "tests_passed": 0
+        }
+      },
+      "duplicate_effects": 0,
+      "evaluable": 24,
+      "faults_triggered": 24,
+      "planned": 24,
+      "recovery_ms_p50": null,
+      "recovery_ms_p95": null,
+      "runs": 24,
+      "safe_terminal": 0,
+      "started": 24,
+      "tests_passed": 12
+    }
+  }
+}

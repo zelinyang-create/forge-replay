@@ -7,7 +7,6 @@ __pycache__/
 # Virtual environments
 .venv/
 venv/
-uv.lock
 
 # Packaging
 *.egg-info/
@@ -30,6 +29,13 @@ htmlcov/
 
 # Local scratch space
 tmp/
+
+# Private/local real-model evaluation artifacts. Public reports, patches, model
+# outputs, and run manifests may be committed explicitly.
+benchmarks/results/bailian-smoke*/
+benchmarks/results/bailian-*/report.json
+benchmarks/results/bailian-*/partial-report.json
+benchmarks/results/bailian-*/runs/*/events.json
 
 # OS files
 .DS_Store

@@ -1,0 +1,15 @@
+{
+  "checkpoint_replay_ms_p50": 0.7814,
+  "checkpoint_replay_ms_p95": 1.1234,
+  "checkpoint_tail_events": 200,
+  "event_count": 10000,
+  "full_replay_ms_p50": 41.5784,
+  "full_replay_ms_p95": 45.8279,
+  "git_sha": "57d9965574ebc390723a1e46e4ff483db54a9e17",
+  "iterations": 50,
+  "p50_speedup": 53.210135653954445,
+  "platform": "Windows-11-10.0.26200-SP0",
+  "python": "3.13.12",
+  "schema_version": 1,
+  "suite": "projection_reducer_cpu_microbenchmark_not_end_to_end_resume"
+}

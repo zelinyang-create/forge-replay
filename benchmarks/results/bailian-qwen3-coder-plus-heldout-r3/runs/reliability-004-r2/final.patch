@@ -1,0 +1,20 @@
+diff --git a/solution.py b/solution.py
+index af7bdc3..7ef0ae9 100644
+--- a/solution.py
++++ b/solution.py
+@@ -1,6 +1,13 @@
++import threading
++
+ def once(fn):
+-    value=[]
++    value = []
++    lock = threading.Lock()
++    
+     def wrapped():
+-        if not value: value.append(fn())
++        if not value:
++            with lock:
++                if not value:  # Double-check pattern
++                    value.append(fn())
+         return value[0]
+     return wrapped

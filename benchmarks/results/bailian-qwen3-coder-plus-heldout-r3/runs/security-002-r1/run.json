@@ -1,0 +1,11 @@
+{
+  "base_commit_sha": "a61d3ed10316671104c11f280179f86499a4f277",
+  "catalog_sha256": "250fa50095749ecb6a6a21bf57e88ebd94e958a736ae1883ba9611cb1a23916a",
+  "hidden_tests_passed": false,
+  "model": "qwen3-coder-plus",
+  "outcome": "completed",
+  "provider": "openai-compatible",
+  "repeat": 1,
+  "run_id": "run-01a016c6-d018-73a8-b0c2-533695007fb8",
+  "task_id": "security-002"
+}

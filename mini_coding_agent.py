@@ -10,7 +10,6 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-
 DOC_NAMES = ("AGENTS.md", "README.md", "pyproject.toml", "package.json")
 HELP_TEXT = "/help, /memory, /session, /reset, /exit"
 WELCOME_ART = (
@@ -247,7 +246,9 @@ class MiniAgent:
         self.max_depth = max_depth
         self.read_only = read_only
         self.session = session or {
-            "id": datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6],
+            "id": datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+            + "-"
+            + uuid.uuid4().hex[:6],
             "created_at": now(),
             "workspace_root": workspace.repo_root,
             "history": [],
@@ -660,7 +661,7 @@ class MiniAgent:
 
     @staticmethod
     def parse_xml_tool(raw):
-        match = re.search(r"<tool(?P<attrs>[^>]*)>(?P<body>.*?)</tool>", raw, re.S)
+        match = re.search(r"<tool(?P<attrs>[^>]*)>(?P<body>.*?)</tool>", raw, re.DOTALL)
         if not match:
             return None
         attrs = MiniAgent.parse_attrs(match.group("attrs"))
@@ -775,6 +776,7 @@ class MiniAgent:
             result = subprocess.run(
                 ["rg", "-n", "--smart-case", "--max-count", "200", pattern, str(path)],
                 cwd=self.root,
+                check=False,
                 capture_output=True,
                 text=True,
             )
@@ -803,6 +805,7 @@ class MiniAgent:
         result = subprocess.run(
             command,
             cwd=self.root,
+            check=False,
             shell=True,
             capture_output=True,
             text=True,
@@ -987,7 +990,7 @@ def main(argv=None):
         try:
             user_input = input("\nmini-coding-agent> ").strip()
         except (EOFError, KeyboardInterrupt):
-            print("")
+            print()
             return 0
 
         if not user_input:

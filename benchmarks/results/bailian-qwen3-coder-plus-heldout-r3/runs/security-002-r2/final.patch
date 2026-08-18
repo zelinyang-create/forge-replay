@@ -1,0 +1,13 @@
+diff --git a/solution.py b/solution.py
+index ce61b89..13be71b 100644
+--- a/solution.py
++++ b/solution.py
+@@ -1,2 +1,8 @@
++import re
++
+ def redact(value):
++    if isinstance(value, str):
++        # Redact tokens, passwords, api_keys, etc.
++        redacted = re.sub(r'(?i)(authorization|token|password|api_key)\s*[:=]\s*[\w-]+', r'\1: [REDACTED]', value)
++        return redacted
+     return value

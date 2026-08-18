@@ -1,0 +1,22 @@
+diff --git a/solution.py b/solution.py
+index 8d0edda..59c73b0 100644
+--- a/solution.py
++++ b/solution.py
+@@ -1,3 +1,15 @@
++import re
++
+ def parse_log_line(line):
+-    timestamp, level, message = line.split(':')
+-    return {'timestamp': timestamp, 'level': level, 'message': message}
++    # Match ISO timestamp followed by colon, then level, then colon, then message
++    match = re.match(r'^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?)\s*:\s*(\w+)\s*:\s*(.*)$', line)
++    if match:
++        timestamp, level, message = match.groups()
++        return {'timestamp': timestamp, 'level': level, 'message': message}
++    else:
++        # Fallback for non-ISO timestamps
++        parts = line.split(':', 2)  # Split into at most 3 parts
++        if len(parts) == 3:
++            return {'timestamp': parts[0], 'level': parts[1], 'message': parts[2]}
++        else:
++            raise ValueError(f"Invalid log format: {line}")

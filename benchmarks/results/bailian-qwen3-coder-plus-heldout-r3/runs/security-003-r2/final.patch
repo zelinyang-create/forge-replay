@@ -1,0 +1,46 @@
+diff --git a/solution.py b/solution.py
+index 052eee3..03e4818 100644
+--- a/solution.py
++++ b/solution.py
+@@ -1,2 +1,39 @@
++import re
++import os
++
+ def sanitize_filename(value):
+-    return value
++    # Extract filename from any path
++    value = os.path.basename(value)
++    
++    # Remove control characters (0x00-0x1F)
++    value = ''.join(c for c in value if ord(c) >= 0x20)
++    
++    # For Windows, remove reserved characters and names
++    if os.name == 'nt':  # Windows
++        # Remove reserved characters
++        value = re.sub(r'[<>:"/\\|?*]', '', value)
++        
++        # Remove trailing dots and spaces
++        value = value.rstrip('. ')
++        
++        # Check for reserved names
++        reserved_names = {
++            'CON', 'PRN', 'AUX', 'NUL',
++            'COM1', 'COM2', 'COM3', 'COM4', 'COM5', 'COM6', 'COM7', 'COM8', 'COM9',
++            'LPT1', 'LPT2', 'LPT3', 'LPT4', 'LPT5', 'LPT6', 'LPT7', 'LPT8', 'LPT9'
++        }
++        name_without_ext = value.split('.')[0].upper()
++        if name_without_ext in reserved_names:
++            value = '_' + value
++    else:  # POSIX systems
++        # Remove null byte and forward slash
++        value = value.replace('/', '')
++        
++        # Remove trailing dots and spaces
++        value = value.rstrip('. ')
++    
++    # Ensure the filename is not empty
++    if not value:
++        value = '_'
++    
++    return value
+\ No newline at end of file
