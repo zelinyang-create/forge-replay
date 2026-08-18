@@ -1,8 +1,9 @@
 from forge_replay.domain import ApprovalDecision, ToolCallState
+from forge_replay.events import ModelCallStartedPayload, ModelResponseReceivedPayload
 from forge_replay.persistence import SQLiteEventStore
 from forge_replay.runtime.agent import DurableAgentRuntime
 from forge_replay.runtime.file_executor import DurableFileExecutor
-from forge_replay.runtime.model import ScriptedModel
+from forge_replay.runtime.model import ModelProviderError, ModelResult, ScriptedModel
 from forge_replay.runtime.shell_executor import DurableShellExecutor
 from forge_replay.tools import ProcessSupervisor, ReplaySafeFileTools
 from forge_replay.workspace import WorkspacePathGuard
@@ -181,6 +182,87 @@ def test_model_failure_is_recorded_and_becomes_needs_attention(tmp_path):
     assert outcome.status == "needs_attention"
     assert "RuntimeError" in outcome.detail
     assert store.get_run_projection("run-1").execution_status.value == "needs_attention"
+
+
+def test_each_physical_model_retry_is_recorded(tmp_path):
+    _, store, runtime = build_runtime(tmp_path, [])
+
+    class RetryingModel:
+        name = "retrying-test"
+
+        def complete(self, prompt, *, max_output_tokens, attempt_observer=None):
+            del prompt, max_output_tokens
+            error = ModelProviderError("temporary", retryable=True)
+            attempt_observer.started(1)
+            attempt_observer.failed(1, error, retryable=True)
+            attempt_observer.started(2)
+            return ModelResult("<final>recovered</final>")
+
+    runtime.model = RetryingModel()
+    outcome = runtime.run("run-1")
+    events = store.load_run_events("run-1")
+    starts = [
+        event.payload
+        for event in events
+        if event.payload.event_type.value == "model_call_started"
+    ]
+    failures = [
+        event.payload
+        for event in events
+        if event.payload.event_type.value == "model_call_failed"
+    ]
+
+    assert outcome.status == "completed"
+    assert [item.attempt_no for item in starts] == [1, 2]
+    assert len({item.model_call_id for item in starts}) == 1
+    assert len(failures) == 1 and failures[0].retryable is True
+
+
+def test_resume_consumes_durable_model_response_and_settles_budget(tmp_path):
+    _, store, runtime = build_runtime(tmp_path, [])
+    projection = store.get_run_projection("run-1")
+    store.reserve_budget(
+        run_id="run-1",
+        reservation_id="model-budget:run-1:0",
+        category="model_calls",
+        amount=1,
+        process_instance_id="crashed-worker",
+    )
+    started = store.append_event(
+        session_id=projection.session_id,
+        turn_id=projection.turn_id,
+        run_id="run-1",
+        process_instance_id="crashed-worker",
+        payload=ModelCallStartedPayload(
+            model_call_id="model-call:run-1:0",
+            model_name="scripted-model",
+            attempt_no=1,
+        ),
+    )
+    blob = store.put_blob("<final>durably recovered</final>", media_type="text/plain")
+    store.append_event(
+        session_id=projection.session_id,
+        turn_id=projection.turn_id,
+        run_id="run-1",
+        process_instance_id="crashed-worker",
+        causation_event_id=str(started.event_id),
+        payload=ModelResponseReceivedPayload(
+            model_call_id="model-call:run-1:0",
+            response_blob_sha256=blob.sha256,
+        ),
+    )
+
+    outcome = runtime.run("run-1")
+
+    assert outcome.status == "completed"
+    assert outcome.final_answer == "durably recovered"
+    assert runtime.model.prompts == []
+    with store.connect() as connection:
+        reservation = connection.execute(
+            "SELECT state FROM budget_reservations WHERE reservation_id = ?",
+            ("model-budget:run-1:0",),
+        ).fetchone()
+    assert reservation["state"] == "settled"
 
 
 def test_runtime_renews_lease_before_bounded_actions(tmp_path, monkeypatch):

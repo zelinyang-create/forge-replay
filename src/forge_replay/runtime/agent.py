@@ -21,6 +21,7 @@ from forge_replay.events import (
     ModelCallStartedPayload,
     ModelOutputRejectedPayload,
     ModelResponseReceivedPayload,
+    ToolCallProposedPayload,
     ToolExecutionFailedPayload,
     ToolExecutionSucceededPayload,
     ToolExecutionUncertainPayload,
@@ -31,9 +32,12 @@ from forge_replay.persistence import (
 )
 from forge_replay.ports import RuntimeStorePort
 from forge_replay.runtime.file_executor import DurableFileExecutor
-from forge_replay.runtime.model import ModelInvocationError, ModelPort
+from forge_replay.runtime.model import (
+    ModelAttemptObserver,
+    ModelInvocationError,
+    ModelPort,
+)
 from forge_replay.runtime.shell_executor import DurableShellExecutor
-from forge_replay.runtime.tool_identity import new_uuid7
 from mini_coding_agent import MiniAgent
 
 
@@ -51,6 +55,63 @@ class AgentOutcome:
     approval_id: str | None = None
     tool_call_id: str | None = None
     detail: str | None = None
+
+
+class _DurableModelAttemptObserver(ModelAttemptObserver):
+    """Append one auditable event for every physical provider attempt."""
+
+    def __init__(
+        self,
+        runtime: DurableAgentRuntime,
+        *,
+        run_id: str,
+        model_call_id: str,
+        attempt_offset: int,
+        execution_context: ExecutionContext,
+    ):
+        self.runtime = runtime
+        self.run_id = run_id
+        self.model_call_id = model_call_id
+        self.attempt_offset = attempt_offset
+        self.execution_context = execution_context
+        self.last_started = None
+        self.failed_attempts: set[int] = set()
+
+    def started(self, attempt_no: int) -> None:
+        projection = self.runtime.store.get_run_projection(self.run_id)
+        durable_attempt = self.attempt_offset + attempt_no
+        self.last_started = self.runtime.store.append_event(
+            session_id=projection.session_id,
+            turn_id=projection.turn_id,
+            run_id=self.run_id,
+            process_instance_id=self.runtime.process_instance_id,
+            payload=ModelCallStartedPayload(
+                model_call_id=self.model_call_id,
+                model_name=self.runtime.model.name,
+                attempt_no=durable_attempt,
+            ),
+            execution_context=self.execution_context,
+        )
+
+    def failed(self, attempt_no: int, error: BaseException, *, retryable: bool) -> None:
+        durable_attempt = self.attempt_offset + attempt_no
+        projection = self.runtime.store.get_run_projection(self.run_id)
+        self.runtime.store.append_event(
+            session_id=projection.session_id,
+            turn_id=projection.turn_id,
+            run_id=self.run_id,
+            process_instance_id=self.runtime.process_instance_id,
+            causation_event_id=(
+                str(self.last_started.event_id) if self.last_started is not None else None
+            ),
+            payload=ModelCallFailedPayload(
+                model_call_id=self.model_call_id,
+                error_class=type(error).__name__,
+                retryable=retryable,
+            ),
+            execution_context=self.execution_context,
+        )
+        self.failed_attempts.add(durable_attempt)
 
 
 class DurableAgentRuntime:
@@ -150,7 +211,7 @@ class DurableAgentRuntime:
                 execution_context=execution_context,
             )
 
-        for step in range(self.max_steps):
+        for _ in range(self.max_steps * 2):
             self._renew_lease(execution_context)
             if self.store.is_cancellation_requested(run_id):
                 self.store.terminate_run(
@@ -168,7 +229,17 @@ class DurableAgentRuntime:
                     return outcome
                 continue
 
-            response_event, raw = self._call_model(run_id, step, execution_context)
+            recovered = self._latest_unconsumed_model_response(run_id)
+            if recovered is not None:
+                response_event, raw, step = recovered
+                self._settle_model_budget(run_id, step, execution_context)
+            else:
+                step = self._next_model_step(run_id)
+                if step >= self.max_steps:
+                    return AgentOutcome(
+                        status="step_limit", detail=f"reached {self.max_steps} model steps"
+                    )
+                response_event, raw = self._call_model(run_id, step, execution_context)
             kind, payload = MiniAgent.parse(raw)
             if kind == "retry":
                 projection = self.store.get_run_projection(run_id)
@@ -245,7 +316,9 @@ class DurableAgentRuntime:
             )
             if outcome is not None:
                 return outcome
-        return AgentOutcome(status="step_limit", detail=f"reached {self.max_steps} steps")
+        return AgentOutcome(
+            status="step_limit", detail="reached the bounded runtime action limit"
+        )
 
     def _call_model(
         self,
@@ -255,7 +328,7 @@ class DurableAgentRuntime:
     ):
         self._renew_lease(execution_context)
         projection = self.store.get_run_projection(run_id)
-        reservation_id = f"model-{new_uuid7()}"
+        reservation_id = f"model-budget:{run_id}:{step}"
         reserved = False
         if "model_calls" in projection.budget_limits:
             self.store.reserve_budget(
@@ -267,38 +340,30 @@ class DurableAgentRuntime:
                 execution_context=execution_context,
             )
             reserved = True
-        model_call_id = str(new_uuid7())
-        started = self.store.append_event(
-            session_id=projection.session_id,
-            turn_id=projection.turn_id,
+        model_call_id = f"model-call:{run_id}:{step}"
+        previous_attempts = sum(
+            1
+            for item in self.store.load_run_events(run_id)
+            if isinstance(item.payload, ModelCallStartedPayload)
+            and item.payload.model_call_id == model_call_id
+        )
+        observer = _DurableModelAttemptObserver(
+            self,
             run_id=run_id,
-            process_instance_id=self.process_instance_id,
-            payload=ModelCallStartedPayload(
-                model_call_id=model_call_id,
-                model_name=self.model.name,
-                attempt_no=1,
-            ),
+            model_call_id=model_call_id,
+            attempt_offset=previous_attempts,
             execution_context=execution_context,
         )
         try:
             result = self.model.complete(
                 self._prompt(run_id, step),
                 max_output_tokens=self.max_output_tokens,
+                attempt_observer=observer,
             )
         except Exception as exc:
-            self.store.append_event(
-                session_id=projection.session_id,
-                turn_id=projection.turn_id,
-                run_id=run_id,
-                process_instance_id=self.process_instance_id,
-                causation_event_id=str(started.event_id),
-                payload=ModelCallFailedPayload(
-                    model_call_id=model_call_id,
-                    error_class=type(exc).__name__,
-                    retryable=False,
-                ),
-                execution_context=execution_context,
-            )
+            last_attempt = previous_attempts + 1
+            if last_attempt not in observer.failed_attempts:
+                observer.failed(last_attempt - previous_attempts, exc, retryable=False)
             if reserved:
                 self.store.settle_budget(
                     reservation_id=reservation_id,
@@ -315,7 +380,9 @@ class DurableAgentRuntime:
             turn_id=projection.turn_id,
             run_id=run_id,
             process_instance_id=self.process_instance_id,
-            causation_event_id=str(started.event_id),
+            causation_event_id=(
+                str(observer.last_started.event_id) if observer.last_started is not None else None
+            ),
             payload=ModelResponseReceivedPayload(
                 model_call_id=model_call_id,
                 response_blob_sha256=blob.sha256,
@@ -332,6 +399,61 @@ class DurableAgentRuntime:
                 execution_context=execution_context,
             )
         return event, result.text
+
+    def _settle_model_budget(
+        self,
+        run_id: str,
+        step: int,
+        execution_context: ExecutionContext,
+    ) -> None:
+        projection = self.store.get_run_projection(run_id)
+        if "model_calls" not in projection.budget_limits:
+            return
+        self.store.settle_budget(
+            reservation_id=f"model-budget:{run_id}:{step}",
+            consumed=1,
+            process_instance_id=self.process_instance_id,
+            execution_context=execution_context,
+        )
+
+    def _next_model_step(self, run_id: str) -> int:
+        prefix = f"model-call:{run_id}:"
+        call_ids: list[str] = []
+        completed: set[str] = set()
+        for event in self.store.load_run_events(run_id):
+            if isinstance(event.payload, ModelCallStartedPayload):
+                call_id = event.payload.model_call_id
+                if call_id.startswith(prefix) and call_id not in call_ids:
+                    call_ids.append(call_id)
+            elif isinstance(event.payload, ModelResponseReceivedPayload):
+                completed.add(event.payload.model_call_id)
+        if call_ids and call_ids[-1] not in completed:
+            return int(call_ids[-1].removeprefix(prefix))
+        return len(call_ids)
+
+    def _latest_unconsumed_model_response(self, run_id: str):
+        events = self.store.load_run_events(run_id)
+        consumed: set[str] = set()
+        for event in events:
+            if isinstance(event.payload, ToolCallProposedPayload):
+                if event.causation_event_id is not None:
+                    consumed.add(str(event.causation_event_id))
+            elif isinstance(event.payload, ModelOutputRejectedPayload):
+                consumed.add(event.payload.response_event_id)
+        prefix = f"model-call:{run_id}:"
+        for event in reversed(events):
+            if not isinstance(event.payload, ModelResponseReceivedPayload):
+                continue
+            if str(event.event_id) in consumed:
+                continue
+            call_id = event.payload.model_call_id
+            if not call_id.startswith(prefix):
+                continue
+            raw = self.store.get_blob(event.payload.response_blob_sha256).content.decode(
+                "utf-8"
+            )
+            return event, raw, int(call_id.removeprefix(prefix))
+        return None
 
     def _continue_tool(
         self,

@@ -10,7 +10,11 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from forge_replay.runtime.model import ModelProviderError, ModelResult
+from forge_replay.runtime.model import (
+    ModelAttemptObserver,
+    ModelProviderError,
+    ModelResult,
+)
 
 
 class OllamaTransport(Protocol):
@@ -76,7 +80,13 @@ class OllamaModel:
         self.transport = transport or UrlLibOllamaTransport(host)
         self.sleeper = sleeper
 
-    def complete(self, prompt: str, *, max_output_tokens: int) -> ModelResult:
+    def complete(
+        self,
+        prompt: str,
+        *,
+        max_output_tokens: int,
+        attempt_observer: ModelAttemptObserver | None = None,
+    ) -> ModelResult:
         payload = {
             "model": self.name,
             "prompt": prompt,
@@ -91,6 +101,8 @@ class OllamaModel:
         }
         last_error = None
         for attempt in range(1, self.max_attempts + 1):
+            if attempt_observer is not None:
+                attempt_observer.started(attempt)
             try:
                 data = self.transport.generate(payload, timeout=self.timeout_seconds)
                 if data.get("error"):
@@ -105,6 +117,8 @@ class OllamaModel:
                 )
             except ModelProviderError as exc:
                 last_error = exc
+                if attempt_observer is not None:
+                    attempt_observer.failed(attempt, exc, retryable=exc.retryable)
                 if not exc.retryable or attempt == self.max_attempts:
                     raise
                 delay = exc.retry_after if exc.retry_after is not None else min(2 ** (attempt - 1), 8)

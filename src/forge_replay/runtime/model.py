@@ -6,6 +6,14 @@ from dataclasses import dataclass
 from typing import Protocol
 
 
+class ModelAttemptObserver(Protocol):
+    """Durable callback around each physical provider attempt."""
+
+    def started(self, attempt_no: int) -> None: ...
+
+    def failed(self, attempt_no: int, error: BaseException, *, retryable: bool) -> None: ...
+
+
 @dataclass(frozen=True)
 class ModelResult:
     text: str
@@ -16,7 +24,13 @@ class ModelResult:
 class ModelPort(Protocol):
     name: str
 
-    def complete(self, prompt: str, *, max_output_tokens: int) -> ModelResult: ...
+    def complete(
+        self,
+        prompt: str,
+        *,
+        max_output_tokens: int,
+        attempt_observer: ModelAttemptObserver | None = None,
+    ) -> ModelResult: ...
 
 
 class ModelInvocationError(RuntimeError):
@@ -41,10 +55,23 @@ class ScriptedModel:
         self.outputs = list(outputs)
         self.prompts: list[str] = []
 
-    def complete(self, prompt: str, *, max_output_tokens: int) -> ModelResult:
+    def complete(
+        self,
+        prompt: str,
+        *,
+        max_output_tokens: int,
+        attempt_observer: ModelAttemptObserver | None = None,
+    ) -> ModelResult:
         del max_output_tokens
         self.prompts.append(prompt)
-        if not self.outputs:
-            raise RuntimeError("scripted model has no remaining output")
-        text = self.outputs.pop(0)
-        return ModelResult(text=text)
+        if attempt_observer is not None:
+            attempt_observer.started(1)
+        try:
+            if not self.outputs:
+                raise RuntimeError("scripted model has no remaining output")
+            text = self.outputs.pop(0)
+            return ModelResult(text=text)
+        except BaseException as exc:
+            if attempt_observer is not None:
+                attempt_observer.failed(1, exc, retryable=False)
+            raise

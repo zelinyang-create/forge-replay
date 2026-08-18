@@ -10,7 +10,11 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from forge_replay.runtime.model import ModelProviderError, ModelResult
+from forge_replay.runtime.model import (
+    ModelAttemptObserver,
+    ModelProviderError,
+    ModelResult,
+)
 
 
 class ChatCompletionsTransport(Protocol):
@@ -84,7 +88,13 @@ class OpenAIChatModel:
         self.transport = transport or UrlLibChatCompletionsTransport(base_url)
         self.sleeper = sleeper
 
-    def complete(self, prompt: str, *, max_output_tokens: int) -> ModelResult:
+    def complete(
+        self,
+        prompt: str,
+        *,
+        max_output_tokens: int,
+        attempt_observer: ModelAttemptObserver | None = None,
+    ) -> ModelResult:
         payload = {
             "model": self.name,
             "messages": [{"role": "user", "content": prompt}],
@@ -94,6 +104,8 @@ class OpenAIChatModel:
         }
         last_error = None
         for attempt in range(1, self.max_attempts + 1):
+            if attempt_observer is not None:
+                attempt_observer.started(attempt)
             try:
                 data = self.transport.complete(
                     payload,
@@ -116,6 +128,8 @@ class OpenAIChatModel:
                 )
             except ModelProviderError as exc:
                 last_error = exc
+                if attempt_observer is not None:
+                    attempt_observer.failed(attempt, exc, retryable=exc.retryable)
                 if not exc.retryable or attempt == self.max_attempts:
                     raise
                 delay = exc.retry_after if exc.retry_after is not None else min(2 ** (attempt - 1), 8)
