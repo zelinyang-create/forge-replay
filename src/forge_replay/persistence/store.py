@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -34,6 +35,35 @@ class MigrationChecksumError(LedgerError):
     """Raised when an applied migration no longer matches its source."""
 
 
+class BlobQuotaExceededError(LedgerError):
+    """Raised before a blob would exceed a configured storage quota."""
+
+
+class BlobMetadataConflictError(LedgerIntegrityError):
+    """Raised when identical bytes are assigned conflicting durable metadata."""
+
+
+@dataclass(frozen=True)
+class BlobLimits:
+    max_blob_bytes: int = 4 * 1024 * 1024
+    max_total_bytes: int = 64 * 1024 * 1024
+
+    def __post_init__(self) -> None:
+        if self.max_blob_bytes < 1:
+            raise ValueError("max_blob_bytes must be positive")
+        if self.max_total_bytes < self.max_blob_bytes:
+            raise ValueError("max_total_bytes must be at least max_blob_bytes")
+
+
+@dataclass(frozen=True)
+class StoredBlob:
+    sha256: str
+    byte_length: int
+    media_type: str
+    content: bytes
+    created_at: datetime
+
+
 def canonical_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
 
@@ -49,9 +79,16 @@ def migration_checksum(migration: Migration) -> str:
 class SQLiteEventStore:
     """Append-only event storage with transactionally allocated session sequence IDs."""
 
-    def __init__(self, path: str | Path, *, busy_timeout_ms: int = 5_000):
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        busy_timeout_ms: int = 5_000,
+        blob_limits: BlobLimits | None = None,
+    ):
         self.path = Path(path)
         self.busy_timeout_ms = busy_timeout_ms
+        self.blob_limits = blob_limits or BlobLimits()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.initialize()
 
@@ -137,6 +174,107 @@ class SQLiteEventStore:
                 connection.execute("ROLLBACK")
                 raise
         return event
+
+    def put_blob(self, content: bytes | str, *, media_type: str) -> StoredBlob:
+        raw_content = content.encode("utf-8") if isinstance(content, str) else bytes(content)
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                blob = self._put_blob_in_transaction(
+                    connection,
+                    content=raw_content,
+                    media_type=media_type,
+                )
+                connection.execute("COMMIT")
+            except BaseException:
+                connection.execute("ROLLBACK")
+                raise
+        return blob
+
+    def _put_blob_in_transaction(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        content: bytes,
+        media_type: str,
+    ) -> StoredBlob:
+        if not media_type.strip():
+            raise ValueError("media_type must not be empty")
+        content_sha256 = hashlib.sha256(content).hexdigest()
+        existing = connection.execute(
+            "SELECT * FROM blobs WHERE sha256 = ?",
+            (content_sha256,),
+        ).fetchone()
+        if existing is not None:
+            stored = self._stored_blob_from_row(existing)
+            self._verify_blob(stored)
+            if stored.content != content:
+                raise LedgerIntegrityError(f"blob {content_sha256} content does not match its digest")
+            if stored.media_type != media_type:
+                raise BlobMetadataConflictError(
+                    f"blob {content_sha256} already uses media type {stored.media_type}"
+                )
+            return stored
+
+        byte_length = len(content)
+        if byte_length > self.blob_limits.max_blob_bytes:
+            raise BlobQuotaExceededError(
+                f"blob size {byte_length} exceeds limit {self.blob_limits.max_blob_bytes}"
+            )
+        total_bytes = connection.execute(
+            "SELECT COALESCE(SUM(byte_length), 0) FROM blobs"
+        ).fetchone()[0]
+        if total_bytes + byte_length > self.blob_limits.max_total_bytes:
+            raise BlobQuotaExceededError(
+                "blob store total would exceed limit "
+                f"{self.blob_limits.max_total_bytes}"
+            )
+
+        created_at = datetime.now(timezone.utc)
+        connection.execute(
+            """
+            INSERT INTO blobs(
+                sha256, byte_length, media_type, compression, content, created_at
+            ) VALUES (?, ?, ?, NULL, ?, ?)
+            """,
+            (content_sha256, byte_length, media_type, content, created_at.isoformat()),
+        )
+        return StoredBlob(
+            sha256=content_sha256,
+            byte_length=byte_length,
+            media_type=media_type,
+            content=content,
+            created_at=created_at,
+        )
+
+    def get_blob(self, sha256: str) -> StoredBlob:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM blobs WHERE sha256 = ?",
+                (sha256,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"unknown blob: {sha256}")
+        blob = self._stored_blob_from_row(row)
+        self._verify_blob(blob)
+        return blob
+
+    @staticmethod
+    def _stored_blob_from_row(row: sqlite3.Row) -> StoredBlob:
+        return StoredBlob(
+            sha256=row["sha256"],
+            byte_length=row["byte_length"],
+            media_type=row["media_type"],
+            content=bytes(row["content"]),
+            created_at=datetime.fromisoformat(row["created_at"]),
+        )
+
+    @staticmethod
+    def _verify_blob(blob: StoredBlob) -> None:
+        if len(blob.content) != blob.byte_length:
+            raise LedgerIntegrityError(f"blob {blob.sha256} length mismatch")
+        if hashlib.sha256(blob.content).hexdigest() != blob.sha256:
+            raise LedgerIntegrityError(f"blob {blob.sha256} checksum mismatch")
 
     def append_event(
         self,
