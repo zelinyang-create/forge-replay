@@ -166,6 +166,7 @@ class ToolCallRecord:
     state: ToolCallState
     target_paths: tuple[str, ...]
     policy_version: str
+    action_plan: dict[str, Any] | None
     proposal_event: EventEnvelope | None
 
 
@@ -824,6 +825,39 @@ class SQLiteEventStore:
                 connection.execute("ROLLBACK")
                 raise
         return self._tool_call_from_row(row, proposal_event=proposal_event)
+
+    def get_tool_call(self, tool_call_id: str) -> ToolCallRecord:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM tool_calls WHERE tool_call_id = ?",
+                (tool_call_id,),
+            ).fetchone()
+        if row is None:
+            raise ToolCallConflictError(f"unknown tool call: {tool_call_id}")
+        return self._tool_call_from_row(row, proposal_event=None)
+
+    def get_tool_attempt(self, attempt_id: str) -> ToolAttemptRecord:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM tool_attempts WHERE attempt_id = ?",
+                (attempt_id,),
+            ).fetchone()
+        if row is None:
+            raise ToolCallConflictError(f"unknown tool attempt: {attempt_id}")
+        return self._tool_attempt_from_row(row, event=None)
+
+    def list_dispatched_attempts(self, run_id: str) -> list[ToolAttemptRecord]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT attempts.* FROM tool_attempts AS attempts
+                JOIN tool_calls AS calls ON calls.tool_call_id = attempts.tool_call_id
+                WHERE calls.run_id = ? AND attempts.state = ?
+                ORDER BY attempts.dispatched_at
+                """,
+                (run_id, ToolCallState.DISPATCHED.value),
+            ).fetchall()
+        return [self._tool_attempt_from_row(row, event=None) for row in rows]
 
     def request_tool_approval(
         self,
@@ -1516,6 +1550,7 @@ class SQLiteEventStore:
             state=ToolCallState(row["state"]),
             target_paths=tuple(identity.get("target_paths", ())),
             policy_version=identity.get("policy_version", ""),
+            action_plan=identity.get("action_plan"),
             proposal_event=proposal_event,
         )
 
