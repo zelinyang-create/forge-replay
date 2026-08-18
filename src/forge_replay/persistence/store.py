@@ -5,18 +5,30 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
+from forge_replay.domain import (
+    ExecutionStatus,
+    RunPhase,
+    WorkspaceDisposition,
+    can_transition_execution,
+)
 from forge_replay.events import (
     EventEnvelope,
+    ProjectionRebuiltPayload,
+    RunCompletedPayload,
+    RunCreatedPayload,
+    RunPhaseChangedPayload,
     RuntimeEventPayload,
     SessionCreatedPayload,
+    UserMessageReceivedPayload,
     new_event,
 )
 from forge_replay.persistence.schema import MIGRATIONS, SCHEMA_TABLE_SQL, Migration
+from forge_replay.runtime.projection import RunProjection, reduce_run_events
 
 
 class LedgerError(RuntimeError):
@@ -43,6 +55,14 @@ class BlobMetadataConflictError(LedgerIntegrityError):
     """Raised when identical bytes are assigned conflicting durable metadata."""
 
 
+class RunNotFoundError(LedgerError):
+    """Raised when an operation targets a run that does not exist."""
+
+
+class RunStateConflictError(LedgerError):
+    """Raised when a command was based on a stale or terminal run projection."""
+
+
 @dataclass(frozen=True)
 class BlobLimits:
     max_blob_bytes: int = 4 * 1024 * 1024
@@ -62,6 +82,17 @@ class StoredBlob:
     media_type: str
     content: bytes
     created_at: datetime
+
+
+@dataclass(frozen=True)
+class CreatedRun:
+    """Facts and projection committed by one atomic run-creation command."""
+
+    message_blob: StoredBlob
+    user_message_event: EventEnvelope
+    run_created_event: EventEnvelope
+    phase_changed_event: EventEnvelope
+    projection: RunProjection
 
 
 def canonical_json(value: Any) -> str:
@@ -276,6 +307,318 @@ class SQLiteEventStore:
         if hashlib.sha256(blob.content).hexdigest() != blob.sha256:
             raise LedgerIntegrityError(f"blob {blob.sha256} checksum mismatch")
 
+    def create_turn_and_run(
+        self,
+        *,
+        session_id: str,
+        turn_id: str,
+        run_id: str,
+        user_message: str,
+        base_repo_root: str | Path,
+        base_commit_sha: str,
+        budget_limits: dict[str, int | float],
+        process_instance_id: str,
+    ) -> CreatedRun:
+        """Commit a user message, turn, run, and initial phase as one unit."""
+
+        if not user_message:
+            raise ValueError("user_message must not be empty")
+        if not base_commit_sha.strip():
+            raise ValueError("base_commit_sha must not be empty")
+        created_at = datetime.now(timezone.utc).isoformat()
+        resolved_repo_root = str(Path(base_repo_root).resolve())
+
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                message_blob = self._put_blob_in_transaction(
+                    connection,
+                    content=user_message.encode("utf-8"),
+                    media_type="text/plain; charset=utf-8",
+                )
+                user_event = self._prepare_event_in_transaction(
+                    connection,
+                    session_id=session_id,
+                    turn_id=turn_id,
+                    process_instance_id=process_instance_id,
+                    payload=UserMessageReceivedPayload(
+                        message_blob_sha256=message_blob.sha256,
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO turns(
+                        turn_id, session_id, user_event_id, created_at, status, active_run_id
+                    ) VALUES (?, ?, ?, ?, 'active', ?)
+                    """,
+                    (turn_id, session_id, str(user_event.event_id), created_at, run_id),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO runs(
+                        run_id, turn_id, session_id, execution_status, phase,
+                        workspace_disposition, base_repo_root, base_commit_sha,
+                        created_at, started_at, budget_limits_json, budget_consumed_json
+                    ) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        run_id,
+                        turn_id,
+                        session_id,
+                        ExecutionStatus.ACTIVE.value,
+                        WorkspaceDisposition.NONE.value,
+                        resolved_repo_root,
+                        base_commit_sha,
+                        created_at,
+                        created_at,
+                        canonical_json(budget_limits),
+                        canonical_json({}),
+                    ),
+                )
+                self._insert_event_in_transaction(connection, user_event)
+                run_created_event = self._append_event_in_transaction(
+                    connection,
+                    session_id=session_id,
+                    turn_id=turn_id,
+                    run_id=run_id,
+                    process_instance_id=process_instance_id,
+                    causation_event_id=str(user_event.event_id),
+                    correlation_id=run_id,
+                    payload=RunCreatedPayload(
+                        base_repo_root=resolved_repo_root,
+                        base_commit_sha=base_commit_sha,
+                        budget_limits=budget_limits,
+                    ),
+                )
+                phase_changed_event = self._append_event_in_transaction(
+                    connection,
+                    session_id=session_id,
+                    turn_id=turn_id,
+                    run_id=run_id,
+                    process_instance_id=process_instance_id,
+                    causation_event_id=str(run_created_event.event_id),
+                    correlation_id=run_id,
+                    payload=RunPhaseChangedPayload(
+                        previous_phase=None,
+                        next_phase=RunPhase.PREFLIGHTING,
+                        reason="run created",
+                    ),
+                )
+                connection.execute(
+                    """
+                    UPDATE runs SET phase = ?, last_event_seq = ? WHERE run_id = ?
+                    """,
+                    (RunPhase.PREFLIGHTING.value, phase_changed_event.seq, run_id),
+                )
+                connection.execute("COMMIT")
+            except BaseException:
+                connection.execute("ROLLBACK")
+                raise
+
+        projection = reduce_run_events([run_created_event, phase_changed_event])
+        return CreatedRun(
+            message_blob=message_blob,
+            user_message_event=user_event,
+            run_created_event=run_created_event,
+            phase_changed_event=phase_changed_event,
+            projection=projection,
+        )
+
+    def load_run_events(self, run_id: str) -> list[EventEnvelope]:
+        with self.connect() as connection:
+            self._require_run_row(connection, run_id)
+            return self._load_run_events_in_transaction(connection, run_id)
+
+    def get_run_projection(self, run_id: str) -> RunProjection:
+        return reduce_run_events(self.load_run_events(run_id))
+
+    def transition_run_phase(
+        self,
+        *,
+        run_id: str,
+        expected_previous_phase: RunPhase | None,
+        next_phase: RunPhase,
+        reason: str,
+        process_instance_id: str,
+    ) -> RunProjection:
+        """Append a phase fact only if the caller observed the current projection."""
+
+        if not reason.strip():
+            raise ValueError("reason must not be empty")
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._require_run_row(connection, run_id)
+                projection = reduce_run_events(
+                    self._load_run_events_in_transaction(connection, run_id)
+                )
+                if projection.execution_status != ExecutionStatus.ACTIVE:
+                    raise RunStateConflictError(f"run {run_id} is terminal")
+                if projection.phase != expected_previous_phase:
+                    raise RunStateConflictError(
+                        f"run {run_id} phase is {projection.phase}, "
+                        f"not {expected_previous_phase}"
+                    )
+                if projection.phase == next_phase:
+                    raise RunStateConflictError(f"run {run_id} is already in phase {next_phase}")
+
+                event = self._append_event_in_transaction(
+                    connection,
+                    session_id=row["session_id"],
+                    turn_id=row["turn_id"],
+                    run_id=run_id,
+                    process_instance_id=process_instance_id,
+                    correlation_id=run_id,
+                    payload=RunPhaseChangedPayload(
+                        previous_phase=projection.phase,
+                        next_phase=next_phase,
+                        reason=reason,
+                    ),
+                )
+                connection.execute(
+                    "UPDATE runs SET phase = ?, last_event_seq = ? WHERE run_id = ?",
+                    (next_phase.value, event.seq, run_id),
+                )
+                connection.execute("COMMIT")
+            except BaseException:
+                connection.execute("ROLLBACK")
+                raise
+        return replace(projection, phase=next_phase, last_event_seq=event.seq)
+
+    def complete_run(
+        self,
+        *,
+        run_id: str,
+        verification_status: Literal["passed", "failed", "not_configured"],
+        process_instance_id: str,
+    ) -> RunProjection:
+        """Persist the single successful terminal transition for a run."""
+
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._require_run_row(connection, run_id)
+                projection = reduce_run_events(
+                    self._load_run_events_in_transaction(connection, run_id)
+                )
+                if not can_transition_execution(
+                    projection.execution_status,
+                    ExecutionStatus.COMPLETED,
+                ) or projection.execution_status == ExecutionStatus.COMPLETED:
+                    raise RunStateConflictError(f"run {run_id} is already terminal")
+                event = self._append_event_in_transaction(
+                    connection,
+                    session_id=row["session_id"],
+                    turn_id=row["turn_id"],
+                    run_id=run_id,
+                    process_instance_id=process_instance_id,
+                    correlation_id=run_id,
+                    payload=RunCompletedPayload(verification_status=verification_status),
+                )
+                finished_at = datetime.now(timezone.utc).isoformat()
+                connection.execute(
+                    """
+                    UPDATE runs
+                    SET execution_status = ?, phase = NULL, finished_at = ?, last_event_seq = ?
+                    WHERE run_id = ?
+                    """,
+                    (ExecutionStatus.COMPLETED.value, finished_at, event.seq, run_id),
+                )
+                connection.execute(
+                    """
+                    UPDATE turns SET status = 'completed', active_run_id = NULL
+                    WHERE turn_id = ?
+                    """,
+                    (row["turn_id"],),
+                )
+                connection.execute("COMMIT")
+            except BaseException:
+                connection.execute("ROLLBACK")
+                raise
+        return replace(
+            projection,
+            execution_status=ExecutionStatus.COMPLETED,
+            phase=None,
+            last_event_seq=event.seq,
+        )
+
+    def rebuild_run_projection(
+        self,
+        *,
+        run_id: str,
+        process_instance_id: str,
+    ) -> RunProjection:
+        """Repair mutable run columns from events and record the repair as an audit fact."""
+
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._require_run_row(connection, run_id)
+                previous_state = {
+                    "execution_status": row["execution_status"],
+                    "phase": row["phase"],
+                    "workspace_disposition": row["workspace_disposition"],
+                }
+                projection = reduce_run_events(
+                    self._load_run_events_in_transaction(connection, run_id)
+                )
+                connection.execute(
+                    """
+                    UPDATE runs
+                    SET execution_status = ?, phase = ?, workspace_disposition = ?,
+                        last_event_seq = ?
+                    WHERE run_id = ?
+                    """,
+                    (
+                        projection.execution_status.value,
+                        projection.phase.value if projection.phase else None,
+                        projection.workspace_disposition.value,
+                        projection.last_event_seq,
+                        run_id,
+                    ),
+                )
+                rebuilt_state = projection.business_state()
+                audit_event = self._append_event_in_transaction(
+                    connection,
+                    session_id=row["session_id"],
+                    turn_id=row["turn_id"],
+                    run_id=run_id,
+                    process_instance_id=process_instance_id,
+                    correlation_id=run_id,
+                    payload=ProjectionRebuiltPayload(
+                        through_seq=projection.last_event_seq,
+                        previous_state_sha256=sha256_text(canonical_json(previous_state)),
+                        rebuilt_state_sha256=sha256_text(canonical_json(rebuilt_state)),
+                    ),
+                )
+                connection.execute(
+                    "UPDATE runs SET last_event_seq = ? WHERE run_id = ?",
+                    (audit_event.seq, run_id),
+                )
+                connection.execute("COMMIT")
+            except BaseException:
+                connection.execute("ROLLBACK")
+                raise
+        return replace(projection, last_event_seq=audit_event.seq)
+
+    @staticmethod
+    def _require_run_row(connection: sqlite3.Connection, run_id: str) -> sqlite3.Row:
+        row = connection.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+        if row is None:
+            raise RunNotFoundError(f"unknown run: {run_id}")
+        return row
+
+    def _load_run_events_in_transaction(
+        self,
+        connection: sqlite3.Connection,
+        run_id: str,
+    ) -> list[EventEnvelope]:
+        rows = connection.execute(
+            "SELECT * FROM events WHERE run_id = ? ORDER BY seq",
+            (run_id,),
+        ).fetchall()
+        return [self._event_from_row(row) for row in rows]
+
     def append_event(
         self,
         *,
@@ -318,6 +661,31 @@ class SQLiteEventStore:
         causation_event_id: str | None = None,
         correlation_id: str | None = None,
     ) -> EventEnvelope:
+        event = self._prepare_event_in_transaction(
+            connection,
+            session_id=session_id,
+            process_instance_id=process_instance_id,
+            payload=payload,
+            turn_id=turn_id,
+            run_id=run_id,
+            causation_event_id=causation_event_id,
+            correlation_id=correlation_id,
+        )
+        self._insert_event_in_transaction(connection, event)
+        return event
+
+    def _prepare_event_in_transaction(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        session_id: str,
+        process_instance_id: str,
+        payload: RuntimeEventPayload,
+        turn_id: str | None = None,
+        run_id: str | None = None,
+        causation_event_id: str | None = None,
+        correlation_id: str | None = None,
+    ) -> EventEnvelope:
         session = connection.execute(
             "SELECT next_seq FROM sessions WHERE session_id = ?",
             (session_id,),
@@ -335,6 +703,13 @@ class SQLiteEventStore:
             causation_event_id=causation_event_id,
             correlation_id=correlation_id,
         )
+        return event
+
+    @staticmethod
+    def _insert_event_in_transaction(
+        connection: sqlite3.Connection,
+        event: EventEnvelope,
+    ) -> None:
         payload_json = canonical_json(event.payload.model_dump(mode="json"))
         payload_sha256 = sha256_text(payload_json)
         connection.execute(
@@ -362,15 +737,18 @@ class SQLiteEventStore:
                 payload_sha256,
             ),
         )
-        connection.execute(
+        cursor = connection.execute(
             """
             UPDATE sessions
             SET next_seq = ?, last_event_id = ?
             WHERE session_id = ? AND next_seq = ?
             """,
-            (event.seq + 1, str(event.event_id), session_id, event.seq),
+            (event.seq + 1, str(event.event_id), event.session_id, event.seq),
         )
-        return event
+        if cursor.rowcount != 1:
+            raise LedgerIntegrityError(
+                f"session {event.session_id} sequence cursor changed during append"
+            )
 
     def load_events(self, session_id: str, *, after_seq: int = 0) -> list[EventEnvelope]:
         with self.connect() as connection:
@@ -383,29 +761,26 @@ class SQLiteEventStore:
                 (session_id, after_seq),
             ).fetchall()
 
-        events = []
-        for row in rows:
-            payload_json = row["payload_json"]
-            if sha256_text(payload_json) != row["payload_sha256"]:
-                raise LedgerIntegrityError(
-                    f"event {row['event_id']} payload checksum mismatch"
-                )
-            events.append(
-                EventEnvelope.model_validate(
-                    {
-                        "event_id": row["event_id"],
-                        "schema_version": row["schema_version"],
-                        "session_id": row["session_id"],
-                        "turn_id": row["turn_id"],
-                        "run_id": row["run_id"],
-                        "seq": row["seq"],
-                        "occurred_at": row["occurred_at"],
-                        "process_instance_id": row["process_instance_id"],
-                        "boot_id": row["boot_id"],
-                        "causation_event_id": row["causation_event_id"],
-                        "correlation_id": row["correlation_id"],
-                        "payload": json.loads(payload_json),
-                    }
-                )
-            )
-        return events
+        return [self._event_from_row(row) for row in rows]
+
+    @staticmethod
+    def _event_from_row(row: sqlite3.Row) -> EventEnvelope:
+        payload_json = row["payload_json"]
+        if sha256_text(payload_json) != row["payload_sha256"]:
+            raise LedgerIntegrityError(f"event {row['event_id']} payload checksum mismatch")
+        return EventEnvelope.model_validate(
+            {
+                "event_id": row["event_id"],
+                "schema_version": row["schema_version"],
+                "session_id": row["session_id"],
+                "turn_id": row["turn_id"],
+                "run_id": row["run_id"],
+                "seq": row["seq"],
+                "occurred_at": row["occurred_at"],
+                "process_instance_id": row["process_instance_id"],
+                "boot_id": row["boot_id"],
+                "causation_event_id": row["causation_event_id"],
+                "correlation_id": row["correlation_id"],
+                "payload": json.loads(payload_json),
+            }
+        )

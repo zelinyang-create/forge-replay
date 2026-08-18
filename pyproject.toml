@@ -23,7 +23,9 @@ dev = [
 
 [tool.setuptools]
 py-modules = ["mini_coding_agent"]
-packages = ["forge_replay"]
+packages = ["forge_replay", "forge_replay.persistence", "forge_replay.runtime"]
 
 [tool.setuptools.package-dir]
 forge_replay = "src/forge_replay"
+"forge_replay.persistence" = "src/forge_replay/persistence"
+"forge_replay.runtime" = "src/forge_replay/runtime"

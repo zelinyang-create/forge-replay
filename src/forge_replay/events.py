@@ -26,6 +26,7 @@ class EventType(str, Enum):
     BUDGET_RESERVED = "budget_reserved"
     CANCELLATION_REQUESTED = "cancellation_requested"
     RUN_COMPLETED = "run_completed"
+    PROJECTION_REBUILT = "projection_rebuilt"
 
 
 class EventPayload(BaseModel):
@@ -141,6 +142,13 @@ class RunCompletedPayload(EventPayload):
     verification_status: Literal["passed", "failed", "not_configured"]
 
 
+class ProjectionRebuiltPayload(EventPayload):
+    event_type: Literal[EventType.PROJECTION_REBUILT] = EventType.PROJECTION_REBUILT
+    through_seq: int = Field(ge=1)
+    previous_state_sha256: str
+    rebuilt_state_sha256: str
+
+
 RuntimeEventPayload = Annotated[
     SessionCreatedPayload
     | UserMessageReceivedPayload
@@ -156,7 +164,8 @@ RuntimeEventPayload = Annotated[
     | CheckpointCommittedPayload
     | BudgetReservedPayload
     | CancellationRequestedPayload
-    | RunCompletedPayload,
+    | RunCompletedPayload
+    | ProjectionRebuiltPayload,
     Field(discriminator="event_type"),
 ]
 
