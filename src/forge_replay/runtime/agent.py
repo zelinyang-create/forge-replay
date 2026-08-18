@@ -8,6 +8,7 @@ from typing import Literal
 
 from forge_replay.domain import (
     ApprovalDecision,
+    ExecutionStatus,
     RunPhase,
     ToolCallState,
     ToolEffectClass,
@@ -22,7 +23,7 @@ from forge_replay.events import (
     ToolExecutionSucceededPayload,
     ToolExecutionUncertainPayload,
 )
-from forge_replay.persistence import SQLiteEventStore
+from forge_replay.persistence import BudgetLimitError, SQLiteEventStore
 from forge_replay.runtime.file_executor import DurableFileExecutor
 from forge_replay.runtime.model import ModelPort
 from forge_replay.runtime.shell_executor import DurableShellExecutor
@@ -32,7 +33,14 @@ from mini_coding_agent import MiniAgent
 
 @dataclass(frozen=True)
 class AgentOutcome:
-    status: Literal["completed", "waiting_approval", "needs_attention", "step_limit"]
+    status: Literal[
+        "completed",
+        "waiting_approval",
+        "needs_attention",
+        "step_limit",
+        "cancelled",
+        "budget_exceeded",
+    ]
     final_answer: str | None = None
     approval_id: str | None = None
     tool_call_id: str | None = None
@@ -71,7 +79,16 @@ class DurableAgentRuntime:
             owner=self.process_instance_id,
         )
         try:
-            return self._run_with_lease(run_id)
+            try:
+                return self._run_with_lease(run_id)
+            except BudgetLimitError as exc:
+                self.store.terminate_run(
+                    run_id=run_id,
+                    execution_status=ExecutionStatus.BUDGET_EXCEEDED,
+                    reason=str(exc),
+                    process_instance_id=self.process_instance_id,
+                )
+                return AgentOutcome(status="budget_exceeded", detail=str(exc))
         finally:
             self.store.release_run_lease(lease)
 
@@ -79,6 +96,15 @@ class DurableAgentRuntime:
         projection = self.store.get_run_projection(run_id)
         if projection.execution_status.value == "completed":
             return AgentOutcome(status="completed", detail="run was already completed")
+        if projection.execution_status != ExecutionStatus.ACTIVE:
+            return AgentOutcome(
+                status=(
+                    "cancelled"
+                    if projection.execution_status == ExecutionStatus.CANCELLED
+                    else "needs_attention"
+                ),
+                detail=f"run status is {projection.execution_status.value}",
+            )
         if projection.phase != RunPhase.AWAITING_MODEL:
             self.store.transition_run_phase(
                 run_id=run_id,
@@ -89,6 +115,14 @@ class DurableAgentRuntime:
             )
 
         for step in range(self.max_steps):
+            if self.store.is_cancellation_requested(run_id):
+                self.store.terminate_run(
+                    run_id=run_id,
+                    execution_status=ExecutionStatus.CANCELLED,
+                    reason="durable cancellation observed by runtime",
+                    process_instance_id=self.process_instance_id,
+                )
+                return AgentOutcome(status="cancelled", detail="cancellation requested")
             pending = self._latest_unfinished_tool(run_id)
             if pending is not None:
                 outcome = self._continue_tool(run_id, pending)
@@ -256,6 +290,12 @@ class DurableAgentRuntime:
             else:
                 return AgentOutcome(status="needs_attention", detail="unsupported tool")
             if result.state == ToolCallState.UNCERTAIN:
+                self.store.terminate_run(
+                    run_id=run_id,
+                    execution_status=ExecutionStatus.NEEDS_ATTENTION,
+                    reason="tool outcome is uncertain",
+                    process_instance_id=self.process_instance_id,
+                )
                 return AgentOutcome(
                     status="needs_attention", tool_call_id=tool_call_id, detail="tool uncertain"
                 )
@@ -276,6 +316,12 @@ class DurableAgentRuntime:
             else:
                 result = self.shell_executor.recover(attempts[0].attempt_id)
             if result.state == ToolCallState.UNCERTAIN:
+                self.store.terminate_run(
+                    run_id=run_id,
+                    execution_status=ExecutionStatus.NEEDS_ATTENTION,
+                    reason="recovered tool outcome is uncertain",
+                    process_instance_id=self.process_instance_id,
+                )
                 return AgentOutcome(
                     status="needs_attention",
                     tool_call_id=tool_call_id,

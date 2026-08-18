@@ -123,3 +123,37 @@ def test_completed_run_is_idempotent_on_resume(tmp_path):
     resumed = runtime.run("run-1")
     assert resumed.status == "completed"
     assert resumed.detail == "run was already completed"
+
+
+def test_runtime_honors_durable_cancellation_before_model_call(tmp_path):
+    _, store, runtime = build_runtime(tmp_path, ["<final>must not run</final>"])
+    store.request_cancellation(
+        run_id="run-1",
+        actor="user:test",
+        reason="stop",
+        process_instance_id="user-action",
+    )
+
+    outcome = runtime.run("run-1")
+
+    assert outcome.status == "cancelled"
+    assert store.get_run_projection("run-1").execution_status.value == "cancelled"
+
+
+def test_model_budget_exhaustion_becomes_explicit_terminal_state(tmp_path):
+    _, store, runtime = build_runtime(
+        tmp_path,
+        [
+            '<tool>{"name":"read_file","args":{"path":"README.md"}}</tool>',
+            "<final>cannot reach this within budget</final>",
+        ],
+    )
+    with store.connect() as connection:
+        connection.execute(
+            "UPDATE runs SET budget_limits_json = '{\"model_calls\":1}' WHERE run_id = 'run-1'"
+        )
+
+    outcome = runtime.run("run-1")
+
+    assert outcome.status == "budget_exceeded"
+    assert store.get_run_projection("run-1").execution_status.value == "budget_exceeded"

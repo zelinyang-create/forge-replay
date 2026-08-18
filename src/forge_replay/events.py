@@ -32,6 +32,7 @@ class EventType(str, Enum):
     BUDGET_SETTLED = "budget_settled"
     CANCELLATION_REQUESTED = "cancellation_requested"
     RUN_COMPLETED = "run_completed"
+    RUN_TERMINATED = "run_terminated"
     FINAL_ANSWER_COMMITTED = "final_answer_committed"
     PROJECTION_REBUILT = "projection_rebuilt"
 
@@ -198,6 +199,17 @@ class RunCompletedPayload(EventPayload):
     verification_status: Literal["passed", "failed", "not_configured"]
 
 
+class RunTerminatedPayload(EventPayload):
+    event_type: Literal[EventType.RUN_TERMINATED] = EventType.RUN_TERMINATED
+    execution_status: Literal[
+        ExecutionStatus.FAILED,
+        ExecutionStatus.CANCELLED,
+        ExecutionStatus.BUDGET_EXCEEDED,
+        ExecutionStatus.NEEDS_ATTENTION,
+    ]
+    reason: str
+
+
 class FinalAnswerCommittedPayload(EventPayload):
     event_type: Literal[EventType.FINAL_ANSWER_COMMITTED] = EventType.FINAL_ANSWER_COMMITTED
     answer_blob_sha256: str
@@ -232,6 +244,7 @@ RuntimeEventPayload = Annotated[
     | BudgetSettledPayload
     | CancellationRequestedPayload
     | RunCompletedPayload
+    | RunTerminatedPayload
     | FinalAnswerCommittedPayload
     | ProjectionRebuiltPayload,
     Field(discriminator="event_type"),

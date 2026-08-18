@@ -33,6 +33,7 @@ from forge_replay.events import (
     RunCompletedPayload,
     RunCreatedPayload,
     RunPhaseChangedPayload,
+    RunTerminatedPayload,
     RuntimeEventPayload,
     SessionCreatedPayload,
     ToolCallProposedPayload,
@@ -1990,6 +1991,84 @@ class SQLiteEventStore:
             phase=None,
             last_event_seq=event.seq,
         )
+
+    def terminate_run(
+        self,
+        *,
+        run_id: str,
+        execution_status: ExecutionStatus,
+        reason: str,
+        process_instance_id: str,
+    ) -> RunProjection:
+        """Commit one non-success terminal or needs-attention outcome."""
+
+        allowed = {
+            ExecutionStatus.FAILED,
+            ExecutionStatus.CANCELLED,
+            ExecutionStatus.BUDGET_EXCEEDED,
+            ExecutionStatus.NEEDS_ATTENTION,
+        }
+        if execution_status not in allowed or not reason.strip():
+            raise ValueError("invalid termination status or reason")
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._require_run_row(connection, run_id)
+                projection = reduce_run_events(
+                    self._load_run_events_in_transaction(connection, run_id)
+                )
+                if projection.execution_status != ExecutionStatus.ACTIVE:
+                    if projection.execution_status == execution_status:
+                        connection.execute("COMMIT")
+                        return projection
+                    raise RunStateConflictError("run already has a different terminal status")
+                event = self._append_event_in_transaction(
+                    connection,
+                    session_id=row["session_id"],
+                    turn_id=row["turn_id"],
+                    run_id=run_id,
+                    process_instance_id=process_instance_id,
+                    correlation_id=run_id,
+                    payload=RunTerminatedPayload(
+                        execution_status=execution_status,
+                        reason=reason,
+                    ),
+                )
+                finished_at = (
+                    None
+                    if execution_status == ExecutionStatus.NEEDS_ATTENTION
+                    else datetime.now(timezone.utc).isoformat()
+                )
+                connection.execute(
+                    """
+                    UPDATE runs
+                    SET execution_status = ?, phase = NULL, finished_at = ?,
+                        terminal_reason_json = ?, last_event_seq = ?
+                    WHERE run_id = ?
+                    """,
+                    (
+                        execution_status.value,
+                        finished_at,
+                        canonical_json({"reason": reason}),
+                        event.seq,
+                        run_id,
+                    ),
+                )
+                connection.execute("COMMIT")
+            except BaseException:
+                connection.execute("ROLLBACK")
+                raise
+        return replace(
+            projection,
+            execution_status=execution_status,
+            phase=None,
+            last_event_seq=event.seq,
+        )
+
+    def is_cancellation_requested(self, run_id: str) -> bool:
+        with self.connect() as connection:
+            row = self._require_run_row(connection, run_id)
+        return row["cancel_requested_at"] is not None
 
     def rebuild_run_projection(
         self,
