@@ -32,6 +32,13 @@ from forge_replay.tools import ProcessSupervisor, ReplaySafeFileTools
 from forge_replay.workspace import GitWorktreeManager, WorkspacePathGuard
 from forge_replay.workspace.controller import WorkspaceController
 
+EVALUATION_INSTRUCTION = """
+This is a repository coding task. Inspect the existing files and implement the requested fix
+in the worktree. Hidden tests will evaluate the resulting files after you finish. Do not stop
+after searching or merely describe a solution; make the necessary file edits, then return a
+concise final answer. Process execution is unavailable, so use file tools only.
+""".strip()
+
 
 @dataclass(frozen=True)
 class CodingRunResult:
@@ -126,7 +133,7 @@ def _run_one(
             session_id=session_id,
             turn_id=turn_id,
             run_id=run_id,
-            user_message=task.prompt,
+            user_message=f"{task.prompt}\n\n{EVALUATION_INSTRUCTION}",
             base_repo_root=repo,
             base_commit_sha=preflight.base_commit_sha,
             budget_limits={"model_calls": 24},
