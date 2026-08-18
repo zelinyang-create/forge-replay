@@ -140,6 +140,18 @@ def test_completed_run_is_idempotent_on_resume(tmp_path):
     assert resumed.detail == "run was already completed"
 
 
+def test_runtime_commits_automatic_checkpoints_on_stable_boundaries(tmp_path):
+    _, store, runtime = build_runtime(tmp_path, ["<final>Done.</final>"])
+    runtime.checkpoint_interval_events = 1
+
+    assert runtime.run("run-1").status == "completed"
+    with store.connect() as connection:
+        count = connection.execute(
+            "SELECT COUNT(*) FROM checkpoints WHERE run_id = 'run-1'"
+        ).fetchone()[0]
+    assert count >= 1
+
+
 def test_runtime_honors_durable_cancellation_before_model_call(tmp_path):
     _, store, runtime = build_runtime(tmp_path, ["<final>must not run</final>"])
     store.request_cancellation(

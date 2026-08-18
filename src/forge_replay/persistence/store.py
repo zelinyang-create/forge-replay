@@ -582,8 +582,21 @@ class SQLiteEventStore:
             self._require_run_row(connection, run_id)
             return self._load_run_events_in_transaction(connection, run_id)
 
+    def load_recent_run_events(self, run_id: str, *, limit: int = 64) -> list[EventEnvelope]:
+        """Load a bounded, chronologically ordered prompt working set."""
+
+        if limit < 1 or limit > 10_000:
+            raise ValueError("recent event limit must be between 1 and 10000")
+        with self.connect() as connection:
+            self._require_run_row(connection, run_id)
+            rows = connection.execute(
+                "SELECT * FROM events WHERE run_id = ? ORDER BY seq DESC LIMIT ?",
+                (run_id, limit),
+            ).fetchall()
+        return [self._event_from_row(row) for row in reversed(rows)]
+
     def get_run_projection(self, run_id: str) -> RunProjection:
-        return reduce_run_events(self.load_run_events(run_id))
+        return self.recover_run_projection(run_id).projection
 
     def get_run_workspace(self, run_id: str) -> RunWorkspaceRecord:
         with self.connect() as connection:
@@ -1088,6 +1101,7 @@ class SQLiteEventStore:
         run_id: str,
         checkpoint_id: str,
         process_instance_id: str,
+        execution_context: ExecutionContext | None = None,
     ) -> CheckpointRecord:
         """Atomically persist a disposable snapshot and its audit event."""
 
@@ -1096,7 +1110,11 @@ class SQLiteEventStore:
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
-                row = self._require_run_row(connection, run_id)
+                row = self._require_execution_context(
+                    connection,
+                    run_id=run_id,
+                    execution_context=execution_context,
+                )
                 projection = reduce_run_events(
                     self._load_run_events_in_transaction(connection, run_id)
                 )
@@ -1143,6 +1161,7 @@ class SQLiteEventStore:
             except BaseException:
                 connection.execute("ROLLBACK")
                 raise
+        self._advance_execution_context(execution_context, event.seq)
         return CheckpointRecord(
             checkpoint_id=checkpoint_id,
             run_id=run_id,
@@ -1151,6 +1170,16 @@ class SQLiteEventStore:
             created_at=created_at,
             committed_event=event,
         )
+
+    def latest_checkpoint_through_seq(self, run_id: str) -> int:
+        with self.connect() as connection:
+            self._require_run_row(connection, run_id)
+            row = connection.execute(
+                "SELECT COALESCE(MAX(through_seq), 0) AS through_seq "
+                "FROM checkpoints WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+        return int(row["through_seq"])
 
     def recover_run_projection(self, run_id: str) -> RecoveredRun:
         """Use the newest valid cache, falling back to older caches or full replay."""

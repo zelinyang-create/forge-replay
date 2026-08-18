@@ -3,6 +3,7 @@ import sqlite3
 import pytest
 
 from forge_replay.domain import ExecutionStatus, RunPhase
+from forge_replay.events import ModelCallStartedPayload
 from forge_replay.persistence import SQLiteEventStore
 
 
@@ -50,6 +51,54 @@ def test_recovery_replays_events_after_latest_valid_checkpoint(tmp_path):
     assert recovered.rejected_checkpoint_ids == ()
     assert recovered.projection == latest
     assert recovered.projection.last_event_seq == 6
+
+
+def test_projection_hot_path_replays_only_after_checkpoint(tmp_path, monkeypatch):
+    store = build_run(tmp_path)
+    checkpoint = store.commit_run_checkpoint(
+        run_id="run-1",
+        checkpoint_id="checkpoint-hot",
+        process_instance_id="worker-1",
+    )
+    observed_after = []
+    original = store._load_run_events_in_transaction
+
+    def recording_load(connection, run_id, *, after_seq=0):
+        observed_after.append(after_seq)
+        return original(connection, run_id, after_seq=after_seq)
+
+    monkeypatch.setattr(store, "_load_run_events_in_transaction", recording_load)
+    projection = store.get_run_projection("run-1")
+
+    assert projection.last_event_seq == checkpoint.committed_event.seq
+    assert observed_after == [checkpoint.through_seq]
+
+
+def test_recent_event_working_set_is_bounded_and_chronological(tmp_path):
+    store = build_run(tmp_path)
+    projection = store.get_run_projection("run-1")
+    for attempt in range(1, 8):
+        store.append_event(
+            session_id=projection.session_id,
+            turn_id=projection.turn_id,
+            run_id="run-1",
+            process_instance_id="worker-1",
+            payload=ModelCallStartedPayload(
+                model_call_id=f"model-{attempt}",
+                model_name="test",
+                attempt_no=1,
+            ),
+        )
+
+    recent = store.load_recent_run_events("run-1", limit=3)
+
+    assert len(recent) == 3
+    assert [event.seq for event in recent] == sorted(event.seq for event in recent)
+    assert [event.payload.model_call_id for event in recent] == [
+        "model-5",
+        "model-6",
+        "model-7",
+    ]
 
 
 def test_corrupt_latest_checkpoint_falls_back_to_older_valid_snapshot(tmp_path):

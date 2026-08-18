@@ -130,6 +130,7 @@ class DurableAgentRuntime:
         auto_approve_file_mutations: bool = False,
         auto_approve_processes: bool = False,
         process_tools_enabled: bool = True,
+        checkpoint_interval_events: int = 25,
     ):
         self.store = store
         self.model = model
@@ -141,6 +142,9 @@ class DurableAgentRuntime:
         self.auto_approve_file_mutations = auto_approve_file_mutations
         self.auto_approve_processes = auto_approve_processes
         self.process_tools_enabled = process_tools_enabled
+        if checkpoint_interval_events < 1:
+            raise ValueError("checkpoint interval must be positive")
+        self.checkpoint_interval_events = checkpoint_interval_events
 
     def run(self, run_id: str) -> AgentOutcome:
         lease = self.store.acquire_run_lease(
@@ -213,6 +217,7 @@ class DurableAgentRuntime:
 
         for _ in range(self.max_steps * 2):
             self._renew_lease(execution_context)
+            self._maybe_checkpoint(run_id, execution_context)
             if self.store.is_cancellation_requested(run_id):
                 self.store.terminate_run(
                     run_id=run_id,
@@ -573,6 +578,21 @@ class DurableAgentRuntime:
         )
         self.store.synchronize_execution_context(execution_context)
 
+    def _maybe_checkpoint(
+        self,
+        run_id: str,
+        execution_context: ExecutionContext,
+    ) -> None:
+        latest = self.store.latest_checkpoint_through_seq(run_id)
+        if execution_context.stream_version - latest < self.checkpoint_interval_events:
+            return
+        self.store.commit_run_checkpoint(
+            run_id=run_id,
+            checkpoint_id=f"auto:{run_id}:{execution_context.stream_version}",
+            process_instance_id=self.process_instance_id,
+            execution_context=execution_context,
+        )
+
     def _latest_unfinished_tool(self, run_id: str) -> str | None:
         events = self.store.load_run_events(run_id)
         for event in reversed(events):
@@ -591,7 +611,7 @@ class DurableAgentRuntime:
 
     def _prompt(self, run_id: str, step: int) -> str:
         transcript = []
-        for event in self.store.load_run_events(run_id):
+        for event in self.store.load_recent_run_events(run_id, limit=64):
             payload = event.payload
             if isinstance(payload, ModelResponseReceivedPayload):
                 transcript.append(

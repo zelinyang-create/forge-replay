@@ -114,6 +114,17 @@ class RuntimeStorePort(BlobStorePort, Protocol):
         execution_context: ExecutionContext | None = None,
     ) -> RunProjection: ...
 
+    def commit_run_checkpoint(
+        self,
+        *,
+        run_id: str,
+        checkpoint_id: str,
+        process_instance_id: str,
+        execution_context: ExecutionContext | None = None,
+    ) -> Any: ...
+
+    def latest_checkpoint_through_seq(self, run_id: str) -> int: ...
+
     def propose_tool_call(
         self,
         *,
@@ -181,6 +192,10 @@ class RuntimeStorePort(BlobStorePort, Protocol):
     def list_dispatched_attempts(self, run_id: str) -> list[ToolAttemptRecord]: ...
 
     def load_run_events(self, run_id: str) -> list[EventEnvelope]: ...
+
+    def load_recent_run_events(
+        self, run_id: str, *, limit: int = 64
+    ) -> list[EventEnvelope]: ...
 
     def get_run_user_message(self, run_id: str) -> str: ...
 
