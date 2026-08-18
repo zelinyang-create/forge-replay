@@ -101,3 +101,41 @@ def test_export_preserves_results_and_clean_only_cleanup_refuses_dirty_run(
     assert (type(repo)(artifact) / "untracked" / "result.txt").is_file()
     assert main(["--state-root", str(state), "cleanup-clean", run_id]) == 2
     assert json.loads(capsys.readouterr().out)["cleaned"] is False
+
+
+def test_cancel_and_trace_are_durable_and_trace_excludes_blob_contents(
+    tmp_path, monkeypatch, capsys
+):
+    repo = create_repo(tmp_path)
+    state = tmp_path / "state"
+
+    class FakeRuntime:
+        def run(self, run_id):
+            return AgentOutcome(status="waiting_approval", final_answer=run_id)
+
+    monkeypatch.setattr("forge_replay.cli._runtime", lambda *_args: FakeRuntime())
+    main(["--state-root", str(state), "start", "secret task", "--repo", str(repo)])
+    run_id = json.loads(capsys.readouterr().out)["run_id"]
+
+    assert main(
+        [
+            "--state-root",
+            str(state),
+            "cancel",
+            run_id,
+            "--reason",
+            "user requested stop",
+        ]
+    ) == 0
+    capsys.readouterr()
+    output = tmp_path / "trace.json"
+    assert main(["--state-root", str(state), "trace", run_id, "--output", str(output)]) == 0
+    capsys.readouterr()
+    trace = json.loads(output.read_text(encoding="utf-8"))
+    assert trace["run_id"] == run_id
+    assert trace["payload_policy"] == "blob hashes only; blob contents excluded"
+    assert "secret task" not in output.read_text(encoding="utf-8")
+    assert any(
+        event["payload"]["event_type"] == "cancellation_requested"
+        for event in trace["events"]
+    )

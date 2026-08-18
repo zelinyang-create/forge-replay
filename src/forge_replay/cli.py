@@ -52,12 +52,20 @@ def build_parser() -> argparse.ArgumentParser:
     approve.add_argument("--actor", default="cli-user")
     approve.add_argument("--reason", required=True)
 
+    cancel = subparsers.add_parser("cancel", help="Persist a cancellation request")
+    cancel.add_argument("run_id")
+    cancel.add_argument("--actor", default="cli-user")
+    cancel.add_argument("--reason", required=True)
+
     status = subparsers.add_parser("status", help="Inspect durable run state")
     status.add_argument("run_id")
     export = subparsers.add_parser("export", help="Export tracked and untracked run results")
     export.add_argument("run_id")
     cleanup = subparsers.add_parser("cleanup-clean", help="Remove only a clean owned worktree")
     cleanup.add_argument("run_id")
+    trace = subparsers.add_parser("trace", help="Export a redacted event trace")
+    trace.add_argument("run_id")
+    trace.add_argument("--output", type=Path)
     return parser
 
 
@@ -126,6 +134,16 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"approval_id": decided.approval_id, "decision": decision.value}))
         return 0
 
+    if args.command == "cancel":
+        event = store.request_cancellation(
+            run_id=args.run_id,
+            actor=args.actor,
+            reason=args.reason,
+            process_instance_id=process_instance_id,
+        )
+        print(json.dumps({"run_id": args.run_id, "event_id": str(event.event_id)}))
+        return 0
+
     if args.command in {"export", "cleanup-clean"}:
         manager = GitWorktreeManager(state_root / "workspace-state")
         results = WorktreeResultManager(manager)
@@ -153,8 +171,40 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"cleaned": cleaned, "run_id": args.run_id}))
         return 0 if cleaned else 2
 
+    if args.command == "trace":
+        events = [
+            event.model_dump(mode="json", exclude_none=True)
+            for event in store.load_run_events(args.run_id)
+        ]
+        encoded = json.dumps(
+            {
+                "schema_version": 1,
+                "run_id": args.run_id,
+                "payload_policy": "blob hashes only; blob contents excluded",
+                "events": events,
+            },
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+        if args.output:
+            output = args.output.resolve()
+            output.parent.mkdir(parents=True, exist_ok=True)
+            temporary = output.with_suffix(output.suffix + ".tmp")
+            temporary.write_text(encoded + "\n", encoding="utf-8")
+            os.replace(temporary, output)
+            print(json.dumps({"run_id": args.run_id, "output": str(output)}))
+        else:
+            print(encoded)
+        return 0
+
     projection = store.get_run_projection(args.run_id)
     workspace = store.get_run_workspace(args.run_id)
+    events = store.load_run_events(args.run_id)
+    event_counts: dict[str, int] = {}
+    for event in events:
+        key = event.payload.event_type.value
+        event_counts[key] = event_counts.get(key, 0) + 1
     print(
         json.dumps(
             {
@@ -165,6 +215,9 @@ def main(argv: list[str] | None = None) -> int:
                 "worktree_path": workspace.worktree_path,
                 "last_event_seq": projection.last_event_seq,
                 "dispatched_attempts": len(store.list_dispatched_attempts(args.run_id)),
+                "model_calls": event_counts.get("model_call_started", 0),
+                "tool_calls": event_counts.get("tool_call_proposed", 0),
+                "event_count": len(events),
             },
             indent=2,
         )
