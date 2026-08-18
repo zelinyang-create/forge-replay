@@ -1,0 +1,16 @@
+{
+  "attempts_per_second": 87.66811782912272,
+  "current_epoch": 2,
+  "durable_valid_events": 10,
+  "elapsed_seconds": 114.06655290001072,
+  "git_sha": "323ad8bc7bc2311337cce2d494cc35b967a7e6e3",
+  "old_epoch": 1,
+  "platform": "Windows-11-10.0.26200-SP0",
+  "python": "3.13.12",
+  "schema_version": 1,
+  "stale_accepted": 0,
+  "stale_attempts": 10000,
+  "stale_rejected": 10000,
+  "suite": "lease_epoch_fencing_stress_not_distributed_soak",
+  "valid_commits": 10
+}

@@ -16,8 +16,14 @@ The upstream snapshot is preserved as tag `upstream-baseline-717cae4`.
 - Typed, append-only runtime events in SQLite with WAL, checksums, immutable
   blobs, deterministic projections, and checkpoint-tail replay.
 - A durable model/tool state machine with stable UUIDv7 identities, approval
-  fingerprints, budget reservations, cancellation, bounded provider retries,
-  and expiring fenced run leases.
+  fingerprints, deterministic budget reservations, cancellation, per-attempt
+  provider retry events, and expiring run leases fenced by epoch and stream
+  version.
+- Separate idempotent control commands for approval and cancellation. Stable
+  command IDs replay the original committed result; stale UI versions and old
+  workers fail closed.
+- Automatic, checksummed checkpoints on the runtime hot path, fallback through
+  older snapshots, and a bounded 64-event prompt working set.
 - Per-run Git Worktrees plus strict path validation. User changes in the source
   checkout are refused by default and are never silently reset.
 - Replay-safe file reads, writes, patches, listings, and searches. Mutations use
@@ -76,6 +82,8 @@ All numbers below are local deterministic measurements, not production SLAs:
 | Duplicate file effects | 0 across 24 hardened fault runs | No duplicate write in the covered deterministic scenarios |
 | Automatic recovery latency | P50 20.1 ms; P95 39.0 ms | Local recovery handler time, excluding a real model call |
 | 10,000-event projection replay | 41.58 ms full vs 0.78 ms from a 200-event checkpoint tail | 53.21x CPU reducer microbenchmark speedup, not end-to-end resume latency |
+| SQLite projection recovery | P50 125.35 ms full vs 8.57 ms from a 50-event tail | 14.63x end-to-end local ledger recovery speedup over 20 paired iterations |
+| Stale-worker fencing | 10,000/10,000 old-epoch writes rejected; 0 accepted | Single-process SQLite stress of epoch takeover, not a distributed soak or capacity SLA |
 | Bailian `qwen3-coder-plus` Held-out coding | 14/24 runs passed (58.3%); task-cluster bootstrap 95% CI 25.0%–87.5% | 8 frozen tasks × 3 repeats, temperature 0, thinking off, process tool disabled |
 | Bailian end-to-end run latency | P50 11.65 s; P95 16.87 s | Model + Harness file-tool loop + durable persistence; hidden evaluator runs afterward |
 
@@ -112,9 +120,10 @@ Arbitrary processes are deliberately not claimed as exactly-once. Read-only
 tools are retryable; file writes/patches are detectable and reconcilable; an
 ambiguous process crash becomes `UNCERTAIN` and requires attention.
 
-See the [technical design](docs/harness-technical-design.md) and
-[implementation review](docs/implementation-review.md) for architecture,
-evidence, deferred scope, and remaining risks.
+See the [technical design](docs/harness-technical-design.md), the
+[v0.3 production P0 review](docs/production-p0-implementation-review.md), and
+the historical [v0.2 implementation review](docs/implementation-review.md) for
+architecture, evidence, deferred scope, and remaining risks.
 
 ## Upstream Tutorial and Baseline Documentation
 

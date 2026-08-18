@@ -1,0 +1,15 @@
+{
+  "checkpoint_recovery_ms_p50": 8.5678,
+  "checkpoint_recovery_ms_p95": 10.3671,
+  "full_recovery_ms_p50": 125.3503,
+  "full_recovery_ms_p95": 133.1532,
+  "git_sha": "323ad8bc7bc2311337cce2d494cc35b967a7e6e3",
+  "iterations": 20,
+  "p50_speedup": 14.630395200634936,
+  "platform": "Windows-11-10.0.26200-SP0",
+  "pre_checkpoint_events": 2000,
+  "python": "3.13.12",
+  "schema_version": 1,
+  "suite": "sqlite_checkpoint_recovery_end_to_end",
+  "tail_events": 50
+}
