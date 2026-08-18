@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import platform
 import statistics
+import subprocess
+import sys
 import tempfile
 import time
 from dataclasses import asdict, dataclass
@@ -30,7 +33,7 @@ class RunResult:
     tests_passed: bool
     physical_effects: int
     duplicate_effects: int
-    recovery_ms: float
+    recovery_ms: float | None
 
 
 def run_benchmark(*, task_count: int = 12) -> dict:
@@ -53,10 +56,8 @@ def _run_baseline(root: Path, task_index: int, fault: str) -> RunResult:
     if fault == "after_effect_before_persist":
         target.write_text(f"after-{task_index}\n", encoding="utf-8")
         physical_effects += 1
-    started = time.perf_counter()
     # Baseline JSON resume has neither in-flight intent nor a recovery probe.
     safe_terminal = False
-    recovery_ms = (time.perf_counter() - started) * 1_000
     return RunResult(
         variant="upstream_baseline_adapter",
         task_id=f"task-{task_index:03d}",
@@ -66,7 +67,7 @@ def _run_baseline(root: Path, task_index: int, fault: str) -> RunResult:
         tests_passed=target.read_text(encoding="utf-8") == f"after-{task_index}\n",
         physical_effects=physical_effects,
         duplicate_effects=0,
-        recovery_ms=recovery_ms,
+        recovery_ms=None,
     )
 
 
@@ -186,25 +187,58 @@ def _report(results: list[RunResult], task_count: int) -> dict:
     variants = {}
     for variant in ("upstream_baseline_adapter", "hardened"):
         selected = [result for result in results if result.variant == variant]
+        recoveries = [
+            result.recovery_ms
+            for result in selected
+            if result.safe_terminal and result.recovery_ms is not None
+        ]
         variants[variant] = {
+            "planned": len(selected),
+            "started": len(selected),
             "runs": len(selected),
             "faults_triggered": sum(result.fault_triggered for result in selected),
+            "evaluable": len(selected),
             "safe_terminal": sum(result.safe_terminal for result in selected),
             "tests_passed": sum(result.tests_passed for result in selected),
             "duplicate_effects": sum(result.duplicate_effects for result in selected),
-            "recovery_ms_p50": statistics.median(result.recovery_ms for result in selected),
-            "recovery_ms_p95": sorted(result.recovery_ms for result in selected)[
-                max(0, int(len(selected) * 0.95) - 1)
-            ],
+            "recovery_ms_p50": statistics.median(recoveries) if recoveries else None,
+            "recovery_ms_p95": (
+                sorted(recoveries)[max(0, int(len(recoveries) * 0.95) - 1)]
+                if recoveries
+                else None
+            ),
+            "by_fault": {
+                fault: {
+                    "runs": sum(result.fault == fault for result in selected),
+                    "safe_terminal": sum(
+                        result.fault == fault and result.safe_terminal for result in selected
+                    ),
+                    "tests_passed": sum(
+                        result.fault == fault and result.tests_passed for result in selected
+                    ),
+                }
+                for fault in FAULTS
+            },
         }
     return {
         "schema_version": 1,
         "suite": "deterministic_harness_conformance_not_coding_ability",
+        "analysis_population": "all_started_runs_intent_to_treat",
+        "git_sha": _git_sha(),
+        "platform": platform.platform(),
+        "python": sys.version.split()[0],
         "task_count": task_count,
         "faults": list(FAULTS),
         "variants": variants,
         "raw_runs": [asdict(result) for result in results],
     }
+
+
+def _git_sha() -> str | None:
+    completed = subprocess.run(
+        ["git", "rev-parse", "HEAD"], check=False, capture_output=True, text=True
+    )
+    return completed.stdout.strip() if completed.returncode == 0 else None
 
 
 def main(argv: list[str] | None = None) -> int:
