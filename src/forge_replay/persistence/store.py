@@ -104,6 +104,16 @@ class BudgetLimitError(LedgerError):
     """Raised when a reservation would exceed a run's durable budget."""
 
 
+class ClosingSQLiteConnection(sqlite3.Connection):
+    """Make `with store.connect()` close the OS handle after commit or rollback."""
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            return super().__exit__(exc_type, exc_value, traceback)
+        finally:
+            self.close()
+
+
 @dataclass(frozen=True)
 class BlobLimits:
     max_blob_bytes: int = 4 * 1024 * 1024
@@ -254,6 +264,7 @@ class SQLiteEventStore:
             self.path,
             timeout=self.busy_timeout_ms / 1_000,
             isolation_level=None,
+            factory=ClosingSQLiteConnection,
         )
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")

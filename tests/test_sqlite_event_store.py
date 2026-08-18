@@ -1,3 +1,4 @@
+import os
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 
@@ -135,3 +136,13 @@ def test_schema_initialization_is_idempotent(tmp_path):
     assert migrations[0]["version"] == 1
     assert len(migrations[0]["checksum"]) == 64
     assert migrations[1]["version"] == 2
+
+
+def test_connection_context_releases_database_file_handle(tmp_path):
+    store = build_store(tmp_path)
+    with store.connect() as connection:
+        connection.execute("SELECT 1").fetchone()
+
+    moved = store.path.with_suffix(".moved")
+    os.replace(store.path, moved)
+    assert moved.is_file()
