@@ -222,3 +222,23 @@ def test_invalid_tool_args_are_recorded_and_model_can_self_correct(tmp_path):
         for event in store.load_run_events("run-1")
     )
     assert "previous model tool call was rejected" in runtime.model.prompts[1]
+
+
+def test_malformed_tool_json_is_persisted_as_rejection_before_retry(tmp_path):
+    _, store, runtime = build_runtime(
+        tmp_path,
+        [
+            '<tool>{"name":"write_file","args":BROKEN}</tool>',
+            "<final>recovered</final>",
+        ],
+    )
+    outcome = runtime.run("run-1")
+    assert outcome.status == "completed"
+    rejected = [
+        event
+        for event in store.load_run_events("run-1")
+        if event.payload.event_type.value == "model_output_rejected"
+    ]
+    assert len(rejected) == 1
+    assert "malformed tool JSON" in rejected[0].payload.reason
+    assert "previous model tool call was rejected" in runtime.model.prompts[1]

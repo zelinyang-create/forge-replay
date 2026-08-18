@@ -154,6 +154,18 @@ class DurableAgentRuntime:
             response_event, raw = self._call_model(run_id, step)
             kind, payload = MiniAgent.parse(raw)
             if kind == "retry":
+                projection = self.store.get_run_projection(run_id)
+                self.store.append_event(
+                    session_id=projection.session_id,
+                    turn_id=projection.turn_id,
+                    run_id=run_id,
+                    process_instance_id=self.process_instance_id,
+                    causation_event_id=str(response_event.event_id),
+                    payload=ModelOutputRejectedPayload(
+                        response_event_id=str(response_event.event_id),
+                        reason=str(payload)[:1000],
+                    ),
+                )
                 continue
             if kind == "final":
                 answer = str(payload).strip()
