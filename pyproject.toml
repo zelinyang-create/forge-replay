@@ -8,6 +8,7 @@ version = "0.1.0"
 description = "Minimal standalone coding agent backed by Ollama"
 requires-python = ">=3.10"
 dependencies = [
+    "pydantic>=2.11,<3",
     "pytest>=9.0.2",
 ]
 
@@ -22,3 +23,7 @@ dev = [
 
 [tool.setuptools]
 py-modules = ["mini_coding_agent"]
+packages = ["forge_replay"]
+
+[tool.setuptools.package-dir]
+forge_replay = "src/forge_replay"
