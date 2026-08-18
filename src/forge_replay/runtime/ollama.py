@@ -10,14 +10,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from forge_replay.runtime.model import ModelResult
-
-
-class ModelProviderError(RuntimeError):
-    def __init__(self, message: str, *, retryable: bool, retry_after: float | None = None):
-        super().__init__(message)
-        self.retryable = retryable
-        self.retry_after = retry_after
+from forge_replay.runtime.model import ModelProviderError, ModelResult
 
 
 class OllamaTransport(Protocol):

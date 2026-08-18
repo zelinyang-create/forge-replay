@@ -66,6 +66,7 @@ class DurableAgentRuntime:
         max_output_tokens: int = 1024,
         auto_approve_file_mutations: bool = False,
         auto_approve_processes: bool = False,
+        process_tools_enabled: bool = True,
     ):
         self.store = store
         self.model = model
@@ -76,6 +77,7 @@ class DurableAgentRuntime:
         self.max_output_tokens = max_output_tokens
         self.auto_approve_file_mutations = auto_approve_file_mutations
         self.auto_approve_processes = auto_approve_processes
+        self.process_tools_enabled = process_tools_enabled
 
     def run(self, run_id: str) -> AgentOutcome:
         lease = self.store.acquire_run_lease(
@@ -397,18 +399,27 @@ class DurableAgentRuntime:
                 transcript.append(f"tool: {payload.model_dump_json()}")
             elif isinstance(payload, ApprovalDecidedPayload):
                 transcript.append(f"approval: {payload.decision}")
+        process_tool = (
+            ", run_process(argv, cwd='.', timeout_seconds=30)"
+            if self.process_tools_enabled
+            else ""
+        )
+        process_rule = (
+            " run_process argv must be a JSON list and is not a shell string."
+            if self.process_tools_enabled
+            else " Process execution is disabled; edit files without invoking commands."
+        )
         return (
             "You are ForgeReplay, a coding agent. Return exactly one JSON <tool> call or one "
             "<final> answer. Available tools: list_files(path='.'), read_file(path), "
             "search(pattern, path='.'), write_file(path, content), "
-            "patch_file(path, old_text, new_text), run_process(argv, cwd='.', "
-            "timeout_seconds=30). run_process argv must be a JSON list and is not a shell string.\n\n"
+            f"patch_file(path, old_text, new_text){process_tool}."
+            f"{process_rule}\n\n"
             f"User request:\n{self.store.get_run_user_message(run_id)}\n\n"
             f"Step: {step}\nTranscript:\n" + "\n".join(transcript[-12:])
         )
 
-    @staticmethod
-    def _classify(name: str, args: dict) -> tuple[ToolEffectClass, tuple[str, ...]]:
+    def _classify(self, name: str, args: dict) -> tuple[ToolEffectClass, tuple[str, ...]]:
         if name == "read_file":
             return ToolEffectClass.PURE, (args["path"],)
         if name in {"list_files", "search"}:
@@ -417,5 +428,7 @@ class DurableAgentRuntime:
         if name in {"write_file", "patch_file"}:
             return ToolEffectClass.DETECTABLE_IDEMPOTENT, (args["path"],)
         if name == "run_process":
+            if not self.process_tools_enabled:
+                raise ValueError("process execution is disabled for this run")
             return ToolEffectClass.NON_IDEMPOTENT, ()
         raise ValueError(f"unknown tool: {name}")

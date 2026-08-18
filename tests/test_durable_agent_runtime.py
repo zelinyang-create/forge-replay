@@ -195,3 +195,11 @@ def test_runtime_renews_lease_before_bounded_actions(tmp_path, monkeypatch):
     monkeypatch.setattr(store, "acquire_run_lease", counting_acquire)
     assert runtime.run("run-1").status == "completed"
     assert len(calls) >= 3
+
+
+def test_runtime_can_remove_process_tool_from_model_contract(tmp_path):
+    _, _, runtime = build_runtime(tmp_path, ["<final>done</final>"])
+    runtime.process_tools_enabled = False
+    assert runtime.run("run-1").status == "completed"
+    assert "Process execution is disabled" in runtime.model.prompts[0]
+    assert "run_process(argv" not in runtime.model.prompts[0]

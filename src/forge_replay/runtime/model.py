@@ -23,6 +23,15 @@ class ModelInvocationError(RuntimeError):
     """A provider failure already recorded in the durable run ledger."""
 
 
+class ModelProviderError(RuntimeError):
+    """A classified provider/transport failure suitable for bounded retry."""
+
+    def __init__(self, message: str, *, retryable: bool, retry_after: float | None = None):
+        super().__init__(message)
+        self.retryable = retryable
+        self.retry_after = retry_after
+
+
 class ScriptedModel:
     """Deterministic model used for conformance and fault tests."""
 

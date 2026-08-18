@@ -1,4 +1,4 @@
-"""Run the frozen coding suite with a real Ollama-backed ForgeReplay agent."""
+"""Run the frozen coding suite with a real ForgeReplay model provider."""
 
 from __future__ import annotations
 
@@ -22,7 +22,9 @@ from forge_replay.eval.coding_tasks import (
 from forge_replay.persistence import SQLiteEventStore
 from forge_replay.runtime.agent import DurableAgentRuntime
 from forge_replay.runtime.file_executor import DurableFileExecutor
+from forge_replay.runtime.model import ModelPort
 from forge_replay.runtime.ollama import OllamaModel
+from forge_replay.runtime.openai_chat import OpenAIChatModel
 from forge_replay.runtime.shell_executor import DurableShellExecutor
 from forge_replay.runtime.tool_identity import new_uuid7
 from forge_replay.tools import ProcessSupervisor, ReplaySafeFileTools
@@ -42,6 +44,8 @@ class CodingRunResult:
     elapsed_seconds: float
     model_calls: int
     tool_calls: int
+    input_tokens: int | None
+    output_tokens: int | None
     changed_files: tuple[str, ...]
     evaluator_stderr: str
 
@@ -50,7 +54,9 @@ def run_suite(
     *,
     output: Path,
     model: str,
-    host: str,
+    provider: str,
+    base_url: str,
+    api_key_env: str,
     split: str,
     repeats: int,
     task_ids: set[str] | None = None,
@@ -62,14 +68,36 @@ def run_suite(
     output.mkdir(parents=True, exist_ok=True)
     for task in selected:
         for repeat in range(1, repeats + 1):
-            results.append(_run_one(task, repeat, output, model=model, host=host))
-            _write_json(output / "partial-report.json", _report(results, model, split, repeats))
-    report = _report(results, model, split, repeats)
+            results.append(
+                _run_one(
+                    task,
+                    repeat,
+                    output,
+                    model=model,
+                    provider=provider,
+                    base_url=base_url,
+                    api_key_env=api_key_env,
+                )
+            )
+            _write_json(
+                output / "partial-report.json",
+                _report(results, model, provider, split, repeats),
+            )
+    report = _report(results, model, provider, split, repeats)
     _write_json(output / "report.json", report)
     return report
 
 
-def _run_one(task: CodingTask, repeat: int, output: Path, *, model: str, host: str):
+def _run_one(
+    task: CodingTask,
+    repeat: int,
+    output: Path,
+    *,
+    model: str,
+    provider: str,
+    base_url: str,
+    api_key_env: str,
+):
     run_artifacts = output / "runs" / f"{task.task_id}-r{repeat}"
     run_artifacts.mkdir(parents=True, exist_ok=False)
     with tempfile.TemporaryDirectory(prefix=f"forge-replay-{task.task_id}-") as temporary:
@@ -86,7 +114,11 @@ def _run_one(task: CodingTask, repeat: int, output: Path, *, model: str, host: s
         store.create_session(
             session_id=session_id,
             workspace_root=repo,
-            config={"model": model, "evaluation": "forge-replay-coding-tasks-v1"},
+            config={
+                "model": model,
+                "provider": provider,
+                "evaluation": "forge-replay-coding-tasks-v1",
+            },
             process_instance_id=process_id,
         )
         store.create_turn_and_run(
@@ -105,7 +137,12 @@ def _run_one(task: CodingTask, repeat: int, output: Path, *, model: str, host: s
         guard = WorkspacePathGuard(workspace.worktree_path)
         runtime = DurableAgentRuntime(
             store,
-            OllamaModel(model, host=host, timeout_seconds=120),
+            _model_provider(
+                provider=provider,
+                model=model,
+                base_url=base_url,
+                api_key_env=api_key_env,
+            ),
             DurableFileExecutor(
                 store, ReplaySafeFileTools(guard), process_instance_id=process_id
             ),
@@ -115,7 +152,8 @@ def _run_one(task: CodingTask, repeat: int, output: Path, *, model: str, host: s
             process_instance_id=process_id,
             max_steps=24,
             auto_approve_file_mutations=True,
-            auto_approve_processes=True,
+            auto_approve_processes=False,
+            process_tools_enabled=False,
         )
         started = time.perf_counter()
         try:
@@ -140,6 +178,7 @@ def _run_one(task: CodingTask, repeat: int, output: Path, *, model: str, host: s
                 "run_id": run_id,
                 "base_commit_sha": preflight.base_commit_sha,
                 "model": model,
+                "provider": provider,
                 "catalog_sha256": catalog_sha256(),
                 "outcome": outcome_name,
                 "hidden_tests_passed": passed,
@@ -153,6 +192,16 @@ def _run_one(task: CodingTask, repeat: int, output: Path, *, model: str, host: s
                 capture_output=True,
             ).stdout
         )
+        input_tokens = [
+            getattr(event.payload, "input_tokens", None)
+            for event in events
+            if event.payload.event_type.value == "model_response_received"
+        ]
+        output_tokens = [
+            getattr(event.payload, "output_tokens", None)
+            for event in events
+            if event.payload.event_type.value == "model_response_received"
+        ]
         return CodingRunResult(
             task_id=task.task_id,
             split=task.split,
@@ -164,6 +213,10 @@ def _run_one(task: CodingTask, repeat: int, output: Path, *, model: str, host: s
             elapsed_seconds=elapsed,
             model_calls=sum(event.payload.event_type.value == "model_call_started" for event in events),
             tool_calls=sum(event.payload.event_type.value == "tool_call_proposed" for event in events),
+            input_tokens=(sum(value for value in input_tokens if value is not None) if input_tokens else None),
+            output_tokens=(
+                sum(value for value in output_tokens if value is not None) if output_tokens else None
+            ),
             changed_files=changed_files,
             evaluator_stderr=evaluator_stderr[-4000:],
         )
@@ -199,7 +252,13 @@ def _evaluate(task: CodingTask, worktree: Path, evaluator_root: Path) -> tuple[b
     return completed.returncode == 0, completed.stderr
 
 
-def _report(results: list[CodingRunResult], model: str, split: str, repeats: int) -> dict:
+def _report(
+    results: list[CodingRunResult],
+    model: str,
+    provider: str,
+    split: str,
+    repeats: int,
+) -> dict:
     elapsed = [result.elapsed_seconds for result in results]
     passed = sum(result.hidden_tests_passed for result in results)
     return {
@@ -208,6 +267,7 @@ def _report(results: list[CodingRunResult], model: str, split: str, repeats: int
         "catalog": "forge-replay-coding-tasks-v1",
         "catalog_sha256": catalog_sha256(),
         "model": model,
+        "provider": provider,
         "requested_split": split,
         "requested_repeats": repeats,
         "runs": len(results),
@@ -217,8 +277,28 @@ def _report(results: list[CodingRunResult], model: str, split: str, repeats: int
         "elapsed_seconds_p95": (
             sorted(elapsed)[max(0, int(len(elapsed) * 0.95) - 1)] if elapsed else None
         ),
+        "input_tokens": sum(result.input_tokens or 0 for result in results),
+        "output_tokens": sum(result.output_tokens or 0 for result in results),
         "raw_runs": [asdict(result) for result in results],
     }
+
+
+def _model_provider(
+    *, provider: str, model: str, base_url: str, api_key_env: str
+) -> ModelPort:
+    if provider == "ollama":
+        return OllamaModel(model, host=base_url, timeout_seconds=120)
+    api_key = os.environ.get(api_key_env)
+    if not api_key:
+        raise RuntimeError(f"required API key environment variable is not set: {api_key_env}")
+    return OpenAIChatModel(
+        model,
+        api_key=api_key,
+        base_url=base_url,
+        timeout_seconds=120,
+        temperature=0.0,
+        enable_thinking=False,
+    )
 
 
 def _git(*, repo: Path, args: tuple[str, ...]) -> str:
@@ -236,8 +316,10 @@ def _write_json(path: Path, value) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path, default=Path("benchmarks/results/real-model"))
+    parser.add_argument("--provider", choices=("ollama", "openai-compatible"), default="ollama")
     parser.add_argument("--model", default="qwen3.5:4b")
-    parser.add_argument("--host", default="http://127.0.0.1:11434")
+    parser.add_argument("--base-url", default="http://127.0.0.1:11434")
+    parser.add_argument("--api-key-env", default="DASHSCOPE_API_KEY")
     parser.add_argument("--split", choices=("dev", "held_out", "all"), default="dev")
     parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument("--task", action="append", dest="tasks")
@@ -257,7 +339,9 @@ def main(argv: list[str] | None = None) -> int:
     report = run_suite(
         output=args.output,
         model=args.model,
-        host=args.host,
+        provider=args.provider,
+        base_url=args.base_url,
+        api_key_env=args.api_key_env,
         split=args.split,
         repeats=args.repeats,
         task_ids=set(args.tasks) if args.tasks else None,
