@@ -9,6 +9,7 @@ from forge_replay.events import (
     RunCreatedPayload,
     RunPhaseChangedPayload,
     RunTerminatedPayload,
+    WorkspaceDispositionChangedPayload,
     WorkspaceProvisionedPayload,
 )
 
@@ -104,6 +105,14 @@ def reduce_run_events(
             projection = replace(
                 projection,
                 workspace_disposition=WorkspaceDisposition.ACTIVE,
+                last_event_seq=event.seq,
+            )
+        elif isinstance(event.payload, WorkspaceDispositionChangedPayload):
+            if projection.workspace_disposition != event.payload.previous:
+                raise ProjectionError("workspace disposition transition does not match projection")
+            projection = replace(
+                projection,
+                workspace_disposition=event.payload.next,
                 last_event_seq=event.seq,
             )
         else:

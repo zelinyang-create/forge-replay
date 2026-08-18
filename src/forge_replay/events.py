@@ -7,7 +7,12 @@ from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from forge_replay.domain import ExecutionStatus, RunPhase, ToolEffectClass
+from forge_replay.domain import (
+    ExecutionStatus,
+    RunPhase,
+    ToolEffectClass,
+    WorkspaceDisposition,
+)
 
 
 class EventType(str, Enum):
@@ -17,6 +22,7 @@ class EventType(str, Enum):
     RUN_PHASE_CHANGED = "run_phase_changed"
     WORKSPACE_PROVISIONING_STARTED = "workspace_provisioning_started"
     WORKSPACE_PROVISIONED = "workspace_provisioned"
+    WORKSPACE_DISPOSITION_CHANGED = "workspace_disposition_changed"
     MODEL_CALL_STARTED = "model_call_started"
     MODEL_RESPONSE_RECEIVED = "model_response_received"
     MODEL_CALL_FAILED = "model_call_failed"
@@ -83,6 +89,15 @@ class WorkspaceProvisionedPayload(EventPayload):
     branch: str
     ownership_marker: str
     ownership_token_sha256: str
+
+
+class WorkspaceDispositionChangedPayload(EventPayload):
+    event_type: Literal[EventType.WORKSPACE_DISPOSITION_CHANGED] = (
+        EventType.WORKSPACE_DISPOSITION_CHANGED
+    )
+    previous: WorkspaceDisposition
+    next: WorkspaceDisposition
+    reason: str
 
 
 class ModelCallStartedPayload(EventPayload):
@@ -229,6 +244,7 @@ RuntimeEventPayload = Annotated[
     | RunPhaseChangedPayload
     | WorkspaceProvisioningStartedPayload
     | WorkspaceProvisionedPayload
+    | WorkspaceDispositionChangedPayload
     | ModelCallStartedPayload
     | ModelResponseReceivedPayload
     | ModelCallFailedPayload

@@ -7,7 +7,7 @@ import json
 import os
 from pathlib import Path
 
-from forge_replay.domain import ApprovalDecision
+from forge_replay.domain import ApprovalDecision, WorkspaceDisposition
 from forge_replay.persistence import SQLiteEventStore
 from forge_replay.runtime.agent import AgentOutcome, DurableAgentRuntime
 from forge_replay.runtime.file_executor import DurableFileExecutor
@@ -17,6 +17,7 @@ from forge_replay.runtime.tool_identity import new_uuid7
 from forge_replay.tools import ProcessSupervisor, ReplaySafeFileTools
 from forge_replay.workspace import GitWorktreeManager, WorkspacePathGuard
 from forge_replay.workspace.controller import WorkspaceController
+from forge_replay.workspace.results import WorktreeResultManager
 
 
 def default_state_root() -> Path:
@@ -53,6 +54,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     status = subparsers.add_parser("status", help="Inspect durable run state")
     status.add_argument("run_id")
+    export = subparsers.add_parser("export", help="Export tracked and untracked run results")
+    export.add_argument("run_id")
+    cleanup = subparsers.add_parser("cleanup-clean", help="Remove only a clean owned worktree")
+    cleanup.add_argument("run_id")
     return parser
 
 
@@ -120,6 +125,33 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(json.dumps({"approval_id": decided.approval_id, "decision": decision.value}))
         return 0
+
+    if args.command in {"export", "cleanup-clean"}:
+        manager = GitWorktreeManager(state_root / "workspace-state")
+        results = WorktreeResultManager(manager)
+        workspace = store.get_run_workspace(args.run_id)
+        if args.command == "export":
+            artifact = results.export(args.run_id)
+            store.set_workspace_disposition(
+                run_id=args.run_id,
+                expected=workspace.disposition,
+                target=WorkspaceDisposition.EXPORTED,
+                reason="result artifact exported by CLI",
+                process_instance_id=process_instance_id,
+            )
+            print(json.dumps({"artifact_root": str(artifact.artifact_root)}, indent=2))
+            return 0
+        cleaned = results.cleanup_if_clean(args.run_id)
+        if cleaned:
+            store.set_workspace_disposition(
+                run_id=args.run_id,
+                expected=workspace.disposition,
+                target=WorkspaceDisposition.CLEANED,
+                reason="verified clean worktree removed by CLI",
+                process_instance_id=process_instance_id,
+            )
+        print(json.dumps({"cleaned": cleaned, "run_id": args.run_id}))
+        return 0 if cleaned else 2
 
     projection = store.get_run_projection(args.run_id)
     workspace = store.get_run_workspace(args.run_id)

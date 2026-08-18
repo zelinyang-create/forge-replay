@@ -77,3 +77,27 @@ def test_status_reads_existing_run_without_model_or_git_side_effect(tmp_path, mo
     status = json.loads(capsys.readouterr().out)
     assert status["run_id"] == run_id
     assert status["workspace_disposition"] == "active"
+
+
+def test_export_preserves_results_and_clean_only_cleanup_refuses_dirty_run(
+    tmp_path, monkeypatch, capsys
+):
+    repo = create_repo(tmp_path)
+    state = tmp_path / "state"
+
+    class FakeRuntime:
+        def run(self, run_id):
+            return AgentOutcome(status="completed", final_answer=run_id)
+
+    monkeypatch.setattr("forge_replay.cli._runtime", lambda *_args: FakeRuntime())
+    main(["--state-root", str(state), "start", "task", "--repo", str(repo)])
+    run_id = json.loads(capsys.readouterr().out)["run_id"]
+    main(["--state-root", str(state), "status", run_id])
+    worktree = json.loads(capsys.readouterr().out)["worktree_path"]
+    (type(repo)(worktree) / "result.txt").write_text("result\n", encoding="utf-8")
+
+    assert main(["--state-root", str(state), "export", run_id]) == 0
+    artifact = json.loads(capsys.readouterr().out)["artifact_root"]
+    assert (type(repo)(artifact) / "untracked" / "result.txt").is_file()
+    assert main(["--state-root", str(state), "cleanup-clean", run_id]) == 2
+    assert json.loads(capsys.readouterr().out)["cleaned"] is False

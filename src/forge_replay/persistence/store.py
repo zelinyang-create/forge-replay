@@ -42,6 +42,7 @@ from forge_replay.events import (
     ToolExecutionSucceededPayload,
     ToolExecutionUncertainPayload,
     UserMessageReceivedPayload,
+    WorkspaceDispositionChangedPayload,
     WorkspaceProvisionedPayload,
     WorkspaceProvisioningStartedPayload,
     new_event,
@@ -795,6 +796,72 @@ class SQLiteEventStore:
                         phase_event.seq,
                         run_id,
                     ),
+                )
+                connection.execute("COMMIT")
+            except BaseException:
+                connection.execute("ROLLBACK")
+                raise
+        return self.get_run_workspace(run_id)
+
+    def set_workspace_disposition(
+        self,
+        *,
+        run_id: str,
+        expected: WorkspaceDisposition,
+        target: WorkspaceDisposition,
+        reason: str,
+        process_instance_id: str,
+    ) -> RunWorkspaceRecord:
+        if not reason.strip() or target == expected:
+            raise ValueError("workspace disposition change is invalid")
+        allowed_transitions = {
+            WorkspaceDisposition.ACTIVE: {
+                WorkspaceDisposition.EXPORTED,
+                WorkspaceDisposition.CLEANED,
+                WorkspaceDisposition.PRESERVED,
+                WorkspaceDisposition.QUARANTINED,
+            },
+            WorkspaceDisposition.EXPORTED: {
+                WorkspaceDisposition.CLEANED,
+                WorkspaceDisposition.PRESERVED,
+                WorkspaceDisposition.INTEGRATED,
+            },
+            WorkspaceDisposition.PRESERVED: {
+                WorkspaceDisposition.EXPORTED,
+                WorkspaceDisposition.INTEGRATED,
+                WorkspaceDisposition.QUARANTINED,
+            },
+            WorkspaceDisposition.ORPHANED: {
+                WorkspaceDisposition.QUARANTINED,
+            },
+        }
+        if target not in allowed_transitions.get(expected, set()):
+            raise ValueError(f"illegal workspace disposition transition: {expected} -> {target}")
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._require_run_row(connection, run_id)
+                if WorkspaceDisposition(row["workspace_disposition"]) != expected:
+                    raise RunStateConflictError("workspace disposition changed concurrently")
+                event = self._append_event_in_transaction(
+                    connection,
+                    session_id=row["session_id"],
+                    turn_id=row["turn_id"],
+                    run_id=run_id,
+                    process_instance_id=process_instance_id,
+                    correlation_id=run_id,
+                    payload=WorkspaceDispositionChangedPayload(
+                        previous=expected,
+                        next=target,
+                        reason=reason,
+                    ),
+                )
+                connection.execute(
+                    """
+                    UPDATE runs SET workspace_disposition = ?, last_event_seq = ?
+                    WHERE run_id = ?
+                    """,
+                    (target.value, event.seq, run_id),
                 )
                 connection.execute("COMMIT")
             except BaseException:
