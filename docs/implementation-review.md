@@ -56,7 +56,7 @@ ForgeReplay 已经从上游的教学型单文件 Agent，形成一个可以独�
 - Hardened：24/24 达到安全终态并通过后置条件。
 - Baseline adapter：0/24 能判断安全终态；其中 12/24 因崩溃发生在写后而偶然满足文件后置条件，但没有恢复证据。
 - Hardened 覆盖运行中的重复文件副作用：0；必须连同分母“24 次、两个 crash window”一起陈述。
-- 自动恢复处理时延：P50 15.99 ms、P95 18.66 ms；不包含模型调用。
+- 自动恢复处理时延：P50 20.08 ms、P95 38.96 ms；不包含模型调用。
 
 这组实验只证明共享文件 crash window 的 Harness 语义，不是 Coding Agent 任务成功率，也不能外推到任意外部 API 或 Shell。
 
@@ -64,9 +64,9 @@ ForgeReplay 已经从上游的教学型单文件 Agent，形成一个可以独�
 
 在 Windows 11 / Python 3.13.12 的本机 CPU microbenchmark 中，10,000 个事件、50 次重复：
 
-- 全量 reducer replay P50：42.37 ms。
+- 全量 reducer replay P50：41.58 ms。
 - 从 checkpoint 后 200 个 tail events replay P50：0.78 ms。
-- P50 reducer speedup：54.65x。
+- P50 reducer speedup：53.21x。
 
 结果反映纯 Projection replay 成本；SQLite 打开、Blob 加载、Worktree 检查、模型和工具时延不在测量范围。
 

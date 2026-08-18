@@ -74,8 +74,8 @@ All numbers below are local deterministic measurements, not production SLAs:
 |---|---:|---|
 | Shared file-effect crash boundaries | 24/24 safe hardened recoveries; 0/24 baseline safe terminals | Harness recovery semantics under two injected file crash windows |
 | Duplicate file effects | 0 across 24 hardened fault runs | No duplicate write in the covered deterministic scenarios |
-| Automatic recovery latency | P50 16.0 ms; P95 18.7 ms | Local recovery handler time, excluding a real model call |
-| 10,000-event projection replay | 42.37 ms full vs 0.78 ms from a 200-event checkpoint tail | 54.65x CPU reducer microbenchmark speedup, not end-to-end resume latency |
+| Automatic recovery latency | P50 20.1 ms; P95 39.0 ms | Local recovery handler time, excluding a real model call |
+| 10,000-event projection replay | 41.58 ms full vs 0.78 ms from a 200-event checkpoint tail | 53.21x CPU reducer microbenchmark speedup, not end-to-end resume latency |
 
 Raw reports, per-run rows, Git metadata, platform, and denominators are in
 [`benchmarks/results`](benchmarks/results). The real-model coding runner is
