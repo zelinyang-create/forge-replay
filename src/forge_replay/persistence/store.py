@@ -7,7 +7,7 @@ import json
 import math
 import sqlite3
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal
 
@@ -102,6 +102,10 @@ class ApprovalConflictError(LedgerError):
 
 class BudgetLimitError(LedgerError):
     """Raised when a reservation would exceed a run's durable budget."""
+
+
+class LeaseConflictError(LedgerError):
+    """Raised when another live worker owns the run lease."""
 
 
 class ClosingSQLiteConnection(sqlite3.Connection):
@@ -229,6 +233,14 @@ class RunWorkspaceRecord:
     worktree_path: str | None
     worktree_branch: str | None
     disposition: WorkspaceDisposition
+
+
+@dataclass(frozen=True)
+class RunLease:
+    run_id: str
+    owner: str
+    epoch: int
+    expires_at: datetime
 
 
 def canonical_json(value: Any) -> str:
@@ -580,6 +592,75 @@ class SQLiteEventStore:
             worktree_branch=row["worktree_branch"],
             disposition=WorkspaceDisposition(row["workspace_disposition"]),
         )
+
+    def acquire_run_lease(
+        self,
+        *,
+        run_id: str,
+        owner: str,
+        ttl_seconds: float = 300,
+        now: datetime | None = None,
+    ) -> RunLease:
+        """Acquire, renew, or take over an expired fenced run lease."""
+
+        if not owner.strip() or not 1 <= ttl_seconds <= 3600:
+            raise ValueError("lease owner and TTL are invalid")
+        observed_at = now or datetime.now(timezone.utc)
+        expires_at = observed_at + timedelta(seconds=ttl_seconds)
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._require_run_row(connection, run_id)
+                current_expiry = (
+                    datetime.fromisoformat(row["lease_expires_at"])
+                    if row["lease_expires_at"]
+                    else None
+                )
+                if (
+                    row["lease_owner"]
+                    and row["lease_owner"] != owner
+                    and current_expiry is not None
+                    and current_expiry > observed_at
+                ):
+                    raise LeaseConflictError(
+                        f"run {run_id} is leased by {row['lease_owner']} until {current_expiry.isoformat()}"
+                    )
+                epoch = row["lease_epoch"]
+                if row["lease_owner"] != owner:
+                    epoch += 1
+                connection.execute(
+                    """
+                    UPDATE runs
+                    SET lease_owner = ?, lease_epoch = ?, lease_expires_at = ?
+                    WHERE run_id = ?
+                    """,
+                    (owner, epoch, expires_at.isoformat(), run_id),
+                )
+                connection.execute("COMMIT")
+            except BaseException:
+                connection.execute("ROLLBACK")
+                raise
+        return RunLease(run_id=run_id, owner=owner, epoch=epoch, expires_at=expires_at)
+
+    def release_run_lease(self, lease: RunLease) -> None:
+        """Release only when owner and fencing epoch still match."""
+
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = connection.execute(
+                    """
+                    UPDATE runs SET lease_owner = NULL, lease_expires_at = NULL
+                    WHERE run_id = ? AND lease_owner = ? AND lease_epoch = ?
+                    """,
+                    (lease.run_id, lease.owner, lease.epoch),
+                )
+                if cursor.rowcount != 1:
+                    raise LeaseConflictError("lease fencing token is stale")
+                connection.execute("COMMIT")
+            except BaseException:
+                connection.execute("ROLLBACK")
+                raise
 
     def begin_workspace_provisioning(
         self,

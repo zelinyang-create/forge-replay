@@ -66,6 +66,16 @@ class DurableAgentRuntime:
         self.auto_approve_processes = auto_approve_processes
 
     def run(self, run_id: str) -> AgentOutcome:
+        lease = self.store.acquire_run_lease(
+            run_id=run_id,
+            owner=self.process_instance_id,
+        )
+        try:
+            return self._run_with_lease(run_id)
+        finally:
+            self.store.release_run_lease(lease)
+
+    def _run_with_lease(self, run_id: str) -> AgentOutcome:
         projection = self.store.get_run_projection(run_id)
         if projection.execution_status.value == "completed":
             return AgentOutcome(status="completed", detail="run was already completed")
