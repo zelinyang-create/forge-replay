@@ -74,7 +74,16 @@ ForgeReplay 已经从上游的教学型单文件 Agent，形成一个可以独�
 
 已冻结 24 题、6 类、16 Dev + 8 Held-out 的 `forge-replay-coding-tasks-v1`，每题从失败 seed commit 开始，隐藏 evaluator 位于 Agent Worktree 之外。Runner 会保存 task/run manifest、event trace、binary patch、测试结果和耗时，并把所有已启动运行按 intent-to-treat 计入分母。
 
-当前机器未安装 Ollama，所以没有发布真实 Task Success Rate。Scripted Model 只能验证状态机，不能作为 Coding 成功率。Held-out 正式数字应在无秘密、默认断网的一次性环境中，固定模型 digest、参数、硬件和每题 3 次运行后生成。
+使用百炼 OpenAI 兼容接口的 `qwen3-coder-plus`，固定 temperature=0、thinking 关闭、Agent 进程工具关闭，对 8 个 Held-out 任务各运行 3 次：
+
+- Hidden-test Task Success：14/24（58.3%）。
+- 按 `task_id` 聚类的 Bootstrap 95% CI：25.0%–87.5%（8 个 cluster，区间较宽，不应包装成稳定生产指标）。
+- 8 题中 5 题至少通过一次，4 题三次全部通过。
+- 24/24 运行正常到达 `completed`；没有 Provider、Runtime 或工具崩溃。
+- 端到端 Agent Run：P50 11.65 秒，P95 16.87 秒；隐藏 evaluator 在计时结束后运行。
+- 110 次模型调用、86 次逻辑工具调用；累计 40,788 输入、9,952 输出 tokens。
+
+逐题结果为：`api-004` 3/3、`data-004` 0/3、`multi-004` 2/3、`reliability-004` 3/3、`security-002` 0/3、`security-003` 0/3、`security-004` 3/3、`single-004` 3/3。失败样本全部保留；没有事后更换题目。公开报告移除了 API Key 和本机路径，私有错误日志只保留在本地。
 
 ## 5. 本轮 Review 发现并修复的问题
 
@@ -85,6 +94,9 @@ ForgeReplay 已经从上游的教学型单文件 Agent，形成一个可以独�
 5. 故障报告曾对不能恢复的 baseline 计算接近 0 ms 的“恢复时延”。现在仅对安全恢复样本报告时延，并加入 planned/started/triggered/evaluable 分母和按故障分层结果。
 6. 原 CLI 缺少取消和可审计轨迹出口。现已增加 durable cancel、blob-content-excluded trace 和运行计数。
 7. 真实模型基准若直接运行会执行模型生成的代码。Runner 现在默认拒绝，要求显式确认，并在文档中把一次性隔离环境设为前置条件。
+8. 百炼模型常用 `arguments` 而不是 `args`，且可能返回无效 JSON。Runtime 现在兼容别名，并把解析/参数拒绝作为类型化事件反馈给下一轮模型。
+9. Windows CRLF 与模型 LF 补丁曾导致派发前冲突。文件工具现在在保留目标换行风格的前提下做跨平台匹配；规划失败会持久化为零副作用的 Tool Failure，不再崩掉 Run。
+10. Hidden evaluator 曾生成 `__pycache__` 并污染 changed-files 指标。现以 `-B`/`PYTHONDONTWRITEBYTECODE` 执行，并修正 Git porcelain 路径解析。
 
 ## 6. 剩余风险与下一版本
 

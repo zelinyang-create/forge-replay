@@ -1,0 +1,11 @@
+{
+  "base_commit_sha": "1e5668505eac7a734d89029f382a6dc2f9cad159",
+  "catalog_sha256": "250fa50095749ecb6a6a21bf57e88ebd94e958a736ae1883ba9611cb1a23916a",
+  "hidden_tests_passed": true,
+  "model": "qwen3-coder-plus",
+  "outcome": "completed",
+  "provider": "openai-compatible",
+  "repeat": 1,
+  "run_id": "run-01a016c5-9d6e-7a9a-b82e-5ec037959046",
+  "task_id": "multi-004"
+}

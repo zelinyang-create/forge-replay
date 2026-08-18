@@ -1,0 +1,538 @@
+{
+  "analysis_population": "all_started_runs_intent_to_treat",
+  "artifact_policy": "API credentials and local paths excluded; evaluator errors reduced to final line",
+  "bootstrap_samples": 10000,
+  "by_category": {
+    "cli_api_contract": {
+      "passed": 3,
+      "runs": 3
+    },
+    "data_parsing": {
+      "passed": 0,
+      "runs": 3
+    },
+    "multi_file_change": {
+      "passed": 2,
+      "runs": 3
+    },
+    "reliability": {
+      "passed": 3,
+      "runs": 3
+    },
+    "security_engineering": {
+      "passed": 3,
+      "runs": 9
+    },
+    "single_file_bug": {
+      "passed": 3,
+      "runs": 3
+    }
+  },
+  "by_task": {
+    "api-004": {
+      "pass_rate": 1.0,
+      "passed": 3,
+      "runs": 3
+    },
+    "data-004": {
+      "pass_rate": 0.0,
+      "passed": 0,
+      "runs": 3
+    },
+    "multi-004": {
+      "pass_rate": 0.6666666666666666,
+      "passed": 2,
+      "runs": 3
+    },
+    "reliability-004": {
+      "pass_rate": 1.0,
+      "passed": 3,
+      "runs": 3
+    },
+    "security-002": {
+      "pass_rate": 0.0,
+      "passed": 0,
+      "runs": 3
+    },
+    "security-003": {
+      "pass_rate": 0.0,
+      "passed": 0,
+      "runs": 3
+    },
+    "security-004": {
+      "pass_rate": 1.0,
+      "passed": 3,
+      "runs": 3
+    },
+    "single-004": {
+      "pass_rate": 1.0,
+      "passed": 3,
+      "runs": 3
+    }
+  },
+  "catalog": "forge-replay-coding-tasks-v1",
+  "catalog_sha256": "250fa50095749ecb6a6a21bf57e88ebd94e958a736ae1883ba9611cb1a23916a",
+  "elapsed_seconds_p50": 11.651991200007615,
+  "elapsed_seconds_p95": 16.866009600023972,
+  "git_sha": "a6a778f5efe3739fc6df735182dcece24b38ddc4",
+  "hidden_tests_passed": 14,
+  "input_tokens": 40788,
+  "model": "qwen3-coder-plus",
+  "model_calls": 110,
+  "outcomes": {
+    "completed": 24
+  },
+  "output_tokens": 9952,
+  "platform": "Windows-11-10.0.26200-SP0",
+  "private_report_sha256": "7cd36c2431f1b50c039749736a9ef2952e32f25e95d23b8494d390138174c49c",
+  "provider": "openai-compatible",
+  "python": "3.13.12",
+  "raw_runs": [
+    {
+      "category": "single_file_bug",
+      "changed_files": [
+        "solution.py"
+      ],
+      "elapsed_seconds": 11.9650690999988,
+      "evaluator_error": null,
+      "hidden_tests_passed": true,
+      "input_tokens": 1188,
+      "model_calls": 4,
+      "outcome": "completed",
+      "output_tokens": 313,
+      "repeat": 1,
+      "run_id": "run-01a016c3-7a73-794e-94e9-3e058fe363f1",
+      "split": "held_out",
+      "task_id": "single-004",
+      "tool_calls": 3
+    },
+    {
+      "category": "single_file_bug",
+      "changed_files": [
+        "solution.py"
+      ],
+      "elapsed_seconds": 11.106894200027455,
+      "evaluator_error": null,
+      "hidden_tests_passed": true,
+      "input_tokens": 1189,
+      "model_calls": 4,
+      "outcome": "completed",
+      "output_tokens": 304,
+      "repeat": 2,
+      "run_id": "run-01a016c3-b849-7bdc-b31b-624667b8522b",
+      "split": "held_out",
+      "task_id": "single-004",
+      "tool_calls": 3
+    },
+    {
+      "category": "single_file_bug",
+      "changed_files": [
+        "solution.py"
+      ],
+      "elapsed_seconds": 11.33891330001643,
+      "evaluator_error": null,
+      "hidden_tests_passed": true,
+      "input_tokens": 1189,
+      "model_calls": 4,
+      "outcome": "completed",
+      "output_tokens": 329,
+      "repeat": 3,
+      "run_id": "run-01a016c3-f528-7d81-afd0-fa40ce9cad6f",
+      "split": "held_out",
+      "task_id": "single-004",
+      "tool_calls": 3
+    },
+    {
+      "category": "data_parsing",
+      "changed_files": [],
+      "elapsed_seconds": 9.295438400004059,
+      "evaluator_error": "ValueError: too many values to unpack (expected 3)",
+      "hidden_tests_passed": false,
+      "input_tokens": 683,
+      "model_calls": 3,
+      "outcome": "completed",
+      "output_tokens": 356,
+      "repeat": 1,
+      "run_id": "run-01a016c4-345f-7d2b-a1eb-6ef96a27492e",
+      "split": "held_out",
+      "task_id": "data-004",
+      "tool_calls": 2
+    },
+    {
+      "category": "data_parsing",
+      "changed_files": [
+        "solution.py"
+      ],
+      "elapsed_seconds": 13.845216400019126,
+      "evaluator_error": "AssertionError",
+      "hidden_tests_passed": false,
+      "input_tokens": 1336,
+      "model_calls": 4,
+      "outcome": "completed",
+      "output_tokens": 417,
+      "repeat": 2,
+      "run_id": "run-01a016c4-699e-7527-801d-f579ea08f86a",
+      "split": "held_out",
+      "task_id": "data-004",
+      "tool_calls": 3
+    },
+    {
+      "category": "data_parsing",
+      "changed_files": [
+        "solution.py"
+      ],
+      "elapsed_seconds": 12.765726199984783,
+      "evaluator_error": "AssertionError",
+      "hidden_tests_passed": false,
+      "input_tokens": 1339,
+      "model_calls": 4,
+      "outcome": "completed",
+      "output_tokens": 405,
+      "repeat": 3,
+      "run_id": "run-01a016c4-ada3-7450-ace3-6a5a19ae448b",
+      "split": "held_out",
+      "task_id": "data-004",
+      "tool_calls": 3
+    },
+    {
+      "category": "cli_api_contract",
+      "changed_files": [
+        "solution.py"
+      ],
+      "elapsed_seconds": 11.08384519998799,
+      "evaluator_error": null,
+      "hidden_tests_passed": true,
+      "input_tokens": 1158,
+      "model_calls": 4,
+      "outcome": "completed",
+      "output_tokens": 256,
+      "repeat": 1,
+      "run_id": "run-01a016c4-eff3-7d94-9abc-cec555059ced",
+      "split": "held_out",
+      "task_id": "api-004",
+      "tool_calls": 3
+    },
+    {
+      "category": "cli_api_contract",
+      "changed_files": [
+        "solution.py"
+      ],
+      "elapsed_seconds": 12.771128699998371,
+      "evaluator_error": null,
+      "hidden_tests_passed": true,
+      "input_tokens": 1268,
+      "model_calls": 4,
+      "outcome": "completed",
+      "output_tokens": 449,
+      "repeat": 2,
+      "run_id": "run-01a016c5-2913-754b-a7d8-357b3cb6f182",
+      "split": "held_out",
+      "task_id": "api-004",
+      "tool_calls": 3
+    },
+    {
+      "category": "cli_api_contract",
+      "changed_files": [
+        "solution.py"
+      ],
+      "elapsed_seconds": 12.429598699993221,
+      "evaluator_error": null,
+      "hidden_tests_passed": true,
+      "input_tokens": 1168,
+      "model_calls": 4,
+      "outcome": "completed",
+      "output_tokens": 382,
+      "repeat": 3,
+      "run_id": "run-01a016c5-68b5-729a-b9d3-677967992cfa",
+      "split": "held_out",
+      "task_id": "api-004",
+      "tool_calls": 3
+    },
+    {
+      "category": "multi_file_change",
+      "changed_files": [
+        "consumer_a.py",
+        "consumer_b.py",
+        "text_utils.py"
+      ],
+      "elapsed_seconds": 20.668733400001656,
+      "evaluator_error": null,
+      "hidden_tests_passed": true,
+      "input_tokens": 4284,
+      "model_calls": 10,
+      "outcome": "completed",
+      "output_tokens": 408,
+      "repeat": 1,
+      "run_id": "run-01a016c5-9d6e-7a9a-b82e-5ec037959046",
+      "split": "held_out",
+      "task_id": "multi-004",
+      "tool_calls": 9
+    },
+    {
+      "category": "multi_file_change",
+      "changed_files": [
+        "consumer_a.py",
+        "consumer_b.py",
+        "text_utils.py"
+      ],
+      "elapsed_seconds": 14.792402399994899,
+      "evaluator_error": null,
+      "hidden_tests_passed": true,
+      "input_tokens": 3280,
+      "model_calls": 8,
+      "outcome": "completed",
+      "output_tokens": 348,
+      "repeat": 2,
+      "run_id": "run-01a016c5-f1a0-7371-afc1-6a9946a4ce88",
+      "split": "held_out",
+      "task_id": "multi-004",
+      "tool_calls": 7
+    },
+    {
+      "category": "multi_file_change",
+      "changed_files": [],
+      "elapsed_seconds": 10.153941600001417,
+      "evaluator_error": "AttributeError: module 'text_utils' has no attribute 'normalize'",
+      "hidden_tests_passed": false,
+      "input_tokens": 1277,
+      "model_calls": 4,
+      "outcome": "completed",
+      "output_tokens": 407,
+      "repeat": 3,
+      "run_id": "run-01a016c6-2ee9-7f6e-97e9-26366fb1b745",
+      "split": "held_out",
+      "task_id": "multi-004",
+      "tool_calls": 3
+    },
+    {
+      "category": "reliability",
+      "changed_files": [
+        "solution.py"
+      ],
+      "elapsed_seconds": 9.993416799989063,
+      "evaluator_error": null,
+      "hidden_tests_passed": true,
+      "input_tokens": 1178,
+      "model_calls": 4,
+      "outcome": "completed",
+      "output_tokens": 257,
+      "repeat": 1,
+      "run_id": "run-01a016c6-5a10-7391-b1cf-775e48e58484",
+      "split": "held_out",
+      "task_id": "reliability-004",
+      "tool_calls": 3
+    },
+    {
+      "category": "reliability",
+      "changed_files": [
+        "solution.py"
+      ],
+      "elapsed_seconds": 8.292410499998368,
+      "evaluator_error": null,
+      "hidden_tests_passed": true,
+      "input_tokens": 1178,
+      "model_calls": 4,
+      "outcome": "completed",
+      "output_tokens": 257,
+      "repeat": 2,
+      "run_id": "run-01a016c6-8485-785b-9d21-472605e3504c",
+      "split": "held_out",
+      "task_id": "reliability-004",
+      "tool_calls": 3
+    },
+    {
+      "category": "reliability",
+      "changed_files": [
+        "solution.py"
+      ],
+      "elapsed_seconds": 9.286676899995655,
+      "evaluator_error": null,
+      "hidden_tests_passed": true,
+      "input_tokens": 1178,
+      "model_calls": 4,
+      "outcome": "completed",
+      "output_tokens": 308,
+      "repeat": 3,
+      "run_id": "run-01a016c6-a860-7513-a9c9-aea97ac97fc8",
+      "split": "held_out",
+      "task_id": "reliability-004",
+      "tool_calls": 3
+    },
+    {
+      "category": "security_engineering",
+      "changed_files": [
+        "solution.py"
+      ],
+      "elapsed_seconds": 12.19280030002119,
+      "evaluator_error": "AssertionError",
+      "hidden_tests_passed": false,
+      "input_tokens": 1264,
+      "model_calls": 4,
+      "outcome": "completed",
+      "output_tokens": 405,
+      "repeat": 1,
+      "run_id": "run-01a016c6-d018-73a8-b0c2-533695007fb8",
+      "split": "held_out",
+      "task_id": "security-002",
+      "tool_calls": 3
+    },
+    {
+      "category": "security_engineering",
+      "changed_files": [
+        "solution.py"
+      ],
+      "elapsed_seconds": 9.36192550000851,
+      "evaluator_error": "AssertionError",
+      "hidden_tests_passed": false,
+      "input_tokens": 1125,
+      "model_calls": 4,
+      "outcome": "completed",
+      "output_tokens": 260,
+      "repeat": 2,
+      "run_id": "run-01a016c7-0321-7304-b46d-7d69ea59c2dc",
+      "split": "held_out",
+      "task_id": "security-002",
+      "tool_calls": 3
+    },
+    {
+      "category": "security_engineering",
+      "changed_files": [
+        "solution.py"
+      ],
+      "elapsed_seconds": 9.385863999981666,
+      "evaluator_error": "AssertionError",
+      "hidden_tests_passed": false,
+      "input_tokens": 1223,
+      "model_calls": 4,
+      "outcome": "completed",
+      "output_tokens": 358,
+      "repeat": 3,
+      "run_id": "run-01a016c7-2afd-7ef7-b59b-444cc7c01325",
+      "split": "held_out",
+      "task_id": "security-002",
+      "tool_calls": 3
+    },
+    {
+      "category": "security_engineering",
+      "changed_files": [
+        "solution.py"
+      ],
+      "elapsed_seconds": 16.866009600023972,
+      "evaluator_error": "AssertionError",
+      "hidden_tests_passed": false,
+      "input_tokens": 1598,
+      "model_calls": 4,
+      "outcome": "completed",
+      "output_tokens": 776,
+      "repeat": 1,
+      "run_id": "run-01a016c7-530b-7bbb-b18b-20878ef33aea",
+      "split": "held_out",
+      "task_id": "security-003",
+      "tool_calls": 3
+    },
+    {
+      "category": "security_engineering",
+      "changed_files": [
+        "solution.py"
+      ],
+      "elapsed_seconds": 34.6102688999963,
+      "evaluator_error": "AssertionError",
+      "hidden_tests_passed": false,
+      "input_tokens": 7639,
+      "model_calls": 9,
+      "outcome": "completed",
+      "output_tokens": 1453,
+      "repeat": 2,
+      "run_id": "run-01a016c7-9864-7c00-ae09-bb4325fc9bc2",
+      "split": "held_out",
+      "task_id": "security-003",
+      "tool_calls": 8
+    },
+    {
+      "category": "security_engineering",
+      "changed_files": [
+        "solution.py"
+      ],
+      "elapsed_seconds": 16.639764099993045,
+      "evaluator_error": "AssertionError",
+      "hidden_tests_passed": false,
+      "input_tokens": 1516,
+      "model_calls": 4,
+      "outcome": "completed",
+      "output_tokens": 672,
+      "repeat": 3,
+      "run_id": "run-01a016c8-22d8-7a90-95d2-d1ce1a068e51",
+      "split": "held_out",
+      "task_id": "security-003",
+      "tool_calls": 3
+    },
+    {
+      "category": "security_engineering",
+      "changed_files": [
+        "solution.py"
+      ],
+      "elapsed_seconds": 8.708239200001117,
+      "evaluator_error": null,
+      "hidden_tests_passed": true,
+      "input_tokens": 1157,
+      "model_calls": 4,
+      "outcome": "completed",
+      "output_tokens": 241,
+      "repeat": 1,
+      "run_id": "run-01a016c8-6720-7506-bb58-96c5463c841d",
+      "split": "held_out",
+      "task_id": "security-004",
+      "tool_calls": 3
+    },
+    {
+      "category": "security_engineering",
+      "changed_files": [
+        "solution.py"
+      ],
+      "elapsed_seconds": 8.059746400016593,
+      "evaluator_error": null,
+      "hidden_tests_passed": true,
+      "input_tokens": 1157,
+      "model_calls": 4,
+      "outcome": "completed",
+      "output_tokens": 241,
+      "repeat": 2,
+      "run_id": "run-01a016c8-8c6d-77c3-ba38-3564ec3dc908",
+      "split": "held_out",
+      "task_id": "security-004",
+      "tool_calls": 3
+    },
+    {
+      "category": "security_engineering",
+      "changed_files": [
+        "solution.py"
+      ],
+      "elapsed_seconds": 11.979307600005995,
+      "evaluator_error": null,
+      "hidden_tests_passed": true,
+      "input_tokens": 1216,
+      "model_calls": 4,
+      "outcome": "completed",
+      "output_tokens": 350,
+      "repeat": 3,
+      "run_id": "run-01a016c8-af28-795c-9ee4-39942544b5f6",
+      "split": "held_out",
+      "task_id": "security-004",
+      "tool_calls": 3
+    }
+  ],
+  "requested_repeats": 3,
+  "requested_split": "held_out",
+  "runs": 24,
+  "schema_version": 1,
+  "suite": "real_model_coding_ability_not_harness_conformance",
+  "task_cluster_bootstrap_95_ci": [
+    0.25,
+    0.875
+  ],
+  "task_success_rate": 0.5833333333333334,
+  "tasks": 8,
+  "tasks_with_all_repeats_passed": 4,
+  "tasks_with_any_pass": 5,
+  "tool_calls": 86
+}

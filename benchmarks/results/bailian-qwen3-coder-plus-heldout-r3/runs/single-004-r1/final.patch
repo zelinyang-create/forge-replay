@@ -1,0 +1,16 @@
+diff --git a/solution.py b/solution.py
+index 0d9da31..af6a5c1 100644
+--- a/solution.py
++++ b/solution.py
+@@ -1,2 +1,10 @@
+ def moving_average(values, width):
+-    return [sum(values[i:i+width]) / width for i in range(len(values) - width)]
++    if width <= 0:
++        raise ValueError("Width must be positive")
++    if width > len(values):
++        raise ValueError("Width cannot be larger than the input list")
++    
++    result = []
++    for i in range(len(values) - width + 1):
++        result.append(sum(values[i:i+width]) / width)
++    return result

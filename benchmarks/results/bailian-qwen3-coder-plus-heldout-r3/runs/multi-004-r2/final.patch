@@ -1,0 +1,24 @@
+diff --git a/consumer_a.py b/consumer_a.py
+index 8e390fc..8f2c956 100644
+--- a/consumer_a.py
++++ b/consumer_a.py
+@@ -1,2 +1,2 @@
+-from solution import normalize
++from text_utils import normalize
+ def key(x): return normalize(x)
+diff --git a/consumer_b.py b/consumer_b.py
+index 7261d79..440a1dc 100644
+--- a/consumer_b.py
++++ b/consumer_b.py
+@@ -1,2 +1,2 @@
+-from solution import normalize
++from text_utils import normalize
+ def equal(a,b): return normalize(a)==normalize(b)
+diff --git a/text_utils.py b/text_utils.py
+index 6beff67..6746724 100644
+--- a/text_utils.py
++++ b/text_utils.py
+@@ -1 +1,3 @@
+ # canonical text utilities
++def normalize(value):
++    return value.strip().lower()

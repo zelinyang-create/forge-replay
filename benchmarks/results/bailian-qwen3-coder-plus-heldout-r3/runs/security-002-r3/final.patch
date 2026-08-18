@@ -1,0 +1,23 @@
+diff --git a/solution.py b/solution.py
+index ce61b89..31cdfe1 100644
+--- a/solution.py
++++ b/solution.py
+@@ -1,2 +1,17 @@
++import re
++
+ def redact(value):
+-    return value
++    if isinstance(value, str):
++        # Redact authorization, token, password, and api_key values
++        patterns = [
++            r'(?i)(authorization\s*[:=]\s*)[^\s,;]+',
++            r'(?i)(token\s*[:=]\s*)[^\s,;]+',
++            r'(?i)(password\s*[:=]\s*)[^\s,;]+',
++            r'(?i)(api_key\s*[:=]\s*)[^\s,;]+'
++        ]
++        result = value
++        for pattern in patterns:
++            result = re.sub(pattern, r'\1[REDACTED]', result)
++        return result
++    else:
++        return value

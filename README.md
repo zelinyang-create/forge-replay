@@ -76,16 +76,26 @@ All numbers below are local deterministic measurements, not production SLAs:
 | Duplicate file effects | 0 across 24 hardened fault runs | No duplicate write in the covered deterministic scenarios |
 | Automatic recovery latency | P50 20.1 ms; P95 39.0 ms | Local recovery handler time, excluding a real model call |
 | 10,000-event projection replay | 41.58 ms full vs 0.78 ms from a 200-event checkpoint tail | 53.21x CPU reducer microbenchmark speedup, not end-to-end resume latency |
+| Bailian `qwen3-coder-plus` Held-out coding | 14/24 runs passed (58.3%); task-cluster bootstrap 95% CI 25.0%–87.5% | 8 frozen tasks × 3 repeats, temperature 0, thinking off, process tool disabled |
+| Bailian end-to-end run latency | P50 11.65 s; P95 16.87 s | Model + Harness file-tool loop + durable persistence; hidden evaluator runs afterward |
 
-Raw reports, per-run rows, Git metadata, platform, and denominators are in
-[`benchmarks/results`](benchmarks/results). The real-model coding runner is
-implemented but no task-success number is published from this machine because
-Ollama is not installed. That benchmark must run in a disposable, secret-free,
-network-isolated environment:
+Reports, per-run patches/model outputs, Git metadata, platform, and denominators
+are in [`benchmarks/results`](benchmarks/results). The published Bailian result
+used the official OpenAI-compatible endpoint with `qwen3-coder-plus`: all 24
+runs reached a normal Harness terminal state; 14 passed hidden tests. Five of
+eight tasks passed at least once and four passed all three repeats. Repeated runs
+are correlated, so the report uses a task-cluster bootstrap rather than treating
+24 rows as independent tasks.
+
+Run the same suite with an environment variable; never put a key in a config or
+command committed to Git:
 
 ```bash
 uv run python -m forge_replay.eval.real_model_benchmark \
-  --split held_out --repeats 3 --model qwen3.5:4b \
+  --provider openai-compatible \
+  --base-url https://dashscope.aliyuncs.com/compatible-mode/v1 \
+  --api-key-env DASHSCOPE_API_KEY \
+  --split held_out --repeats 3 --model qwen3-coder-plus \
   --i-understand-model-generated-code-runs-locally
 ```
 

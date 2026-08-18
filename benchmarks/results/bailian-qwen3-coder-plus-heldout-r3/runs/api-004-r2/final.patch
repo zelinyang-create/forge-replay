@@ -1,0 +1,26 @@
+diff --git a/solution.py b/solution.py
+index fa710ec..284b434 100644
+--- a/solution.py
++++ b/solution.py
+@@ -1,2 +1,20 @@
+ def validate_port(value):
+-    return value
++    # Check if value is boolean (booleans are instances of int in Python)
++    if isinstance(value, bool):
++        raise ValueError("Boolean values are not accepted")
++    
++    # Check if value is integer-like (int, float with no decimal part, string representation of int)
++    if isinstance(value, int):
++        port = value
++    elif isinstance(value, float) and value.is_integer():
++        port = int(value)
++    elif isinstance(value, str) and value.isdigit():
++        port = int(value)
++    else:
++        raise ValueError(f"Invalid port value: {value}")
++    
++    # Validate port range
++    if 1 <= port <= 65535:
++        return port
++    else:
++        raise ValueError(f"Port must be between 1 and 65535: {port}")

@@ -1,0 +1,47 @@
+diff --git a/solution.py b/solution.py
+index 052eee3..a67202a 100644
+--- a/solution.py
++++ b/solution.py
+@@ -1,2 +1,42 @@
++import re
++import os
++
+ def sanitize_filename(value):
++    # Remove path separators to prevent directory traversal
++    value = re.sub(r'[\\/]', '', value)
++    
++    # Remove control characters (ASCII 0-31)
++    value = ''.join(c for c in value if ord(c) >= 32)
++    
++    # Remove trailing dots and spaces (problematic on Windows)
++    value = value.rstrip('. ')
++    
++    # Check for reserved names in Windows (CON, PRN, AUX, NUL, COM1-COM9, LPT1-LPT9)
++    # Case-insensitive check
++    name_parts = os.path.splitext(value)
++    name = name_parts[0]
++    ext = name_parts[1]
++    
++    # Reserved names without extensions
++    reserved_names = {
++        'CON', 'PRN', 'AUX', 'NUL',
++        'COM1', 'COM2', 'COM3', 'COM4', 'COM5', 'COM6', 'COM7', 'COM8', 'COM9',
++        'LPT1', 'LPT2', 'LPT3', 'LPT4', 'LPT5', 'LPT6', 'LPT7', 'LPT8', 'LPT9'
++    }
++    
++    # If the name part matches a reserved name (case-insensitive), add an underscore
++    if name.upper() in reserved_names:
++        name = name + '_'
++    
++    value = name + ext
++    
++    # For POSIX systems, we just need to ensure no path separators were included
++    # The above already handles that, plus other sanitization
++    
++    # Limit length to reasonable size (255 is common max for filesystems)
++    if len(value) > 255:
++        name, ext = os.path.splitext(value)
++        name = name[:255 - len(ext)]
++        value = name + ext
++    
+     return value

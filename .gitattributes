@@ -1,0 +1,5 @@
+# Evaluation patches are byte-for-byte Git output and must not undergo CRLF conversion.
+benchmarks/results/**/final.patch -text
+
+# Machine-readable reports are canonical LF JSON across platforms.
+benchmarks/results/**/*.json text eol=lf

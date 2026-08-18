@@ -1,0 +1,11 @@
+{
+  "base_commit_sha": "310d29bd9c62f7831bfcc939303e125123949ee5",
+  "catalog_sha256": "250fa50095749ecb6a6a21bf57e88ebd94e958a736ae1883ba9611cb1a23916a",
+  "hidden_tests_passed": true,
+  "model": "qwen3-coder-plus",
+  "outcome": "completed",
+  "provider": "openai-compatible",
+  "repeat": 3,
+  "run_id": "run-01a016c6-a860-7513-a9c9-aea97ac97fc8",
+  "task_id": "reliability-004"
+}

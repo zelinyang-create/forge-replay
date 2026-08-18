@@ -1,0 +1,15 @@
+diff --git a/solution.py b/solution.py
+index c4ffe57..4ce1188 100644
+--- a/solution.py
++++ b/solution.py
+@@ -1,4 +1,8 @@
+ def atomic_write_text(path, text):
+     temporary = path.with_suffix('.tmp')
+-    temporary.write_text(text)
+-    path.write_text(text)
++    try:
++        temporary.write_text(text)
++        path.write_text(text)
++    finally:
++        if temporary.exists():
++            temporary.unlink()

@@ -1,0 +1,14 @@
+[
+  {
+    "event_id": "4623cbf7-222e-4a4b-ba3e-d89018d5c648",
+    "text": "<tool>\n{\n    \"name\": \"list_files\",\n    \"arguments\": {\n        \"path\": \".\"\n    }\n}\n</tool>"
+  },
+  {
+    "event_id": "395cd733-7e5b-4664-8041-2a056c1fdb8a",
+    "text": "<tool>\n{\n    \"name\": \"read_file\",\n    \"arguments\": {\n        \"path\": \"solution.py\"\n    }\n}\n</tool>"
+  },
+  {
+    "event_id": "e48a7e5c-b3cf-441f-be61-8373703c90da",
+    "text": "<patch_file>\n{\n    \"path\": \"solution.py\",\n    \"old_text\": \"def parse_log_line(line):\\n    timestamp, level, message = line.split(':')\\n    return {'timestamp': timestamp, 'level': level, 'message': message}\",\n    \"new_text\": \"import re\\n\\ndef parse_log_line(line):\\n    # Match ISO timestamp (YYYY-MM-DDTHH:MM:SS) followed by colon, level, and message\\n    match = re.match(r'^(\\\\d{4}-\\\\d{2}-\\\\d{2}T\\\\d{2}:\\\\d{2}:\\\\d{2}):([^:]+):(.*)$', line)\\n    if match:\\n        timestamp, level, message = match.groups()\\n        return {'timestamp': timestamp, 'level': level.strip(), 'message': message.strip()}\\n    else:\\n        # Fallback for non-ISO format\\n        parts = line.split(':', 2)  # Split into max 3 parts\\n        if len(parts) == 3:\\n            return {'timestamp': parts[0], 'level': parts[1].strip(), 'message': parts[2].strip()}\\n        else:\\n            # If we don't have 3 parts, assume it's malformed\\n            raise ValueError(f\\\"Log line format not recognized: {line}\\\")\"\n}\n</patch_file>"
+  }
+]

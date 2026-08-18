@@ -1,0 +1,43 @@
+diff --git a/solution.py b/solution.py
+index 052eee3..1e774bd 100644
+--- a/solution.py
++++ b/solution.py
+@@ -1,2 +1,38 @@
++import re
++import os
++
+ def sanitize_filename(value):
++    # Extract filename from any path
++    value = os.path.basename(value)
++    
++    # Remove control characters (0x00-0x1F)
++    value = ''.join(c for c in value if ord(c) >= 0x20)
++    
++    # For Windows, remove reserved names like CON, PRN, AUX, etc.
++    # These are case-insensitive and may have extensions
++    if os.name == 'nt':  # Windows
++        # Check against reserved names
++        name_parts = value.split('.')
++        base_name = name_parts[0].upper()
++        reserved_names = {
++            'CON', 'PRN', 'AUX', 'NUL',
++            'COM1', 'COM2', 'COM3', 'COM4', 'COM5', 'COM6', 'COM7', 'COM8', 'COM9',
++            'LPT1', 'LPT2', 'LPT3', 'LPT4', 'LPT5', 'LPT6', 'LPT7', 'LPT8', 'LPT9'
++        }
++        if base_name in reserved_names:
++            value = '_' + value
++    
++    # Replace reserved characters based on OS
++    if os.name == 'nt':  # Windows
++        value = re.sub(r'[<>:"/\\|?*]', '_', value)
++    else:  # POSIX
++        value = re.sub(r'/+', '_', value)  # Forward slashes become underscores
++    
++    # Remove trailing dots and spaces (problematic on Windows)
++    value = value.rstrip('. ')
++    
++    # Ensure the filename is not empty after sanitization
++    if not value:
++        value = '_'
++    
+     return value
