@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import platform
 import statistics
 import subprocess
 import sys
@@ -171,10 +172,7 @@ def _run_one(
             outcome_name = f"error:{type(exc).__name__}"
         elapsed = time.perf_counter() - started
         passed, evaluator_stderr = _evaluate(task, workspace.worktree_path, root / "evaluator")
-        changed = _git(repo=workspace.worktree_path, args=("status", "--porcelain"))
-        changed_files = tuple(
-            sorted(line[3:].strip().replace("\\", "/") for line in changed.splitlines())
-        )
+        changed_files = _changed_files(workspace.worktree_path)
         events = store.load_run_events(run_id)
         event_dump = [event.model_dump(mode="json") for event in events]
         _write_json(run_artifacts / "events.json", event_dump)
@@ -286,11 +284,17 @@ def _report(
 ) -> dict:
     elapsed = [result.elapsed_seconds for result in results]
     passed = sum(result.hidden_tests_passed for result in results)
+    categories = sorted({result.category for result in results})
+    outcomes = sorted({result.outcome for result in results})
     return {
         "schema_version": 1,
         "suite": "real_model_coding_ability_not_harness_conformance",
+        "analysis_population": "all_started_runs_intent_to_treat",
         "catalog": "forge-replay-coding-tasks-v1",
         "catalog_sha256": catalog_sha256(),
+        "git_sha": _git_sha(),
+        "platform": platform.platform(),
+        "python": sys.version.split()[0],
         "model": model,
         "provider": provider,
         "requested_split": split,
@@ -304,6 +308,22 @@ def _report(
         ),
         "input_tokens": sum(result.input_tokens or 0 for result in results),
         "output_tokens": sum(result.output_tokens or 0 for result in results),
+        "model_calls": sum(result.model_calls for result in results),
+        "tool_calls": sum(result.tool_calls for result in results),
+        "outcomes": {
+            outcome: sum(result.outcome == outcome for result in results)
+            for outcome in outcomes
+        },
+        "by_category": {
+            category: {
+                "runs": sum(result.category == category for result in results),
+                "passed": sum(
+                    result.category == category and result.hidden_tests_passed
+                    for result in results
+                ),
+            }
+            for category in categories
+        },
         "raw_runs": [asdict(result) for result in results],
     }
 
@@ -330,6 +350,30 @@ def _git(*, repo: Path, args: tuple[str, ...]) -> str:
     return subprocess.run(
         ["git", *args], cwd=repo, check=True, capture_output=True, text=True
     ).stdout.strip()
+
+
+def _changed_files(repo: Path) -> tuple[str, ...]:
+    status = subprocess.run(
+        ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    return tuple(
+        sorted(
+            line[3:].strip().replace("\\", "/")
+            for line in status.splitlines()
+            if len(line) >= 4
+        )
+    )
+
+
+def _git_sha() -> str | None:
+    completed = subprocess.run(
+        ["git", "rev-parse", "HEAD"], check=False, capture_output=True, text=True
+    )
+    return completed.stdout.strip() if completed.returncode == 0 else None
 
 
 def _write_json(path: Path, value) -> None:

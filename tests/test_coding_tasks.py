@@ -1,7 +1,7 @@
 import json
 
 from forge_replay.eval.coding_tasks import TASKS, catalog_sha256, public_manifest
-from forge_replay.eval.real_model_benchmark import _evaluate, _seed_repo
+from forge_replay.eval.real_model_benchmark import _changed_files, _evaluate, _seed_repo
 
 
 def test_frozen_catalog_has_24_balanced_unique_tasks():
@@ -29,3 +29,11 @@ def test_all_seed_fixtures_are_git_repositories_and_evaluators_fail_before_fix(t
         passed, _ = _evaluate(task, repo, tmp_path / f"eval-{task.task_id}")
         assert not passed, task.task_id
         assert not list(repo.rglob("__pycache__")), task.task_id
+
+
+def test_changed_file_metrics_preserve_first_filename_character(tmp_path):
+    task = TASKS[0]
+    repo = _seed_repo(task, tmp_path / "repo")
+    (repo / "solution.py").write_text("changed\n", encoding="utf-8")
+    (repo / "added.py").write_text("new\n", encoding="utf-8")
+    assert _changed_files(repo) == ("added.py", "solution.py")
