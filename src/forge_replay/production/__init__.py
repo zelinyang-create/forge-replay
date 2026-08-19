@@ -1,7 +1,9 @@
 """Production boundary adapters for ForgeReplay."""
 
+from forge_replay.production.model_gateway import BudgetLedger, ModelGateway
 from forge_replay.production.orchestration import MultiWorkerTakeoverCoordinator
 from forge_replay.production.policy import PolicyBundle, SignedPolicyEvaluator
+from forge_replay.production.release_gate import ReleaseGate
 from forge_replay.production.sandbox import (
     ExecReceipt,
     ExecRequest,
@@ -18,11 +20,14 @@ from forge_replay.production.workspace_snapshot import (
 )
 
 __all__ = [
+    "BudgetLedger",
     "ExecReceipt",
     "ExecRequest",
+    "ModelGateway",
     "MultiWorkerTakeoverCoordinator",
     "OciGvisorExecutionProvider",
     "PolicyBundle",
+    "ReleaseGate",
     "SandboxAttestation",
     "SandboxHandle",
     "SandboxSpec",
