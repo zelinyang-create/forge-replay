@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 from forge_replay.domain import (
@@ -13,6 +15,13 @@ from forge_replay.domain import (
     WorkspaceDisposition,
 )
 from forge_replay.persistence import SQLiteEventStore
+from forge_replay.production import (
+    OciGvisorExecutionProvider,
+    SandboxProcessSupervisor,
+    SandboxSpec,
+    SubprocessCommandTransport,
+    UnsafeHostExecutionProvider,
+)
 from forge_replay.runtime.agent import AgentOutcome, DurableAgentRuntime
 from forge_replay.runtime.file_executor import DurableFileExecutor
 from forge_replay.runtime.ollama import OllamaModel
@@ -40,6 +49,7 @@ def build_parser() -> argparse.ArgumentParser:
     start.add_argument("task")
     start.add_argument("--repo", type=Path, default=Path.cwd())
     _add_model_options(start)
+    _add_execution_options(start)
     start.add_argument("--dirty-mode", choices=("refuse", "head-only"), default="refuse")
     start.add_argument("--auto-approve-files", action="store_true")
     start.add_argument("--auto-approve-processes", action="store_true")
@@ -47,6 +57,7 @@ def build_parser() -> argparse.ArgumentParser:
     resume = subparsers.add_parser("resume", help="Resume an existing run")
     resume.add_argument("run_id")
     _add_model_options(resume)
+    _add_execution_options(resume)
     resume.add_argument("--auto-approve-files", action="store_true")
     resume.add_argument("--auto-approve-processes", action="store_true")
 
@@ -81,8 +92,27 @@ def _add_model_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--model-timeout", type=float, default=120)
 
 
+def _add_execution_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--execution-provider",
+        choices=("host", "gvisor"),
+        default="host",
+        help="Process boundary; gvisor requires a digest-pinned sandbox image",
+    )
+    parser.add_argument(
+        "--sandbox-image",
+        help="Immutable sha256 image digest used by the gVisor provider",
+    )
+    parser.add_argument(
+        "--production",
+        action="store_true",
+        help="Fail closed unless the attested gVisor provider is selected",
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    _validate_execution_args(args)
     state_root = args.state_root.resolve()
     state_root.mkdir(parents=True, exist_ok=True)
     store = SQLiteEventStore(state_root / "ledger.sqlite3")
@@ -250,32 +280,80 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-def _runtime(store, args, run_id: str, process_instance_id: str) -> DurableAgentRuntime:
+def _validate_execution_args(args: argparse.Namespace) -> None:
+    if args.command not in {"start", "resume"}:
+        return
+    if args.execution_provider == "host":
+        UnsafeHostExecutionProvider(production=args.production)
+    elif not args.sandbox_image:
+        raise ValueError("--sandbox-image is required for the gVisor provider")
+
+
+@dataclass
+class _ManagedRuntime:
+    runtime: DurableAgentRuntime
+    cleanup: Callable[[], None]
+
+    def run(self, run_id: str) -> AgentOutcome:
+        try:
+            return self.runtime.run(run_id)
+        finally:
+            self.cleanup()
+
+
+def _runtime(store, args, run_id: str, process_instance_id: str) -> _ManagedRuntime:
     workspace = store.get_run_workspace(run_id)
     if workspace.worktree_path is None:
         raise RuntimeError("run does not have an attached worktree")
     guard = WorkspacePathGuard(workspace.worktree_path)
     file_tools = ReplaySafeFileTools(guard)
-    return DurableAgentRuntime(
-        store,
-        OllamaModel(
-            args.model,
-            host=args.host,
-            timeout_seconds=args.model_timeout,
-        ),
-        DurableFileExecutor(
-            store, file_tools, process_instance_id=process_instance_id
-        ),
-        DurableShellExecutor(
+    supervisor: ProcessSupervisor | SandboxProcessSupervisor
+    cleanup: Callable[[], None] = lambda: None
+    execution_provider = getattr(args, "execution_provider", "host")
+    production = bool(getattr(args, "production", False))
+    if execution_provider == "host":
+        UnsafeHostExecutionProvider(production=production)
+        supervisor = ProcessSupervisor()
+    else:
+        image_digest = getattr(args, "sandbox_image", None)
+        if not image_digest:
+            raise ValueError("--sandbox-image is required for the gVisor provider")
+        provider = OciGvisorExecutionProvider(SubprocessCommandTransport())
+        spec = SandboxSpec(
+            tenant_id="local-cli",
+            run_id=run_id,
+            execution_id=f"execution-{new_uuid7()}",
+            image_digest=image_digest,
+            workspace=Path(workspace.worktree_path),
+        )
+        handle = provider.provision(spec)
+        supervisor = SandboxProcessSupervisor(provider, handle, spec.workspace)
+        cleanup = lambda: provider.destroy(handle)
+    try:
+        runtime = DurableAgentRuntime(
             store,
-            ProcessSupervisor(),
-            guard,
+            OllamaModel(
+                args.model,
+                host=args.host,
+                timeout_seconds=args.model_timeout,
+            ),
+            DurableFileExecutor(
+                store, file_tools, process_instance_id=process_instance_id
+            ),
+            DurableShellExecutor(
+                store,
+                supervisor,
+                guard,
+                process_instance_id=process_instance_id,
+            ),
             process_instance_id=process_instance_id,
-        ),
-        process_instance_id=process_instance_id,
-        auto_approve_file_mutations=args.auto_approve_files,
-        auto_approve_processes=args.auto_approve_processes,
-    )
+            auto_approve_file_mutations=args.auto_approve_files,
+            auto_approve_processes=args.auto_approve_processes,
+        )
+    except BaseException:
+        cleanup()
+        raise
+    return _ManagedRuntime(runtime, cleanup)
 
 
 def _print_outcome(run_id: str, outcome: AgentOutcome) -> None:

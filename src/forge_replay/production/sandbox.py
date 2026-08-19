@@ -13,9 +13,12 @@ import os
 import re
 import subprocess
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Protocol
+
+from forge_replay.tools.process_supervisor import ProcessReceipt
 
 _DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 
@@ -243,6 +246,69 @@ class OciGvisorExecutionProvider:
             f"{spec.tenant_id}:{spec.run_id}:{spec.execution_id}".encode()
         ).hexdigest()[:20]
         return f"forge-{digest}"
+
+
+class SandboxProcessSupervisor:
+    """Adapt the attested sandbox provider to the durable shell port."""
+
+    def __init__(
+        self,
+        provider: OciGvisorExecutionProvider,
+        handle: SandboxHandle,
+        host_workspace: Path,
+        *,
+        max_output_bytes: int = 256 * 1024,
+    ):
+        if max_output_bytes < 1:
+            raise ValueError("max_output_bytes must be positive")
+        self.provider = provider
+        self.handle = handle
+        self.host_workspace = host_workspace.resolve(strict=True)
+        self.max_output_bytes = max_output_bytes
+
+    def run(
+        self,
+        argv: tuple[str, ...] | list[str],
+        *,
+        cwd: str | Path,
+        timeout_seconds: float,
+        extra_env: dict[str, str] | None = None,
+    ) -> ProcessReceipt:
+        if extra_env:
+            raise SandboxSecurityError(
+                "per-call environment injection is disabled at the sandbox boundary"
+            )
+        host_cwd = Path(cwd).resolve(strict=True)
+        try:
+            relative = host_cwd.relative_to(self.host_workspace)
+        except ValueError as exc:
+            raise SandboxSecurityError("process cwd escaped the run workspace") from exc
+        sandbox_cwd = PurePosixPath("/workspace")
+        if relative.parts:
+            sandbox_cwd = sandbox_cwd.joinpath(*relative.parts)
+        command = tuple(argv)
+        receipt = self.provider.execute(
+            self.handle,
+            ExecRequest(
+                request_id=f"exec-{uuid.uuid4()}",
+                argv=command,
+                cwd=str(sandbox_cwd),
+                timeout_seconds=timeout_seconds,
+            ),
+        )
+        return ProcessReceipt(
+            argv=command,
+            cwd=str(host_cwd),
+            exit_code=receipt.exit_code,
+            timed_out=False,
+            duration_ms=receipt.duration_ms,
+            stdout=receipt.stdout[: self.max_output_bytes],
+            stderr=receipt.stderr[: self.max_output_bytes],
+            stdout_sha256=receipt.stdout_sha256,
+            stderr_sha256=receipt.stderr_sha256,
+            stdout_truncated=len(receipt.stdout) > self.max_output_bytes,
+            stderr_truncated=len(receipt.stderr) > self.max_output_bytes,
+        )
 
 
 class UnsafeHostExecutionProvider:

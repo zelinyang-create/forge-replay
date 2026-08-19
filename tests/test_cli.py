@@ -1,7 +1,10 @@
 import json
 import subprocess
 
+import pytest
+
 from forge_replay.cli import build_parser, main
+from forge_replay.production.sandbox import SandboxSecurityError
 from forge_replay.runtime.agent import AgentOutcome
 
 
@@ -31,6 +34,28 @@ def test_cli_parser_exposes_durable_lifecycle_commands():
         "approve"
     )
     assert parser.parse_args(["status", "run-1"]).command == "status"
+    production = parser.parse_args(
+        ["start", "task", "--production", "--execution-provider", "gvisor"]
+    )
+    assert production.production is True
+    assert production.execution_provider == "gvisor"
+
+
+def test_production_cli_fails_closed_before_host_model_execution(tmp_path, capsys):
+    repo = create_repo(tmp_path)
+    with pytest.raises(SandboxSecurityError, match="forbidden"):
+        main(
+            [
+                "--state-root",
+                str(tmp_path / "state"),
+                "start",
+                "task",
+                "--repo",
+                str(repo),
+                "--production",
+            ]
+        )
+    assert capsys.readouterr().out == ""
 
 
 def test_start_creates_external_ledger_and_owned_worktree(tmp_path, monkeypatch, capsys):

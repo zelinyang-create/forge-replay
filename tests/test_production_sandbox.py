@@ -9,6 +9,7 @@ from forge_replay.production import (
     ExecRequest,
     OciGvisorExecutionProvider,
     PolicyBundle,
+    SandboxProcessSupervisor,
     SandboxSpec,
     SignedPolicyEvaluator,
     UnsafeHostExecutionProvider,
@@ -68,6 +69,20 @@ def test_gvisor_provider_enforces_boundary_and_receipts(tmp_path):
     assert receipt.stdout_sha256
     provider.destroy(handle)
     assert transport.calls[-1][1:3] == ("rm", "-f")
+
+
+def test_sandbox_process_supervisor_maps_workspace_and_preserves_receipt(tmp_path):
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    transport = FakeTransport()
+    provider = OciGvisorExecutionProvider(transport)
+    handle = provider.provision(spec(tmp_path))
+    supervisor = SandboxProcessSupervisor(provider, handle, tmp_path)
+    receipt = supervisor.run(("pytest", "-q"), cwd=nested, timeout_seconds=30)
+    execute = next(call for call in transport.calls if call[1] == "exec")
+    assert execute[3] == "/workspace/nested"
+    assert receipt.stdout == b"ok\n"
+    assert receipt.stdout_sha256
 
 
 def test_attestation_failure_destroys_container(tmp_path):
