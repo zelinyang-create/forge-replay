@@ -86,6 +86,19 @@ CREATE TABLE IF NOT EXISTS worker_registry (
     worker_id text PRIMARY KEY, capabilities_json jsonb NOT NULL,
     last_heartbeat_at timestamptz NOT NULL, draining boolean NOT NULL DEFAULT false
 );
+CREATE TABLE IF NOT EXISTS control_plane_generations (
+    cluster_id text PRIMARY KEY, active_region text NOT NULL, generation bigint NOT NULL,
+    promoted_at timestamptz NOT NULL DEFAULT clock_timestamp(), evidence_sha256 text NOT NULL
+);
+CREATE TABLE IF NOT EXISTS audit_anchors (
+    anchor_id text PRIMARY KEY, through_sequence bigint NOT NULL, chain_sha256 text NOT NULL,
+    kms_signature text NOT NULL, created_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+CREATE TABLE IF NOT EXISTS deletion_tombstones (
+    tenant_id text NOT NULL, resource_type text NOT NULL, resource_id text NOT NULL,
+    deleted_at timestamptz NOT NULL, reason text NOT NULL,
+    PRIMARY KEY (tenant_id, resource_type, resource_id)
+);
 ALTER TABLE runs ENABLE ROW LEVEL SECURITY;
 ALTER TABLE run_events ENABLE ROW LEVEL SECURITY;
 ALTER TABLE run_commands ENABLE ROW LEVEL SECURITY;
@@ -95,6 +108,7 @@ ALTER TABLE artifacts ENABLE ROW LEVEL SECURITY;
 ALTER TABLE artifact_refs ENABLE ROW LEVEL SECURITY;
 ALTER TABLE workspace_snapshots ENABLE ROW LEVEL SECURITY;
 ALTER TABLE sandbox_jobs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE deletion_tombstones ENABLE ROW LEVEL SECURITY;
 DO $$ BEGIN CREATE POLICY tenant_runs ON runs
     USING (tenant_id = current_setting('app.tenant_id', true));
 EXCEPTION WHEN duplicate_object THEN NULL; END $$;
@@ -120,6 +134,9 @@ DO $$ BEGIN CREATE POLICY tenant_snapshots ON workspace_snapshots
     USING (tenant_id = current_setting('app.tenant_id', true));
 EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 DO $$ BEGIN CREATE POLICY tenant_sandbox_jobs ON sandbox_jobs
+    USING (tenant_id = current_setting('app.tenant_id', true));
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+DO $$ BEGIN CREATE POLICY tenant_tombstones ON deletion_tombstones
     USING (tenant_id = current_setting('app.tenant_id', true));
 EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 """
