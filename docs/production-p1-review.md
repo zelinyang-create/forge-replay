@@ -21,6 +21,10 @@ supervision as a production sandbox.
 - Exec requests are argv-only, constrained to `/workspace`, time bounded and
   return hashed stdout/stderr receipts.
 - The host provider explicitly refuses production construction.
+- The durable CLI now wires process execution through the sandbox adapter;
+  `--production` rejects host execution before creating a Run, requires a
+  digest-pinned image, maps only the run Worktree to `/workspace`, and destroys
+  the sandbox after each invocation.
 - Signed policy bundles separate deterministic tool policy from model output;
   missing identity, dangerous executables and inline interpreter code fail
   closed, while network and package installation require approval.
@@ -30,6 +34,8 @@ supervision as a production sandbox.
 - Deterministic transport tests verify the exact container security arguments,
   attestation rejection and cleanup behavior.
 - Policy tests cover allow, approval and deny decisions plus missing identity.
+- CLI tests cover fail-closed production selection and sandbox path/receipt
+  adaptation.
 - The full existing P0 suite remains green.
 
 ## Deployment boundary

@@ -37,6 +37,29 @@ The upstream snapshot is preserved as tag `upstream-baseline-717cae4`.
 - Deterministic crash conformance, projection microbenchmarks, and a frozen
   24-task real-model coding suite with a 16/8 development/held-out split.
 
+## Production Control-Plane Reference
+
+The v0.4 production path adds code-level P1-P5 controls without claiming that a
+local checkout is already a hosted GA service:
+
+- An attested, digest-pinned OCI/gVisor execution provider. `--production`
+  fails before run creation unless this provider is selected; every CLI run
+  destroys its container on exit.
+- A PostgreSQL authoritative control plane with tenant RLS, stream-version CAS,
+  an at-least-once `SKIP LOCKED` command queue, transactional outbox and
+  idempotent API creation.
+- Tenant-scoped content-addressed artifacts plus deterministic workspace
+  snapshots, lease-epoch fencing and reconnect-or-restore worker takeover.
+- A policy-constrained model gateway with circuit breaking, retry budgets,
+  hierarchical cost reservation and versioned price-book settlement.
+- Fail-closed Shadow/Canary and GA readiness gates, regional-generation
+  fencing, signed backup/supply-chain evidence and a tamper-evident audit chain.
+
+The implementation reviews explicitly separate deterministic local evidence
+from deployment evidence such as live gVisor canaries, PostgreSQL concurrency,
+multi-host soak, multi-AZ failover, 28-day SLOs and penetration testing. See the
+[v0.4 P1-P5 overall review](docs/production-p1-p5-overall-review.md).
+
 ## Quick Start
 
 Install Python 3.10+, Git, `uv`, and Ollama, then pull a model:
@@ -51,6 +74,18 @@ Start a durable run in a clean Git repository:
 ```bash
 uv run forge-replay start "Fix the failing parser tests" --repo /path/to/repo
 ```
+
+The default host executor is development-only. A production-mode invocation
+must select the gVisor provider and an immutable image digest:
+
+```bash
+uv run forge-replay start "Fix the failing parser tests" \
+  --repo /path/to/repo --production --execution-provider gvisor \
+  --sandbox-image sha256:<64-hex-digest>
+```
+
+The command fails closed if the provider, digest or runtime attestation is
+missing or unsafe.
 
 File mutations and processes pause for approval unless their explicit
 auto-approval flags are passed. Continue a pending call and resume the run:
@@ -121,8 +156,10 @@ tools are retryable; file writes/patches are detectable and reconcilable; an
 ambiguous process crash becomes `UNCERTAIN` and requires attention.
 
 See the [technical design](docs/harness-technical-design.md), the
-[v0.3 production P0 review](docs/production-p0-implementation-review.md), and
-the historical [v0.2 implementation review](docs/implementation-review.md) for
+[production upgrade design](docs/production-coding-agent-upgrade.md), the
+[v0.3 production P0 review](docs/production-p0-implementation-review.md), the
+[v0.4 P1-P5 overall review](docs/production-p1-p5-overall-review.md), and the
+historical [v0.2 implementation review](docs/implementation-review.md) for
 architecture, evidence, deferred scope, and remaining risks.
 
 ## Upstream Tutorial and Baseline Documentation
