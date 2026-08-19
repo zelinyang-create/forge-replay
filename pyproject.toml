@@ -8,6 +8,8 @@ version = "0.3.0"
 description = "Durable, replay-aware coding agent harness backed by Ollama"
 requires-python = ">=3.10"
 dependencies = [
+    "fastapi>=0.116,<1",
+    "psycopg[binary]>=3.2,<4",
     "pydantic>=2.11,<3",
 ]
 
@@ -17,16 +19,18 @@ forge-replay = "forge_replay.cli:main"
 
 [dependency-groups]
 dev = [
+  "httpx>=0.28,<1",
   "pytest>=8.3.5",
   "ruff>=0.4.4",
 ]
 
 [tool.setuptools]
 py-modules = ["mini_coding_agent"]
-packages = ["forge_replay", "forge_replay.eval", "forge_replay.persistence", "forge_replay.production", "forge_replay.runtime", "forge_replay.tools", "forge_replay.workspace"]
+packages = ["forge_replay", "forge_replay.control_plane", "forge_replay.eval", "forge_replay.persistence", "forge_replay.production", "forge_replay.runtime", "forge_replay.tools", "forge_replay.workspace"]
 
 [tool.setuptools.package-dir]
 forge_replay = "src/forge_replay"
+"forge_replay.control_plane" = "src/forge_replay/control_plane"
 "forge_replay.eval" = "src/forge_replay/eval"
 "forge_replay.persistence" = "src/forge_replay/persistence"
 "forge_replay.production" = "src/forge_replay/production"
