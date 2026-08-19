@@ -1,5 +1,6 @@
 """Production boundary adapters for ForgeReplay."""
 
+from forge_replay.production.orchestration import MultiWorkerTakeoverCoordinator
 from forge_replay.production.policy import PolicyBundle, SignedPolicyEvaluator
 from forge_replay.production.sandbox import (
     ExecReceipt,
@@ -11,10 +12,15 @@ from forge_replay.production.sandbox import (
     SubprocessCommandTransport,
     UnsafeHostExecutionProvider,
 )
+from forge_replay.production.workspace_snapshot import (
+    WorkspaceSnapshot,
+    WorkspaceSnapshotManager,
+)
 
 __all__ = [
     "ExecReceipt",
     "ExecRequest",
+    "MultiWorkerTakeoverCoordinator",
     "OciGvisorExecutionProvider",
     "PolicyBundle",
     "SandboxAttestation",
@@ -23,4 +29,6 @@ __all__ = [
     "SignedPolicyEvaluator",
     "SubprocessCommandTransport",
     "UnsafeHostExecutionProvider",
+    "WorkspaceSnapshot",
+    "WorkspaceSnapshotManager",
 ]

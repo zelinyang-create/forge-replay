@@ -67,6 +67,25 @@ CREATE TABLE IF NOT EXISTS artifact_refs (
     FOREIGN KEY (tenant_id, run_id) REFERENCES runs(tenant_id, run_id),
     FOREIGN KEY (tenant_id, sha256) REFERENCES artifacts(tenant_id, sha256)
 );
+CREATE TABLE IF NOT EXISTS workspace_snapshots (
+    tenant_id text NOT NULL, snapshot_id text NOT NULL, run_id text NOT NULL,
+    parent_snapshot_id text, base_commit_sha text NOT NULL, manifest_sha256 text NOT NULL,
+    workspace_root_hash text NOT NULL, created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY (tenant_id, snapshot_id),
+    FOREIGN KEY (tenant_id, run_id) REFERENCES runs(tenant_id, run_id)
+);
+CREATE TABLE IF NOT EXISTS sandbox_jobs (
+    tenant_id text NOT NULL, sandbox_execution_id text NOT NULL, run_id text NOT NULL,
+    lease_epoch bigint NOT NULL, provider text NOT NULL, provider_handle text,
+    state text NOT NULL, attestation_json jsonb NOT NULL,
+    updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY (tenant_id, sandbox_execution_id),
+    FOREIGN KEY (tenant_id, run_id) REFERENCES runs(tenant_id, run_id)
+);
+CREATE TABLE IF NOT EXISTS worker_registry (
+    worker_id text PRIMARY KEY, capabilities_json jsonb NOT NULL,
+    last_heartbeat_at timestamptz NOT NULL, draining boolean NOT NULL DEFAULT false
+);
 ALTER TABLE runs ENABLE ROW LEVEL SECURITY;
 ALTER TABLE run_events ENABLE ROW LEVEL SECURITY;
 ALTER TABLE run_commands ENABLE ROW LEVEL SECURITY;
@@ -74,6 +93,8 @@ ALTER TABLE run_outbox ENABLE ROW LEVEL SECURITY;
 ALTER TABLE api_idempotency_keys ENABLE ROW LEVEL SECURITY;
 ALTER TABLE artifacts ENABLE ROW LEVEL SECURITY;
 ALTER TABLE artifact_refs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE workspace_snapshots ENABLE ROW LEVEL SECURITY;
+ALTER TABLE sandbox_jobs ENABLE ROW LEVEL SECURITY;
 DO $$ BEGIN CREATE POLICY tenant_runs ON runs
     USING (tenant_id = current_setting('app.tenant_id', true));
 EXCEPTION WHEN duplicate_object THEN NULL; END $$;
@@ -93,6 +114,12 @@ DO $$ BEGIN CREATE POLICY tenant_artifacts ON artifacts
     USING (tenant_id = current_setting('app.tenant_id', true));
 EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 DO $$ BEGIN CREATE POLICY tenant_artifact_refs ON artifact_refs
+    USING (tenant_id = current_setting('app.tenant_id', true));
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+DO $$ BEGIN CREATE POLICY tenant_snapshots ON workspace_snapshots
+    USING (tenant_id = current_setting('app.tenant_id', true));
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+DO $$ BEGIN CREATE POLICY tenant_sandbox_jobs ON sandbox_jobs
     USING (tenant_id = current_setting('app.tenant_id', true));
 EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 """
@@ -302,6 +329,50 @@ class PostgresControlPlaneStore:
                 "VALUES (%s, %s, %s, %s) ON CONFLICT DO NOTHING",
                 (tenant_id, run_id, sha256, purpose),
             )
+
+    def acquire_worker_lease(
+        self, *, tenant_id: str, run_id: str, worker_id: str, ttl_seconds: int = 30
+    ) -> dict[str, Any]:
+        if not 5 <= ttl_seconds <= 300:
+            raise ValueError("worker lease ttl must be between 5 and 300 seconds")
+        with self.connect() as connection:
+            self._tenant(connection, tenant_id)
+            row = connection.execute(
+                "UPDATE runs SET lease_owner = %s, lease_epoch = lease_epoch + 1, "
+                "lease_expires_at = clock_timestamp() + make_interval(secs => %s), "
+                "updated_at = clock_timestamp() WHERE tenant_id = %s AND run_id = %s "
+                "AND (lease_owner IS NULL OR lease_owner = %s OR lease_expires_at <= clock_timestamp()) "
+                "RETURNING lease_owner, lease_epoch, lease_expires_at, stream_version",
+                (worker_id, ttl_seconds, tenant_id, run_id, worker_id),
+            ).fetchone()
+            if row is None:
+                raise RunVersionConflictError("run is owned by another live worker")
+            return dict(row)
+
+    def advance_run_as_worker(
+        self, *, tenant_id: str, run_id: str, worker_id: str, lease_epoch: int,
+        expected_stream_version: int, status: str, event_id: str, event_type: str,
+        payload: dict[str, Any],
+    ) -> int:
+        next_version = expected_stream_version + 1
+        with self.connect() as connection:
+            self._tenant(connection, tenant_id)
+            row = connection.execute(
+                "UPDATE runs SET status = %s, stream_version = stream_version + 1, "
+                "updated_at = clock_timestamp() WHERE tenant_id = %s AND run_id = %s "
+                "AND lease_owner = %s AND lease_epoch = %s "
+                "AND lease_expires_at > clock_timestamp() AND stream_version = %s "
+                "RETURNING stream_version",
+                (status, tenant_id, run_id, worker_id, lease_epoch, expected_stream_version),
+            ).fetchone()
+            if row is None:
+                raise RunVersionConflictError("worker lease or stream version is stale")
+            connection.execute(
+                "INSERT INTO run_events(tenant_id, run_id, seq, event_id, event_type, payload_json) "
+                "VALUES (%s, %s, %s, %s, %s, %s::jsonb)",
+                (tenant_id, run_id, next_version, event_id, event_type, _canonical_json(payload)),
+            )
+        return next_version
 
     @staticmethod
     def _tenant(connection, tenant_id: str) -> None:
