@@ -278,6 +278,8 @@ class DurableAgentRuntime:
                 return AgentOutcome(status="completed", final_answer=answer)
 
             try:
+                if not isinstance(payload, dict):
+                    raise TypeError("tool payload must be an object")
                 name = payload["name"]
                 args = payload.get("args", payload.get("arguments", {}))
                 if not isinstance(name, str) or not isinstance(args, dict):
@@ -367,9 +369,12 @@ class DurableAgentRuntime:
         except Exception as exc:
             if observer.last_attempt_no is None:
                 observer.started(1)
-            if observer.last_attempt_no not in observer.failed_attempts:
+            last_attempt_no = observer.last_attempt_no
+            if last_attempt_no is None:
+                raise AssertionError("model attempt observer did not record an attempt")
+            if last_attempt_no not in observer.failed_attempts:
                 observer.failed(
-                    observer.last_attempt_no - previous_attempts,
+                    last_attempt_no - previous_attempts,
                     exc,
                     retryable=False,
                 )

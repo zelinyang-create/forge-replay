@@ -165,6 +165,29 @@ def test_corrupt_latest_checkpoint_falls_back_to_older_valid_snapshot(tmp_path):
     assert recovered.projection.last_event_seq == newest.committed_event.seq
 
 
+def test_checkpoint_recovery_stops_after_newest_valid_snapshot(tmp_path, monkeypatch):
+    store = build_run(tmp_path)
+    for index in range(3):
+        store.commit_run_checkpoint(
+            run_id="run-1",
+            checkpoint_id=f"checkpoint-{index}",
+            process_instance_id="worker-1",
+        )
+
+    inspected = []
+    original = store._projection_from_checkpoint_row
+
+    def recording_projection(checkpoint_row, run_row):
+        inspected.append(checkpoint_row["checkpoint_id"])
+        return original(checkpoint_row, run_row)
+
+    monkeypatch.setattr(store, "_projection_from_checkpoint_row", recording_projection)
+    recovered = store.recover_run_projection("run-1")
+
+    assert recovered.checkpoint_id == "checkpoint-2"
+    assert inspected == ["checkpoint-2"]
+
+
 def test_all_invalid_checkpoints_fall_back_to_full_event_replay(tmp_path):
     store = build_run(tmp_path)
     checkpoint = store.commit_run_checkpoint(

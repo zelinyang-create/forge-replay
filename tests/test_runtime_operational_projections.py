@@ -276,3 +276,66 @@ def test_failed_legacy_backfill_is_atomic_and_retryable(tmp_path):
         )
     finally:
         connection.close()
+
+
+def test_hot_path_query_plans_use_indexes_without_temp_sort(tmp_path):
+    store = build_run(tmp_path)
+    response = append_response(store, append_started(store))
+    store.propose_tool_call(
+        run_id="run-1",
+        response_event_id=str(response.event_id),
+        ordinal=0,
+        tool_name="read_file",
+        tool_version="1",
+        args={"path": "README.md"},
+        effect_class=ToolEffectClass.PURE,
+        process_instance_id="worker-1",
+    )
+    with store.connect() as connection:
+        plans = {
+            "unfinished": connection.execute(
+                """
+                EXPLAIN QUERY PLAN
+                SELECT * FROM tool_calls
+                WHERE run_id = ? AND state IN (?, ?, ?, ?)
+                LIMIT 2
+                """,
+                ("run-1", "proposed", "waiting_approval", "ready", "dispatched"),
+            ).fetchall(),
+            "next_step": connection.execute(
+                """
+                EXPLAIN QUERY PLAN
+                SELECT * FROM model_calls
+                WHERE run_id = ? ORDER BY step DESC LIMIT 1
+                """,
+                ("run-1",),
+            ).fetchall(),
+            "pending": connection.execute(
+                """
+                EXPLAIN QUERY PLAN
+                SELECT * FROM model_calls
+                WHERE run_id = ? AND status = 'responded'
+                ORDER BY response_seq DESC LIMIT 2
+                """,
+                ("run-1",),
+            ).fetchall(),
+            "identity": connection.execute(
+                """
+                EXPLAIN QUERY PLAN
+                SELECT * FROM model_calls WHERE model_call_id = ?
+                """,
+                ("model-call:run-1:0",),
+            ).fetchall(),
+        }
+
+    details = {
+        name: " | ".join(str(row["detail"]) for row in rows)
+        for name, rows in plans.items()
+    }
+    assert "tool_calls_by_run_state" in details["unfinished"]
+    assert "model_calls_by_run_step" in details["next_step"]
+    assert "model_calls_pending_response" in details["pending"]
+    assert "sqlite_autoindex_model_calls_1" in details["identity"]
+    for detail in details.values():
+        assert "SCAN " not in detail
+        assert "TEMP B-TREE" not in detail

@@ -9,7 +9,8 @@ import sqlite3
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
+from uuid import UUID
 
 from forge_replay.domain import (
     ApprovalDecision,
@@ -2365,6 +2366,10 @@ class SQLiteEventStore:
                     ),
                 )
                 if outcome == "succeeded":
+                    if receipt_json is None:
+                        raise LedgerIntegrityError(
+                            "successful tool execution requires a durable receipt"
+                        )
                     payload = ToolExecutionSucceededPayload(
                         tool_call_id=existing.tool_call_id,
                         attempt_id=attempt_id,
@@ -2750,6 +2755,15 @@ class SQLiteEventStore:
         }
         if execution_status not in allowed or not reason.strip():
             raise ValueError("invalid termination status or reason")
+        termination_status = cast(
+            Literal[
+                ExecutionStatus.FAILED,
+                ExecutionStatus.CANCELLED,
+                ExecutionStatus.BUDGET_EXCEEDED,
+                ExecutionStatus.NEEDS_ATTENTION,
+            ],
+            execution_status,
+        )
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
@@ -2776,7 +2790,7 @@ class SQLiteEventStore:
                     process_instance_id=process_instance_id,
                     correlation_id=run_id,
                     payload=RunTerminatedPayload(
-                        execution_status=execution_status,
+                        execution_status=termination_status,
                         reason=reason,
                     ),
                 )
@@ -3356,7 +3370,9 @@ class SQLiteEventStore:
             seq=session["next_seq"],
             process_instance_id=process_instance_id,
             payload=payload,
-            causation_event_id=causation_event_id,
+            causation_event_id=(
+                UUID(causation_event_id) if causation_event_id is not None else None
+            ),
             correlation_id=correlation_id,
         )
         return event
