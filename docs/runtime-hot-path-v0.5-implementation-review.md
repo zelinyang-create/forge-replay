@@ -98,14 +98,14 @@ workload.
 
 | History | Samples | Query | Legacy P50 | Indexed P50 | P50 speedup |
 |---:|---:|---|---:|---:|---:|
-| 10,000 events | 100 | Unfinished tool | 301.55 ms | 4.63 ms | 65.2x |
-| 10,000 events | 100 | Pending response | 245.58 ms | 3.98 ms | 61.6x |
-| 10,000 events | 100 | Next model step | 665.94 ms | 7.99 ms | 83.4x |
-| 10,000 events | 100 | Attempt offset | 659.36 ms | 7.92 ms | 83.3x |
-| 100,000 events | 20 | Unfinished tool | 1,786.77 ms | 2.67 ms | 670.0x |
-| 100,000 events | 20 | Pending response | 1,444.58 ms | 2.24 ms | 645.5x |
-| 100,000 events | 20 | Next model step | 1,373.14 ms | 1.84 ms | 746.8x |
-| 100,000 events | 20 | Attempt offset | 1,354.86 ms | 1.90 ms | 714.8x |
+| 10,000 events | 100 | Unfinished tool | 668.71 ms | 8.57 ms | 78.0x |
+| 10,000 events | 100 | Pending response | 727.08 ms | 9.16 ms | 79.3x |
+| 10,000 events | 100 | Next model step | 718.25 ms | 8.37 ms | 85.8x |
+| 10,000 events | 100 | Attempt offset | 696.44 ms | 7.73 ms | 90.1x |
+| 100,000 events | 20 | Unfinished tool | 1,377.15 ms | 2.13 ms | 647.3x |
+| 100,000 events | 20 | Pending response | 1,369.70 ms | 2.03 ms | 675.3x |
+| 100,000 events | 20 | Next model step | 1,315.81 ms | 1.81 ms | 728.7x |
+| 100,000 events | 20 | Attempt offset | 1,272.65 ms | 1.72 ms | 741.8x |
 
 Raw reports:
 
