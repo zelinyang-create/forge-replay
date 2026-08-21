@@ -30,6 +30,10 @@ from forge_replay.events import (
     CancellationRequestedPayload,
     CheckpointCommittedPayload,
     EventEnvelope,
+    FinalAnswerCommittedPayload,
+    ModelCallFailedPayload,
+    ModelCallStartedPayload,
+    ModelOutputRejectedPayload,
     ModelResponseReceivedPayload,
     ProjectionRebuiltPayload,
     RunCompletedPayload,
@@ -191,6 +195,30 @@ class ToolCallRecord:
 
 
 @dataclass(frozen=True)
+class ModelCallRecord:
+    model_call_id: str
+    run_id: str
+    step: int
+    model_name: str
+    status: Literal["started", "responded", "consumed"]
+    attempt_count: int
+    latest_attempt_no: int
+    response_event_id: str | None
+    response_blob_sha256: str | None
+    response_seq: int | None
+    consumed_event_id: str | None
+    consumption_kind: Literal["tool_batch", "rejected", "final"] | None
+
+
+@dataclass(frozen=True)
+class PendingModelResponse:
+    event: EventEnvelope
+    model_call_id: str
+    step: int
+    response_blob_sha256: str
+
+
+@dataclass(frozen=True)
 class ApprovalRecord:
     approval_id: str
     run_id: str
@@ -294,6 +322,7 @@ class SQLiteEventStore:
             connection.execute(SCHEMA_TABLE_SQL)
             for migration in MIGRATIONS:
                 self._apply_migration(connection, migration)
+            self._backfill_model_call_projection(connection)
 
     def _apply_migration(self, connection: sqlite3.Connection, migration: Migration) -> None:
         expected_checksum = migration_checksum(migration)
@@ -315,6 +344,58 @@ class SQLiteEventStore:
             connection.execute(
                 "INSERT INTO schema_migrations(version, applied_at, checksum) VALUES (?, ?, ?)",
                 (migration.version, datetime.now(timezone.utc).isoformat(), expected_checksum),
+            )
+            connection.execute("COMMIT")
+        except BaseException:
+            connection.execute("ROLLBACK")
+            raise
+
+    def _backfill_model_call_projection(self, connection: sqlite3.Connection) -> None:
+        """Build migration-4 operational state once from the immutable ledger."""
+
+        migration_name = "model_calls"
+        projection_version = 1
+        completed = connection.execute(
+            "SELECT version FROM operational_projection_migrations WHERE name = ?",
+            (migration_name,),
+        ).fetchone()
+        if completed is not None:
+            if completed["version"] != projection_version:
+                raise MigrationChecksumError(
+                    "model_calls operational projection version is unsupported"
+                )
+            return
+
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            connection.execute("DELETE FROM model_calls")
+            rows = connection.execute(
+                """
+                SELECT * FROM events
+                WHERE event_type IN (
+                    'model_call_started', 'model_call_failed',
+                    'model_response_received', 'model_output_rejected',
+                    'tool_call_proposed', 'final_answer_committed'
+                )
+                ORDER BY session_id, seq
+                """
+            )
+            for row in rows:
+                self._apply_operational_projection_in_transaction(
+                    connection,
+                    self._event_from_row(row),
+                    legacy_backfill=True,
+                )
+            connection.execute(
+                """
+                INSERT INTO operational_projection_migrations(name, version, completed_at)
+                VALUES (?, ?, ?)
+                """,
+                (
+                    migration_name,
+                    projection_version,
+                    datetime.now(timezone.utc).isoformat(),
+                ),
             )
             connection.execute("COMMIT")
         except BaseException:
@@ -597,6 +678,117 @@ class SQLiteEventStore:
 
     def get_run_projection(self, run_id: str) -> RunProjection:
         return self.recover_run_projection(run_id).projection
+
+    def get_unfinished_tool_call(self, run_id: str) -> ToolCallRecord | None:
+        """Return the only active tool call, failing closed on ambiguity."""
+
+        active_states = (
+            ToolCallState.PROPOSED.value,
+            ToolCallState.WAITING_APPROVAL.value,
+            ToolCallState.READY.value,
+            ToolCallState.DISPATCHED.value,
+        )
+        with self.connect() as connection:
+            self._require_run_row(connection, run_id)
+            rows = connection.execute(
+                """
+                SELECT * FROM tool_calls
+                WHERE run_id = ? AND state IN (?, ?, ?, ?)
+                LIMIT 2
+                """,
+                (run_id, *active_states),
+            ).fetchall()
+            if len(rows) > 1:
+                raise LedgerIntegrityError(
+                    f"run {run_id} has multiple unfinished tool calls"
+                )
+            if not rows:
+                return None
+            response_row = connection.execute(
+                "SELECT * FROM events WHERE event_id = ?",
+                (rows[0]["response_event_id"],),
+            ).fetchone()
+        if response_row is None:
+            raise LedgerIntegrityError("unfinished tool response event is missing")
+        response = self._event_from_row(response_row)
+        if response.run_id != run_id or not isinstance(
+            response.payload, ModelResponseReceivedPayload
+        ):
+            raise LedgerIntegrityError(
+                "unfinished tool does not reference a model response from its run"
+            )
+        return self._tool_call_from_row(rows[0], proposal_event=None)
+
+    def get_model_call(self, model_call_id: str) -> ModelCallRecord | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM model_calls WHERE model_call_id = ?",
+                (model_call_id,),
+            ).fetchone()
+        return self._model_call_from_row(row) if row is not None else None
+
+    def get_next_model_step(self, run_id: str) -> int:
+        with self.connect() as connection:
+            self._require_run_row(connection, run_id)
+            row = connection.execute(
+                """
+                SELECT * FROM model_calls
+                WHERE run_id = ?
+                ORDER BY step DESC
+                LIMIT 1
+                """,
+                (run_id,),
+            ).fetchone()
+        if row is None:
+            return 0
+        record = self._model_call_from_row(row)
+        return record.step if record.status == "started" else record.step + 1
+
+    def get_latest_unconsumed_model_response(
+        self,
+        run_id: str,
+    ) -> PendingModelResponse | None:
+        with self.connect() as connection:
+            self._require_run_row(connection, run_id)
+            rows = connection.execute(
+                """
+                SELECT * FROM model_calls
+                WHERE run_id = ? AND status = 'responded'
+                ORDER BY response_seq DESC
+                LIMIT 2
+                """,
+                (run_id,),
+            ).fetchall()
+            if len(rows) > 1:
+                raise LedgerIntegrityError(
+                    f"run {run_id} has multiple unconsumed model responses"
+                )
+            if not rows:
+                return None
+            record = self._model_call_from_row(rows[0])
+            if record.response_event_id is None or record.response_blob_sha256 is None:
+                raise LedgerIntegrityError("responded model call is missing response metadata")
+            response_row = connection.execute(
+                "SELECT * FROM events WHERE event_id = ?",
+                (record.response_event_id,),
+            ).fetchone()
+        if response_row is None:
+            raise LedgerIntegrityError("pending model response event is missing")
+        response = self._event_from_row(response_row)
+        if (
+            response.run_id != run_id
+            or response.seq != record.response_seq
+            or not isinstance(response.payload, ModelResponseReceivedPayload)
+            or response.payload.model_call_id != record.model_call_id
+            or response.payload.response_blob_sha256 != record.response_blob_sha256
+        ):
+            raise LedgerIntegrityError("pending model response projection does not match event")
+        return PendingModelResponse(
+            event=response,
+            model_call_id=record.model_call_id,
+            step=record.step,
+            response_blob_sha256=record.response_blob_sha256,
+        )
 
     def get_run_workspace(self, run_id: str) -> RunWorkspaceRecord:
         with self.connect() as connection:
@@ -956,9 +1148,11 @@ class SQLiteEventStore:
                         raise RunStateConflictError("run already owns a different worktree")
                     connection.execute("COMMIT")
                     return self.get_run_workspace(run_id)
-                projection = reduce_run_events(
-                    self._load_run_events_in_transaction(connection, run_id)
-                )
+                projection = self._recover_run_projection_in_transaction(
+                    connection,
+                    run_id=run_id,
+                    run_row=row,
+                ).projection
                 if projection.phase != RunPhase.PROVISIONING:
                     raise RunStateConflictError("run has no durable provisioning intent")
                 provisioned = self._append_event_in_transaction(
@@ -1115,9 +1309,11 @@ class SQLiteEventStore:
                     run_id=run_id,
                     execution_context=execution_context,
                 )
-                projection = reduce_run_events(
-                    self._load_run_events_in_transaction(connection, run_id)
-                )
+                projection = self._recover_run_projection_in_transaction(
+                    connection,
+                    run_id=run_id,
+                    run_row=row,
+                ).projection
                 snapshot = RunCheckpointSnapshot.from_projection(projection)
                 snapshot_json = canonical_json(snapshot.model_dump(mode="json"))
                 snapshot_sha256 = sha256_text(snapshot_json)
@@ -1206,10 +1402,10 @@ class SQLiteEventStore:
             """
             SELECT * FROM checkpoints
             WHERE run_id = ?
-            ORDER BY through_seq DESC, created_at DESC
+            ORDER BY through_seq DESC
             """,
             (run_id,),
-        ).fetchall()
+        )
         for checkpoint_row in checkpoint_rows:
             try:
                 checkpoint_projection = self._projection_from_checkpoint_row(
@@ -2276,6 +2472,23 @@ class SQLiteEventStore:
         )
 
     @staticmethod
+    def _model_call_from_row(row: sqlite3.Row) -> ModelCallRecord:
+        return ModelCallRecord(
+            model_call_id=row["model_call_id"],
+            run_id=row["run_id"],
+            step=row["step"],
+            model_name=row["model_name"],
+            status=row["status"],
+            attempt_count=row["attempt_count"],
+            latest_attempt_no=row["latest_attempt_no"],
+            response_event_id=row["response_event_id"],
+            response_blob_sha256=row["response_blob_sha256"],
+            response_seq=row["response_seq"],
+            consumed_event_id=row["consumed_event_id"],
+            consumption_kind=row["consumption_kind"],
+        )
+
+    @staticmethod
     def _projection_from_checkpoint_row(
         checkpoint_row: sqlite3.Row,
         run_row: sqlite3.Row,
@@ -2329,9 +2542,11 @@ class SQLiteEventStore:
                     run_id=run_id,
                     execution_context=execution_context,
                 )
-                projection = reduce_run_events(
-                    self._load_run_events_in_transaction(connection, run_id)
-                )
+                projection = self._recover_run_projection_in_transaction(
+                    connection,
+                    run_id=run_id,
+                    run_row=row,
+                ).projection
                 if projection.execution_status != ExecutionStatus.ACTIVE:
                     raise RunStateConflictError(f"run {run_id} is terminal")
                 if projection.phase != expected_previous_phase:
@@ -2366,6 +2581,91 @@ class SQLiteEventStore:
         self._advance_execution_context(execution_context, event.seq)
         return replace(projection, phase=next_phase, last_event_seq=event.seq)
 
+    def commit_final_answer(
+        self,
+        *,
+        run_id: str,
+        response_event_id: str,
+        answer_blob_sha256: str,
+        verification_status: Literal["passed", "failed", "not_configured"],
+        process_instance_id: str,
+        execution_context: ExecutionContext | None = None,
+    ) -> RunProjection:
+        """Atomically consume a response, commit its answer, and finish the run."""
+
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._require_execution_context(
+                    connection,
+                    run_id=run_id,
+                    execution_context=execution_context,
+                )
+                recovered = self._recover_run_projection_in_transaction(
+                    connection,
+                    run_id=run_id,
+                    run_row=row,
+                )
+                projection = recovered.projection
+                if projection.execution_status != ExecutionStatus.ACTIVE:
+                    raise RunStateConflictError(f"run {run_id} is already terminal")
+                final_event = self._append_event_in_transaction(
+                    connection,
+                    session_id=row["session_id"],
+                    turn_id=row["turn_id"],
+                    run_id=run_id,
+                    process_instance_id=process_instance_id,
+                    causation_event_id=response_event_id,
+                    correlation_id=run_id,
+                    payload=FinalAnswerCommittedPayload(
+                        answer_blob_sha256=answer_blob_sha256
+                    ),
+                )
+                completed_event = self._append_event_in_transaction(
+                    connection,
+                    session_id=row["session_id"],
+                    turn_id=row["turn_id"],
+                    run_id=run_id,
+                    process_instance_id=process_instance_id,
+                    causation_event_id=str(final_event.event_id),
+                    correlation_id=run_id,
+                    payload=RunCompletedPayload(
+                        verification_status=verification_status
+                    ),
+                )
+                finished_at = datetime.now(timezone.utc).isoformat()
+                connection.execute(
+                    """
+                    UPDATE runs
+                    SET execution_status = ?, phase = NULL, finished_at = ?, last_event_seq = ?
+                    WHERE run_id = ?
+                    """,
+                    (
+                        ExecutionStatus.COMPLETED.value,
+                        finished_at,
+                        completed_event.seq,
+                        run_id,
+                    ),
+                )
+                connection.execute(
+                    """
+                    UPDATE turns SET status = 'completed', active_run_id = NULL
+                    WHERE turn_id = ?
+                    """,
+                    (row["turn_id"],),
+                )
+                connection.execute("COMMIT")
+            except BaseException:
+                connection.execute("ROLLBACK")
+                raise
+        self._advance_execution_context(execution_context, completed_event.seq)
+        return replace(
+            projection,
+            execution_status=ExecutionStatus.COMPLETED,
+            phase=None,
+            last_event_seq=completed_event.seq,
+        )
+
     def complete_run(
         self,
         *,
@@ -2384,9 +2684,11 @@ class SQLiteEventStore:
                     run_id=run_id,
                     execution_context=execution_context,
                 )
-                projection = reduce_run_events(
-                    self._load_run_events_in_transaction(connection, run_id)
-                )
+                projection = self._recover_run_projection_in_transaction(
+                    connection,
+                    run_id=run_id,
+                    run_row=row,
+                ).projection
                 if not can_transition_execution(
                     projection.execution_status,
                     ExecutionStatus.COMPLETED,
@@ -2456,9 +2758,11 @@ class SQLiteEventStore:
                     run_id=run_id,
                     execution_context=execution_context,
                 )
-                projection = reduce_run_events(
-                    self._load_run_events_in_transaction(connection, run_id)
-                )
+                projection = self._recover_run_projection_in_transaction(
+                    connection,
+                    run_id=run_id,
+                    run_row=row,
+                ).projection
                 if projection.execution_status != ExecutionStatus.ACTIVE:
                     if projection.execution_status == execution_status:
                         connection.execute("COMMIT")
@@ -2659,7 +2963,372 @@ class SQLiteEventStore:
             correlation_id=correlation_id,
         )
         self._insert_event_in_transaction(connection, event)
+        self._apply_operational_projection_in_transaction(connection, event)
         return event
+
+    def _apply_operational_projection_in_transaction(
+        self,
+        connection: sqlite3.Connection,
+        event: EventEnvelope,
+        *,
+        legacy_backfill: bool = False,
+    ) -> None:
+        payload = event.payload
+        if isinstance(payload, ModelCallStartedPayload):
+            self._project_model_call_started(
+                connection,
+                event,
+                payload,
+                legacy_backfill=legacy_backfill,
+            )
+        elif isinstance(payload, ModelCallFailedPayload):
+            self._project_model_call_failed(connection, event, payload)
+        elif isinstance(payload, ModelResponseReceivedPayload):
+            self._project_model_response(
+                connection,
+                event,
+                payload,
+                legacy_backfill=legacy_backfill,
+            )
+        elif isinstance(
+            payload,
+            (ToolCallProposedPayload, ModelOutputRejectedPayload, FinalAnswerCommittedPayload),
+        ):
+            self._project_model_response_consumption(
+                connection,
+                event,
+                legacy_backfill=legacy_backfill,
+            )
+
+    def _project_model_call_started(
+        self,
+        connection: sqlite3.Connection,
+        event: EventEnvelope,
+        payload: ModelCallStartedPayload,
+        *,
+        legacy_backfill: bool,
+    ) -> None:
+        run_id = self._event_run_id(event)
+        existing = connection.execute(
+            "SELECT * FROM model_calls WHERE model_call_id = ?",
+            (payload.model_call_id,),
+        ).fetchone()
+        step = self._resolve_model_step(
+            connection,
+            run_id=run_id,
+            model_call_id=payload.model_call_id,
+            explicit_step=payload.step,
+            legacy_backfill=legacy_backfill,
+            existing=existing,
+        )
+        if existing is None:
+            active = connection.execute(
+                """
+                SELECT model_call_id FROM model_calls
+                WHERE run_id = ? AND status IN ('started', 'responded')
+                LIMIT 1
+                """,
+                (run_id,),
+            ).fetchone()
+            if active is not None:
+                raise LedgerIntegrityError(
+                    f"run {run_id} already has active model call {active['model_call_id']}"
+                )
+            connection.execute(
+                """
+                INSERT INTO model_calls(
+                    model_call_id, run_id, step, model_name, status,
+                    attempt_count, latest_attempt_no, first_started_event_id,
+                    latest_attempt_event_id, updated_seq
+                ) VALUES (?, ?, ?, ?, 'started', 1, ?, ?, ?, ?)
+                """,
+                (
+                    payload.model_call_id,
+                    run_id,
+                    step,
+                    payload.model_name,
+                    payload.attempt_no,
+                    str(event.event_id),
+                    str(event.event_id),
+                    event.seq,
+                ),
+            )
+            return
+        if (
+            existing["run_id"] != run_id
+            or existing["step"] != step
+            or existing["model_name"] not in {payload.model_name, "legacy-unknown"}
+        ):
+            raise LedgerIntegrityError(
+                f"model call identity conflict at event {event.event_id}"
+            )
+        if existing["status"] != "started":
+            raise LedgerIntegrityError(
+                f"model call {payload.model_call_id} received an attempt after response"
+            )
+        if str(event.event_id) == existing["latest_attempt_event_id"]:
+            return
+        if payload.attempt_no <= existing["latest_attempt_no"]:
+            raise LedgerIntegrityError(
+                f"model call {payload.model_call_id} attempt number did not advance"
+            )
+        connection.execute(
+            """
+            UPDATE model_calls
+            SET model_name = ?, attempt_count = attempt_count + 1,
+                latest_attempt_no = ?, latest_attempt_event_id = ?,
+                first_started_event_id = COALESCE(first_started_event_id, ?),
+                updated_seq = ?
+            WHERE model_call_id = ?
+            """,
+            (
+                payload.model_name,
+                payload.attempt_no,
+                str(event.event_id),
+                str(event.event_id),
+                event.seq,
+                payload.model_call_id,
+            ),
+        )
+
+    def _project_model_call_failed(
+        self,
+        connection: sqlite3.Connection,
+        event: EventEnvelope,
+        payload: ModelCallFailedPayload,
+    ) -> None:
+        row = connection.execute(
+            "SELECT * FROM model_calls WHERE model_call_id = ?",
+            (payload.model_call_id,),
+        ).fetchone()
+        if row is None or row["run_id"] != self._event_run_id(event):
+            raise LedgerIntegrityError(
+                f"model failure {event.event_id} has no matching model call"
+            )
+        if row["status"] != "started":
+            raise LedgerIntegrityError("model failure was appended after a response")
+        if event.causation_event_id is not None and (
+            str(event.causation_event_id) != row["latest_attempt_event_id"]
+        ):
+            raise LedgerIntegrityError("model failure does not reference the latest attempt")
+        connection.execute(
+            """
+            UPDATE model_calls
+            SET latest_failure_event_id = ?, updated_seq = ?
+            WHERE model_call_id = ?
+            """,
+            (str(event.event_id), event.seq, payload.model_call_id),
+        )
+
+    def _project_model_response(
+        self,
+        connection: sqlite3.Connection,
+        event: EventEnvelope,
+        payload: ModelResponseReceivedPayload,
+        *,
+        legacy_backfill: bool,
+    ) -> None:
+        run_id = self._event_run_id(event)
+        row = connection.execute(
+            "SELECT * FROM model_calls WHERE model_call_id = ?",
+            (payload.model_call_id,),
+        ).fetchone()
+        if row is None and legacy_backfill:
+            active = connection.execute(
+                """
+                SELECT model_call_id FROM model_calls
+                WHERE run_id = ? AND status IN ('started', 'responded')
+                LIMIT 1
+                """,
+                (run_id,),
+            ).fetchone()
+            if active is not None:
+                raise LedgerIntegrityError(
+                    f"run {run_id} already has active model call {active['model_call_id']}"
+                )
+            step = self._resolve_model_step(
+                connection,
+                run_id=run_id,
+                model_call_id=payload.model_call_id,
+                explicit_step=None,
+                legacy_backfill=True,
+                existing=None,
+            )
+            connection.execute(
+                """
+                INSERT INTO model_calls(
+                    model_call_id, run_id, step, model_name, status,
+                    attempt_count, latest_attempt_no, updated_seq
+                ) VALUES (?, ?, ?, 'legacy-unknown', 'started', 0, 0, ?)
+                """,
+                (payload.model_call_id, run_id, step, event.seq),
+            )
+            row = connection.execute(
+                "SELECT * FROM model_calls WHERE model_call_id = ?",
+                (payload.model_call_id,),
+            ).fetchone()
+        if row is None or row["run_id"] != run_id:
+            raise LedgerIntegrityError(
+                f"model response {event.event_id} has no matching started call"
+            )
+        if row["status"] == "responded" and (
+            row["response_event_id"] == str(event.event_id)
+            and row["response_blob_sha256"] == payload.response_blob_sha256
+        ):
+            return
+        if row["status"] != "started":
+            raise LedgerIntegrityError(
+                f"model call {payload.model_call_id} has conflicting responses"
+            )
+        if event.causation_event_id is not None and row["latest_attempt_event_id"] and (
+            str(event.causation_event_id) != row["latest_attempt_event_id"]
+        ):
+            raise LedgerIntegrityError("model response does not reference the latest attempt")
+        connection.execute(
+            """
+            UPDATE model_calls
+            SET status = 'responded', response_event_id = ?,
+                response_blob_sha256 = ?, response_seq = ?, updated_seq = ?
+            WHERE model_call_id = ?
+            """,
+            (
+                str(event.event_id),
+                payload.response_blob_sha256,
+                event.seq,
+                event.seq,
+                payload.model_call_id,
+            ),
+        )
+
+    def _project_model_response_consumption(
+        self,
+        connection: sqlite3.Connection,
+        event: EventEnvelope,
+        *,
+        legacy_backfill: bool,
+    ) -> None:
+        payload = event.payload
+        if isinstance(payload, ToolCallProposedPayload):
+            kind = "tool_batch"
+            response_event_id = (
+                str(event.causation_event_id) if event.causation_event_id else None
+            )
+            if response_event_id is None and legacy_backfill:
+                tool_row = connection.execute(
+                    "SELECT response_event_id FROM tool_calls WHERE tool_call_id = ?",
+                    (payload.tool_call_id,),
+                ).fetchone()
+                response_event_id = tool_row["response_event_id"] if tool_row else None
+        elif isinstance(payload, ModelOutputRejectedPayload):
+            kind = "rejected"
+            response_event_id = payload.response_event_id
+            if event.causation_event_id is not None and (
+                str(event.causation_event_id) != response_event_id
+            ):
+                raise LedgerIntegrityError("model rejection causation does not match payload")
+        else:
+            kind = "final"
+            response_event_id = (
+                str(event.causation_event_id) if event.causation_event_id else None
+            )
+            if response_event_id is None and legacy_backfill:
+                rows = connection.execute(
+                    """
+                    SELECT response_event_id FROM model_calls
+                    WHERE run_id = ? AND status = 'responded' AND response_seq < ?
+                    ORDER BY response_seq DESC LIMIT 2
+                    """,
+                    (self._event_run_id(event), event.seq),
+                ).fetchall()
+                if len(rows) == 1:
+                    response_event_id = rows[0]["response_event_id"]
+        if response_event_id is None:
+            raise LedgerIntegrityError(
+                f"model response consumption {event.event_id} has no causation"
+            )
+        response_row = connection.execute(
+            "SELECT * FROM events WHERE event_id = ?",
+            (response_event_id,),
+        ).fetchone()
+        if response_row is None:
+            raise LedgerIntegrityError("consumed model response event is missing")
+        response = self._event_from_row(response_row)
+        run_id = self._event_run_id(event)
+        if response.run_id != run_id or not isinstance(
+            response.payload, ModelResponseReceivedPayload
+        ):
+            raise LedgerIntegrityError("consumer references a response from another run")
+        row = connection.execute(
+            "SELECT * FROM model_calls WHERE response_event_id = ?",
+            (response_event_id,),
+        ).fetchone()
+        if row is None:
+            raise LedgerIntegrityError("model response has no operational projection")
+        if row["status"] == "consumed":
+            if (
+                kind == "tool_batch"
+                and row["consumption_kind"] == "tool_batch"
+                and row["response_event_id"] == response_event_id
+            ):
+                return
+            if row["consumed_event_id"] == str(event.event_id):
+                return
+            raise LedgerIntegrityError("model response was consumed by conflicting actions")
+        if row["status"] != "responded":
+            raise LedgerIntegrityError("model response is not available for consumption")
+        connection.execute(
+            """
+            UPDATE model_calls
+            SET status = 'consumed', consumed_event_id = ?, consumed_seq = ?,
+                consumption_kind = ?, updated_seq = ?
+            WHERE model_call_id = ?
+            """,
+            (str(event.event_id), event.seq, kind, event.seq, row["model_call_id"]),
+        )
+
+    def _resolve_model_step(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        run_id: str,
+        model_call_id: str,
+        explicit_step: int | None,
+        legacy_backfill: bool,
+        existing: sqlite3.Row | None,
+    ) -> int:
+        if existing is not None:
+            if explicit_step is not None and explicit_step != existing["step"]:
+                raise LedgerIntegrityError("model call step changed")
+            return int(existing["step"])
+        prefix = f"model-call:{run_id}:"
+        parsed: int | None = None
+        if model_call_id.startswith(prefix):
+            suffix = model_call_id.removeprefix(prefix)
+            if suffix.isdigit():
+                parsed = int(suffix)
+        if explicit_step is not None:
+            if model_call_id != f"{prefix}{explicit_step}":
+                raise LedgerIntegrityError(
+                    "explicit model step conflicts with the stable model_call_id"
+                )
+            return explicit_step
+        if parsed is not None:
+            return parsed
+        if not legacy_backfill:
+            raise LedgerIntegrityError(
+                "new model call event requires an explicit step or frozen legacy identity"
+            )
+        row = connection.execute(
+            "SELECT MAX(step) AS max_step FROM model_calls WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+        return 0 if row["max_step"] is None else int(row["max_step"]) + 1
+
+    @staticmethod
+    def _event_run_id(event: EventEnvelope) -> str:
+        if event.run_id is None:
+            raise LedgerIntegrityError(f"runtime event {event.event_id} has no run_id")
+        return event.run_id
 
     def _prepare_event_in_transaction(
         self,

@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from forge_replay.domain import ExecutionContext
-from forge_replay.events import ModelCallStartedPayload
+from forge_replay.events import CancellationRequestedPayload
 from forge_replay.persistence import LeaseConflictError, SQLiteEventStore
 
 
@@ -65,7 +65,7 @@ def run_stress(*, stale_attempts: int = 10_000, valid_every: int = 1_000) -> dic
         elapsed = time.perf_counter() - started
         with store.connect() as connection:
             durable_valid = connection.execute(
-                "SELECT COUNT(*) FROM events WHERE event_type = 'model_call_started'"
+                "SELECT COUNT(*) FROM events WHERE event_type = 'cancellation_requested'"
             ).fetchone()[0]
         return {
             "schema_version": 1,
@@ -98,10 +98,9 @@ def _append_attempt(
         turn_id=projection.turn_id,
         run_id="run-1",
         process_instance_id=worker,
-        payload=ModelCallStartedPayload(
-            model_call_id=f"{worker}-{index}",
-            model_name="stress",
-            attempt_no=1,
+        payload=CancellationRequestedPayload(
+            actor=worker,
+            reason=f"fencing-stress-{index}",
         ),
         execution_context=context,
     )

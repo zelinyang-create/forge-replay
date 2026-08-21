@@ -3,7 +3,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 from forge_replay.domain import ToolCallState, ToolEffectClass
-from forge_replay.events import ModelResponseReceivedPayload
+from forge_replay.events import ModelCallStartedPayload, ModelResponseReceivedPayload
 from forge_replay.persistence import (
     LedgerIntegrityError,
     SQLiteEventStore,
@@ -30,13 +30,26 @@ def build_run(tmp_path):
         process_instance_id="worker-1",
     )
     blob = store.put_blob('{"tool":"read_file"}', media_type="application/json")
+    started = store.append_event(
+        session_id="session-1",
+        turn_id="turn-1",
+        run_id="run-1",
+        process_instance_id="worker-1",
+        payload=ModelCallStartedPayload(
+            model_call_id="model-call:run-1:0",
+            model_name="test",
+            attempt_no=1,
+            step=0,
+        ),
+    )
     response = store.append_event(
         session_id="session-1",
         turn_id="turn-1",
         run_id="run-1",
         process_instance_id="worker-1",
+        causation_event_id=str(started.event_id),
         payload=ModelResponseReceivedPayload(
-            model_call_id="model-call-1",
+            model_call_id="model-call:run-1:0",
             response_blob_sha256=blob.sha256,
             input_tokens=100,
             output_tokens=20,

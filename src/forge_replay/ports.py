@@ -23,6 +23,8 @@ from forge_replay.events import EventEnvelope, RuntimeEventPayload
 from forge_replay.persistence.store import (
     ApprovalRecord,
     BudgetReservationRecord,
+    ModelCallRecord,
+    PendingModelResponse,
     RunLease,
     RunWorkspaceRecord,
     StoredBlob,
@@ -69,6 +71,16 @@ class RuntimeStorePort(BlobStorePort, Protocol):
 
     def get_run_projection(self, run_id: str) -> RunProjection: ...
 
+    def get_unfinished_tool_call(self, run_id: str) -> ToolCallRecord | None: ...
+
+    def get_model_call(self, model_call_id: str) -> ModelCallRecord | None: ...
+
+    def get_next_model_step(self, run_id: str) -> int: ...
+
+    def get_latest_unconsumed_model_response(
+        self, run_id: str
+    ) -> PendingModelResponse | None: ...
+
     def transition_run_phase(
         self,
         *,
@@ -109,6 +121,17 @@ class RuntimeStorePort(BlobStorePort, Protocol):
         self,
         *,
         run_id: str,
+        verification_status: Literal["passed", "failed", "not_configured"],
+        process_instance_id: str,
+        execution_context: ExecutionContext | None = None,
+    ) -> RunProjection: ...
+
+    def commit_final_answer(
+        self,
+        *,
+        run_id: str,
+        response_event_id: str,
+        answer_blob_sha256: str,
         verification_status: Literal["passed", "failed", "not_configured"],
         process_instance_id: str,
         execution_context: ExecutionContext | None = None,
@@ -190,8 +213,6 @@ class RuntimeStorePort(BlobStorePort, Protocol):
     ) -> ApprovalRecord | None: ...
 
     def list_dispatched_attempts(self, run_id: str) -> list[ToolAttemptRecord]: ...
-
-    def load_run_events(self, run_id: str) -> list[EventEnvelope]: ...
 
     def load_recent_run_events(
         self, run_id: str, *, limit: int = 64

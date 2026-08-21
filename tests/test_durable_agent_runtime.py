@@ -249,6 +249,7 @@ def test_resume_consumes_durable_model_response_and_settles_budget(tmp_path):
             model_call_id="model-call:run-1:0",
             model_name="scripted-model",
             attempt_no=1,
+            step=0,
         ),
     )
     blob = store.put_blob("<final>durably recovered</final>", media_type="text/plain")
@@ -275,6 +276,42 @@ def test_resume_consumes_durable_model_response_and_settles_budget(tmp_path):
             ("model-budget:run-1:0",),
         ).fetchone()
     assert reservation["state"] == "settled"
+
+
+def test_runtime_hot_path_never_calls_public_full_event_loader(tmp_path, monkeypatch):
+    _, store, runtime = build_runtime(tmp_path, ["<final>done</final>"])
+
+    def forbidden(_run_id):
+        raise AssertionError("runtime attempted a full event scan")
+
+    monkeypatch.setattr(store, "load_run_events", forbidden)
+    assert runtime.run("run-1").status == "completed"
+
+
+def test_runtime_resumes_attempt_numbers_from_latest_not_count(tmp_path):
+    _, store, runtime = build_runtime(tmp_path, ["<final>done</final>"])
+    projection = store.get_run_projection("run-1")
+    for attempt_no in (1, 3):
+        store.append_event(
+            session_id=projection.session_id,
+            turn_id=projection.turn_id,
+            run_id="run-1",
+            process_instance_id="crashed-worker",
+            payload=ModelCallStartedPayload(
+                model_call_id="model-call:run-1:0",
+                model_name="scripted-model",
+                attempt_no=attempt_no,
+                step=0,
+            ),
+        )
+
+    assert runtime.run("run-1").status == "completed"
+    starts = [
+        event.payload.attempt_no
+        for event in store.load_run_events("run-1")
+        if isinstance(event.payload, ModelCallStartedPayload)
+    ]
+    assert starts == [1, 3, 4]
 
 
 def test_runtime_renews_lease_before_bounded_actions(tmp_path, monkeypatch):

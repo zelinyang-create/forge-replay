@@ -106,6 +106,7 @@ class ModelCallStartedPayload(EventPayload):
     model_call_id: str
     model_name: str
     attempt_no: int = Field(ge=1)
+    step: int | None = Field(default=None, ge=0)
 
 
 class ModelResponseReceivedPayload(EventPayload):

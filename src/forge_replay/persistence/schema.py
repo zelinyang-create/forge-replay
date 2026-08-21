@@ -211,6 +211,54 @@ MIGRATIONS = (
             "CREATE INDEX control_commands_by_run ON control_commands(run_id, created_at)",
         ),
     ),
+    Migration(
+        version=4,
+        statements=(
+            """
+            CREATE TABLE model_calls (
+                model_call_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL REFERENCES runs(run_id),
+                step INTEGER NOT NULL CHECK(step >= 0),
+                model_name TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('started', 'responded', 'consumed')),
+                attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
+                latest_attempt_no INTEGER NOT NULL DEFAULT 0 CHECK(latest_attempt_no >= 0),
+                first_started_event_id TEXT REFERENCES events(event_id),
+                latest_attempt_event_id TEXT REFERENCES events(event_id),
+                latest_failure_event_id TEXT REFERENCES events(event_id),
+                response_event_id TEXT UNIQUE REFERENCES events(event_id),
+                response_blob_sha256 TEXT REFERENCES blobs(sha256),
+                response_seq INTEGER,
+                consumed_event_id TEXT REFERENCES events(event_id),
+                consumed_seq INTEGER,
+                consumption_kind TEXT CHECK(
+                    consumption_kind IN ('tool_batch', 'rejected', 'final')
+                ),
+                updated_seq INTEGER NOT NULL
+            )
+            """,
+            """
+            CREATE UNIQUE INDEX model_calls_by_run_step
+            ON model_calls(run_id, step)
+            """,
+            """
+            CREATE UNIQUE INDEX model_calls_one_active_per_run
+            ON model_calls(run_id)
+            WHERE status IN ('started', 'responded')
+            """,
+            """
+            CREATE INDEX model_calls_pending_response
+            ON model_calls(run_id, status, response_seq DESC)
+            """,
+            """
+            CREATE TABLE operational_projection_migrations (
+                name TEXT PRIMARY KEY,
+                version INTEGER NOT NULL,
+                completed_at TEXT NOT NULL
+            )
+            """,
+        ),
+    ),
 )
 
 

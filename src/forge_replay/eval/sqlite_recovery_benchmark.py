@@ -11,7 +11,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from forge_replay.events import ModelCallStartedPayload
+from forge_replay.events import CancellationRequestedPayload
 from forge_replay.persistence import SQLiteEventStore
 
 
@@ -82,10 +82,9 @@ def _append_events(store: SQLiteEventStore, count: int, *, offset: int) -> None:
             turn_id=projection.turn_id,
             run_id="run-1",
             process_instance_id="benchmark",
-            payload=ModelCallStartedPayload(
-                model_call_id=f"benchmark-{index}",
-                model_name="benchmark",
-                attempt_no=1,
+            payload=CancellationRequestedPayload(
+                actor="benchmark",
+                reason=f"event-{index}",
             ),
         )
 

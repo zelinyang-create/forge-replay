@@ -16,12 +16,10 @@ from forge_replay.domain import (
 )
 from forge_replay.events import (
     ApprovalDecidedPayload,
-    FinalAnswerCommittedPayload,
     ModelCallFailedPayload,
     ModelCallStartedPayload,
     ModelOutputRejectedPayload,
     ModelResponseReceivedPayload,
-    ToolCallProposedPayload,
     ToolExecutionFailedPayload,
     ToolExecutionSucceededPayload,
     ToolExecutionUncertainPayload,
@@ -66,12 +64,14 @@ class _DurableModelAttemptObserver(ModelAttemptObserver):
         *,
         run_id: str,
         model_call_id: str,
+        step: int,
         attempt_offset: int,
         execution_context: ExecutionContext,
     ):
         self.runtime = runtime
         self.run_id = run_id
         self.model_call_id = model_call_id
+        self.step = step
         self.attempt_offset = attempt_offset
         self.execution_context = execution_context
         self.last_started = None
@@ -91,6 +91,7 @@ class _DurableModelAttemptObserver(ModelAttemptObserver):
                 model_call_id=self.model_call_id,
                 model_name=self.runtime.model.name,
                 attempt_no=durable_attempt,
+                step=self.step,
             ),
             execution_context=self.execution_context,
         )
@@ -266,17 +267,10 @@ class DurableAgentRuntime:
             if kind == "final":
                 answer = str(payload).strip()
                 blob = self.store.put_blob(answer, media_type="text/plain; charset=utf-8")
-                projection = self.store.get_run_projection(run_id)
-                self.store.append_event(
-                    session_id=projection.session_id,
-                    turn_id=projection.turn_id,
+                self.store.commit_final_answer(
                     run_id=run_id,
-                    process_instance_id=self.process_instance_id,
-                    payload=FinalAnswerCommittedPayload(answer_blob_sha256=blob.sha256),
-                    execution_context=execution_context,
-                )
-                self.store.complete_run(
-                    run_id=run_id,
+                    response_event_id=str(response_event.event_id),
+                    answer_blob_sha256=blob.sha256,
                     verification_status="not_configured",
                     process_instance_id=self.process_instance_id,
                     execution_context=execution_context,
@@ -348,16 +342,19 @@ class DurableAgentRuntime:
             )
             reserved = True
         model_call_id = f"model-call:{run_id}:{step}"
-        previous_attempts = sum(
-            1
-            for item in self.store.load_run_events(run_id)
-            if isinstance(item.payload, ModelCallStartedPayload)
-            and item.payload.model_call_id == model_call_id
+        existing_call = self.store.get_model_call(model_call_id)
+        if existing_call is not None and (
+            existing_call.run_id != run_id or existing_call.step != step
+        ):
+            raise ModelInvocationError("model call projection identity mismatch")
+        previous_attempts = (
+            existing_call.latest_attempt_no if existing_call is not None else 0
         )
         observer = _DurableModelAttemptObserver(
             self,
             run_id=run_id,
             model_call_id=model_call_id,
+            step=step,
             attempt_offset=previous_attempts,
             execution_context=execution_context,
         )
@@ -429,43 +426,14 @@ class DurableAgentRuntime:
         )
 
     def _next_model_step(self, run_id: str) -> int:
-        prefix = f"model-call:{run_id}:"
-        call_ids: list[str] = []
-        completed: set[str] = set()
-        for event in self.store.load_run_events(run_id):
-            if isinstance(event.payload, ModelCallStartedPayload):
-                call_id = event.payload.model_call_id
-                if call_id.startswith(prefix) and call_id not in call_ids:
-                    call_ids.append(call_id)
-            elif isinstance(event.payload, ModelResponseReceivedPayload):
-                completed.add(event.payload.model_call_id)
-        if call_ids and call_ids[-1] not in completed:
-            return int(call_ids[-1].removeprefix(prefix))
-        return len(call_ids)
+        return self.store.get_next_model_step(run_id)
 
     def _latest_unconsumed_model_response(self, run_id: str):
-        events = self.store.load_run_events(run_id)
-        consumed: set[str] = set()
-        for event in events:
-            if isinstance(event.payload, ToolCallProposedPayload):
-                if event.causation_event_id is not None:
-                    consumed.add(str(event.causation_event_id))
-            elif isinstance(event.payload, ModelOutputRejectedPayload):
-                consumed.add(event.payload.response_event_id)
-        prefix = f"model-call:{run_id}:"
-        for event in reversed(events):
-            if not isinstance(event.payload, ModelResponseReceivedPayload):
-                continue
-            if str(event.event_id) in consumed:
-                continue
-            call_id = event.payload.model_call_id
-            if not call_id.startswith(prefix):
-                continue
-            raw = self.store.get_blob(event.payload.response_blob_sha256).content.decode(
-                "utf-8"
-            )
-            return event, raw, int(call_id.removeprefix(prefix))
-        return None
+        pending = self.store.get_latest_unconsumed_model_response(run_id)
+        if pending is None:
+            return None
+        raw = self.store.get_blob(pending.response_blob_sha256).content.decode("utf-8")
+        return pending.event, raw, pending.step
 
     def _continue_tool(
         self,
@@ -601,20 +569,8 @@ class DurableAgentRuntime:
         )
 
     def _latest_unfinished_tool(self, run_id: str) -> str | None:
-        events = self.store.load_run_events(run_id)
-        for event in reversed(events):
-            if hasattr(event.payload, "tool_call_id"):
-                tool_call_id = event.payload.tool_call_id
-                call = self.store.get_tool_call(tool_call_id)
-                if call.state in {
-                    ToolCallState.PROPOSED,
-                    ToolCallState.WAITING_APPROVAL,
-                    ToolCallState.READY,
-                    ToolCallState.DISPATCHED,
-                }:
-                    return tool_call_id
-                return None
-        return None
+        call = self.store.get_unfinished_tool_call(run_id)
+        return call.tool_call_id if call is not None else None
 
     def _prompt(self, run_id: str, step: int) -> str:
         transcript = []

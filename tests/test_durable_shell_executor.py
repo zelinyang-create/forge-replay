@@ -4,7 +4,7 @@ import sys
 import pytest
 
 from forge_replay.domain import ApprovalDecision, ToolCallState, ToolEffectClass
-from forge_replay.events import ModelResponseReceivedPayload
+from forge_replay.events import ModelCallStartedPayload, ModelResponseReceivedPayload
 from forge_replay.persistence import SQLiteEventStore
 from forge_replay.runtime.shell_executor import DurableShellExecutor
 from forge_replay.tools import ProcessSupervisor
@@ -32,13 +32,26 @@ def build_executor(tmp_path, *, hook=None, code="print('hello')"):
         process_instance_id="worker-1",
     )
     blob = store.put_blob("response", media_type="text/plain")
+    started = store.append_event(
+        session_id="session-1",
+        turn_id="turn-1",
+        run_id="run-1",
+        process_instance_id="worker-1",
+        payload=ModelCallStartedPayload(
+            model_call_id="model-call:run-1:0",
+            model_name="test",
+            attempt_no=1,
+            step=0,
+        ),
+    )
     response = store.append_event(
         session_id="session-1",
         turn_id="turn-1",
         run_id="run-1",
         process_instance_id="worker-1",
+        causation_event_id=str(started.event_id),
         payload=ModelResponseReceivedPayload(
-            model_call_id="model-1", response_blob_sha256=blob.sha256
+            model_call_id="model-call:run-1:0", response_blob_sha256=blob.sha256
         ),
     )
     call = store.propose_tool_call(
