@@ -257,6 +257,10 @@ MIGRATIONS = (
                 completed_at TEXT NOT NULL
             )
             """,
+            """
+            CREATE INDEX tool_attempts_by_call_state
+            ON tool_attempts(tool_call_id, state, attempt_no DESC)
+            """,
         ),
     ),
 )

@@ -55,6 +55,10 @@ class AgentOutcome:
     detail: str | None = None
 
 
+class DurableObservationError(RuntimeError):
+    """A provider hook could not persist its attempt fact."""
+
+
 class _DurableModelAttemptObserver(ModelAttemptObserver):
     """Append one auditable event for every physical provider attempt."""
 
@@ -81,39 +85,48 @@ class _DurableModelAttemptObserver(ModelAttemptObserver):
     def started(self, attempt_no: int) -> None:
         projection = self.runtime.store.get_run_projection(self.run_id)
         durable_attempt = self.attempt_offset + attempt_no
+        try:
+            started = self.runtime.store.append_event(
+                session_id=projection.session_id,
+                turn_id=projection.turn_id,
+                run_id=self.run_id,
+                process_instance_id=self.runtime.process_instance_id,
+                payload=ModelCallStartedPayload(
+                    model_call_id=self.model_call_id,
+                    model_name=self.runtime.model.name,
+                    attempt_no=durable_attempt,
+                    step=self.step,
+                ),
+                execution_context=self.execution_context,
+            )
+        except Exception as exc:
+            raise DurableObservationError("model attempt start was not persisted") from exc
         self.last_attempt_no = durable_attempt
-        self.last_started = self.runtime.store.append_event(
-            session_id=projection.session_id,
-            turn_id=projection.turn_id,
-            run_id=self.run_id,
-            process_instance_id=self.runtime.process_instance_id,
-            payload=ModelCallStartedPayload(
-                model_call_id=self.model_call_id,
-                model_name=self.runtime.model.name,
-                attempt_no=durable_attempt,
-                step=self.step,
-            ),
-            execution_context=self.execution_context,
-        )
+        self.last_started = started
 
     def failed(self, attempt_no: int, error: BaseException, *, retryable: bool) -> None:
         durable_attempt = self.attempt_offset + attempt_no
         projection = self.runtime.store.get_run_projection(self.run_id)
-        self.runtime.store.append_event(
-            session_id=projection.session_id,
-            turn_id=projection.turn_id,
-            run_id=self.run_id,
-            process_instance_id=self.runtime.process_instance_id,
-            causation_event_id=(
-                str(self.last_started.event_id) if self.last_started is not None else None
-            ),
-            payload=ModelCallFailedPayload(
-                model_call_id=self.model_call_id,
-                error_class=type(error).__name__,
-                retryable=retryable,
-            ),
-            execution_context=self.execution_context,
-        )
+        try:
+            self.runtime.store.append_event(
+                session_id=projection.session_id,
+                turn_id=projection.turn_id,
+                run_id=self.run_id,
+                process_instance_id=self.runtime.process_instance_id,
+                causation_event_id=(
+                    str(self.last_started.event_id)
+                    if self.last_started is not None
+                    else None
+                ),
+                payload=ModelCallFailedPayload(
+                    model_call_id=self.model_call_id,
+                    error_class=type(error).__name__,
+                    retryable=retryable,
+                ),
+                execution_context=self.execution_context,
+            )
+        except Exception as exc:
+            raise DurableObservationError("model attempt failure was not persisted") from exc
         self.failed_attempts.add(durable_attempt)
 
 
@@ -332,6 +345,17 @@ class DurableAgentRuntime:
         self._renew_lease(execution_context)
         projection = self.store.get_run_projection(run_id)
         reservation_id = f"model-budget:{run_id}:{step}"
+        model_call_id = f"model-call:{run_id}:{step}"
+        existing_call = self.store.get_model_call(model_call_id)
+        if existing_call is not None and (
+            existing_call.run_id != run_id or existing_call.step != step
+        ):
+            raise ModelInvocationError("model call projection identity mismatch")
+        if existing_call is not None and existing_call.model_name not in {
+            self.model.name,
+            "legacy-unknown",
+        }:
+            raise ModelInvocationError("model changed while resuming a logical call")
         reserved = False
         if "model_calls" in projection.budget_limits:
             self.store.reserve_budget(
@@ -343,12 +367,6 @@ class DurableAgentRuntime:
                 execution_context=execution_context,
             )
             reserved = True
-        model_call_id = f"model-call:{run_id}:{step}"
-        existing_call = self.store.get_model_call(model_call_id)
-        if existing_call is not None and (
-            existing_call.run_id != run_id or existing_call.step != step
-        ):
-            raise ModelInvocationError("model call projection identity mismatch")
         previous_attempts = (
             existing_call.latest_attempt_no if existing_call is not None else 0
         )
@@ -366,18 +384,39 @@ class DurableAgentRuntime:
                 max_output_tokens=self.max_output_tokens,
                 attempt_observer=observer,
             )
-        except Exception as exc:
-            if observer.last_attempt_no is None:
-                observer.started(1)
-            last_attempt_no = observer.last_attempt_no
-            if last_attempt_no is None:
-                raise AssertionError("model attempt observer did not record an attempt")
-            if last_attempt_no not in observer.failed_attempts:
-                observer.failed(
-                    last_attempt_no - previous_attempts,
-                    exc,
-                    retryable=False,
+        except DurableObservationError as exc:
+            if reserved:
+                self.store.settle_budget(
+                    reservation_id=reservation_id,
+                    consumed=1 if observer.last_started is not None else 0,
+                    process_instance_id=self.process_instance_id,
+                    execution_context=execution_context,
                 )
+            raise ModelInvocationError("model attempt audit persistence failed") from exc
+        except Exception as exc:
+            try:
+                if observer.last_attempt_no is None:
+                    observer.started(1)
+                last_attempt_no = observer.last_attempt_no
+                if last_attempt_no is None:
+                    raise AssertionError("model attempt observer did not record an attempt")
+                if last_attempt_no not in observer.failed_attempts:
+                    observer.failed(
+                        last_attempt_no - previous_attempts,
+                        exc,
+                        retryable=False,
+                    )
+            except DurableObservationError as observation_exc:
+                if reserved:
+                    self.store.settle_budget(
+                        reservation_id=reservation_id,
+                        consumed=1,
+                        process_instance_id=self.process_instance_id,
+                        execution_context=execution_context,
+                    )
+                raise ModelInvocationError(
+                    "provider failed and its audit event could not be persisted"
+                ) from observation_exc
             if reserved:
                 self.store.settle_budget(
                     reservation_id=reservation_id,
@@ -512,25 +551,21 @@ class DurableAgentRuntime:
                     status="needs_attention", tool_call_id=tool_call_id, detail="tool uncertain"
                 )
         elif call.state == ToolCallState.DISPATCHED:
-            attempts = [
-                attempt
-                for attempt in self.store.list_dispatched_attempts(run_id)
-                if attempt.tool_call_id == tool_call_id
-            ]
-            if len(attempts) != 1:
+            attempt = self.store.get_dispatched_attempt(tool_call_id)
+            if attempt is None:
                 return AgentOutcome(
                     status="needs_attention",
                     tool_call_id=tool_call_id,
-                    detail="dispatched tool has ambiguous attempt state",
+                    detail="dispatched tool is missing its attempt state",
                 )
             if call.tool_name in {"read_file", "list_files", "search", "write_file", "patch_file"}:
                 result = self.file_executor.recover(
-                    attempts[0].attempt_id,
+                    attempt.attempt_id,
                     execution_context=execution_context,
                 )
             else:
                 result = self.shell_executor.recover(
-                    attempts[0].attempt_id,
+                    attempt.attempt_id,
                     execution_context=execution_context,
                 )
             if result.state == ToolCallState.UNCERTAIN:

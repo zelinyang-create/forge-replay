@@ -214,6 +214,10 @@ class RuntimeStorePort(BlobStorePort, Protocol):
 
     def list_dispatched_attempts(self, run_id: str) -> list[ToolAttemptRecord]: ...
 
+    def get_dispatched_attempt(
+        self, tool_call_id: str
+    ) -> ToolAttemptRecord | None: ...
+
     def load_recent_run_events(
         self, run_id: str, *, limit: int = 64
     ) -> list[EventEnvelope]: ...

@@ -196,6 +196,34 @@ def test_model_failure_is_recorded_and_becomes_needs_attention(tmp_path):
     assert store.get_run_projection("run-1").execution_status.value == "needs_attention"
 
 
+def test_resuming_with_a_different_model_fails_before_provider_or_budget(tmp_path):
+    _, store, runtime = build_runtime(tmp_path, ["<final>must not run</final>"])
+    projection = store.get_run_projection("run-1")
+    store.append_event(
+        session_id=projection.session_id,
+        turn_id=projection.turn_id,
+        run_id="run-1",
+        process_instance_id="worker-1",
+        payload=ModelCallStartedPayload(
+            model_call_id="model-call:run-1:0",
+            model_name="previous-model",
+            attempt_no=1,
+            step=0,
+        ),
+    )
+
+    outcome = runtime.run("run-1")
+
+    assert outcome.status == "needs_attention"
+    assert runtime.model.prompts == []
+    events = store.load_run_events("run-1")
+    assert not any(
+        event.payload.event_type.value == "model_call_failed" for event in events
+    )
+    with store.connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM budget_reservations").fetchone()[0] == 0
+
+
 def test_each_physical_model_retry_is_recorded(tmp_path):
     _, store, runtime = build_runtime(tmp_path, [])
 

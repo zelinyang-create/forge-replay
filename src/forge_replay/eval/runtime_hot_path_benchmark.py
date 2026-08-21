@@ -79,7 +79,7 @@ def run_benchmark(
         workloads.append(
             {
                 "history_events": history_size,
-                "database_bytes": sum(
+                "main_database_bytes": sum(
                     path.stat().st_size for path in workload_root.glob("*.sqlite3")
                 ),
                 "metrics": metrics,
@@ -90,6 +90,10 @@ def run_benchmark(
         "benchmark": "runtime-hot-path-operational-projections",
         "clock": "perf_counter_ns",
         "cache_mode": "warm-os/new-connection",
+        "history_fixture": (
+            "synthetic low-level CancellationRequested events used only to scale "
+            "immutable-ledger scan cost; not a business-state workload"
+        ),
         "iterations": iterations,
         "warmups": warmups,
         "seed": seed,
@@ -254,6 +258,7 @@ def _legacy_unfinished_tool(store: SQLiteEventStore) -> str | None:
 
 def _legacy_pending_response(store: SQLiteEventStore) -> str | None:
     events = store.load_run_events("run-1")
+    prefix = "model-call:run-1:"
     consumed: set[str] = set()
     for event in events:
         if isinstance(event.payload, ToolCallProposedPayload):
@@ -264,7 +269,7 @@ def _legacy_pending_response(store: SQLiteEventStore) -> str | None:
     for event in reversed(events):
         if isinstance(event.payload, ModelResponseReceivedPayload) and (
             str(event.event_id) not in consumed
-        ):
+        ) and event.payload.model_call_id.startswith(prefix):
             return str(event.event_id)
     return None
 
@@ -292,7 +297,10 @@ def _legacy_next_step(store: SQLiteEventStore) -> int:
     completed: set[str] = set()
     for event in store.load_run_events("run-1"):
         if isinstance(event.payload, ModelCallStartedPayload):
-            if event.payload.model_call_id not in call_ids:
+            if (
+                event.payload.model_call_id.startswith(prefix)
+                and event.payload.model_call_id not in call_ids
+            ):
                 call_ids.append(event.payload.model_call_id)
         elif isinstance(event.payload, ModelResponseReceivedPayload):
             completed.add(event.payload.model_call_id)

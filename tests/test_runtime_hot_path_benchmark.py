@@ -13,7 +13,7 @@ def test_runtime_hot_path_benchmark_reports_paired_raw_samples(tmp_path):
     assert report["iterations"] == 3
     workload = report["workloads"][0]
     assert workload["history_events"] == 100
-    assert workload["database_bytes"] > 0
+    assert workload["main_database_bytes"] > 0
     assert set(workload["metrics"]) == {
         "unfinished_tool",
         "pending_response",

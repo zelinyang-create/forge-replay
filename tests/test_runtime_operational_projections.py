@@ -6,10 +6,13 @@ import pytest
 
 from forge_replay.domain import ExecutionStatus, ToolEffectClass
 from forge_replay.events import (
+    FinalAnswerCommittedPayload,
+    ModelCallFailedPayload,
     ModelCallStartedPayload,
     ModelOutputRejectedPayload,
     ModelResponseReceivedPayload,
     RunCompletedPayload,
+    ToolCallProposedPayload,
 )
 from forge_replay.persistence import LedgerIntegrityError, SQLiteEventStore
 from forge_replay.persistence.schema import MIGRATIONS, SCHEMA_TABLE_SQL
@@ -204,6 +207,78 @@ def test_atomic_final_answer_consumes_response_and_completes_run(tmp_path):
     assert record is not None and record.consumption_kind == "final"
 
 
+def test_final_answer_requires_existing_blob_and_rolls_back(tmp_path):
+    store = build_run(tmp_path)
+    response = append_response(store, append_started(store))
+
+    with pytest.raises(LedgerIntegrityError, match="answer blob does not exist"):
+        store.commit_final_answer(
+            run_id="run-1",
+            response_event_id=str(response.event_id),
+            answer_blob_sha256="f" * 64,
+            verification_status="not_configured",
+            process_instance_id="worker-1",
+        )
+
+    assert store.get_latest_unconsumed_model_response("run-1") is not None
+    assert store.get_run_projection("run-1").execution_status == ExecutionStatus.ACTIVE
+
+
+def test_command_owned_tool_proposal_cannot_bypass_domain_command(tmp_path):
+    store = build_run(tmp_path)
+    response = append_response(store, append_started(store))
+    projection = store.get_run_projection("run-1")
+
+    with pytest.raises(TypeError, match="domain command"):
+        store.append_event(
+            session_id=projection.session_id,
+            turn_id=projection.turn_id,
+            run_id="run-1",
+            process_instance_id="worker-1",
+            causation_event_id=str(response.event_id),
+            payload=ToolCallProposedPayload(
+                tool_call_id="missing",
+                tool_name="read_file",
+                tool_version="1",
+                args_sha256="a" * 64,
+                effect_class=ToolEffectClass.PURE,
+            ),
+        )
+
+    assert store.get_latest_unconsumed_model_response("run-1") is not None
+
+
+def test_new_model_response_and_failure_require_attempt_causation(tmp_path):
+    store = build_run(tmp_path)
+    started = append_started(store)
+    projection = store.get_run_projection("run-1")
+    blob = store.put_blob("response", media_type="text/plain")
+
+    with pytest.raises(LedgerIntegrityError, match="response requires attempt causation"):
+        store.append_event(
+            session_id=projection.session_id,
+            turn_id=projection.turn_id,
+            run_id="run-1",
+            process_instance_id="worker-1",
+            payload=ModelResponseReceivedPayload(
+                model_call_id=started.payload.model_call_id,
+                response_blob_sha256=blob.sha256,
+            ),
+        )
+    with pytest.raises(LedgerIntegrityError, match="failure requires attempt causation"):
+        store.append_event(
+            session_id=projection.session_id,
+            turn_id=projection.turn_id,
+            run_id="run-1",
+            process_instance_id="worker-1",
+            payload=ModelCallFailedPayload(
+                model_call_id=started.payload.model_call_id,
+                error_class="TimeoutError",
+                retryable=True,
+            ),
+        )
+
+
 class Migration3Store(SQLiteEventStore):
     def initialize(self) -> None:
         with self.connect() as connection:
@@ -244,6 +319,50 @@ def test_migration4_backfills_legacy_response_without_started_event(tmp_path):
             "SELECT version FROM operational_projection_migrations WHERE name = 'model_calls'"
         ).fetchone()
     assert marker["version"] == 1
+
+
+def test_migration4_keeps_preterminal_legacy_final_response_resumable(tmp_path):
+    legacy = build_run(tmp_path, store_type=Migration3Store)
+    projection = legacy.get_run_projection("run-1")
+    response_blob = legacy.put_blob("<final>legacy answer</final>", media_type="text/plain")
+    answer_blob = legacy.put_blob("legacy answer", media_type="text/plain")
+    started = legacy.append_event(
+        session_id=projection.session_id,
+        turn_id=projection.turn_id,
+        run_id="run-1",
+        process_instance_id="legacy-worker",
+        payload=ModelCallStartedPayload(
+            model_call_id="model-call:run-1:0",
+            model_name="legacy-model",
+            attempt_no=1,
+        ),
+    )
+    response = legacy.append_event(
+        session_id=projection.session_id,
+        turn_id=projection.turn_id,
+        run_id="run-1",
+        process_instance_id="legacy-worker",
+        causation_event_id=str(started.event_id),
+        payload=ModelResponseReceivedPayload(
+            model_call_id="model-call:run-1:0",
+            response_blob_sha256=response_blob.sha256,
+        ),
+    )
+    legacy.append_event(
+        session_id=projection.session_id,
+        turn_id=projection.turn_id,
+        run_id="run-1",
+        process_instance_id="legacy-worker",
+        payload=FinalAnswerCommittedPayload(answer_blob_sha256=answer_blob.sha256),
+    )
+
+    upgraded = SQLiteEventStore(legacy.path)
+
+    pending = upgraded.get_latest_unconsumed_model_response("run-1")
+    assert pending is not None and pending.event.event_id == response.event_id
+    assert upgraded.get_next_model_step("run-1") == 1
+    record = upgraded.get_model_call("model-call:run-1:0")
+    assert record is not None and record.status == "responded"
 
 
 def test_failed_legacy_backfill_is_atomic_and_retryable(tmp_path):
@@ -326,6 +445,22 @@ def test_hot_path_query_plans_use_indexes_without_temp_sort(tmp_path):
                 """,
                 ("model-call:run-1:0",),
             ).fetchall(),
+            "event_identity": connection.execute(
+                """
+                EXPLAIN QUERY PLAN
+                SELECT * FROM events WHERE event_id = ?
+                """,
+                (str(response.event_id),),
+            ).fetchall(),
+            "dispatched_attempt": connection.execute(
+                """
+                EXPLAIN QUERY PLAN
+                SELECT * FROM tool_attempts
+                WHERE tool_call_id = ? AND state = ?
+                ORDER BY attempt_no DESC LIMIT 2
+                """,
+                ("tool-call-placeholder", "dispatched"),
+            ).fetchall(),
         }
 
     details = {
@@ -336,6 +471,8 @@ def test_hot_path_query_plans_use_indexes_without_temp_sort(tmp_path):
     assert "model_calls_by_run_step" in details["next_step"]
     assert "model_calls_pending_response" in details["pending"]
     assert "sqlite_autoindex_model_calls_1" in details["identity"]
+    assert "sqlite_autoindex_events_1" in details["event_identity"]
+    assert "tool_attempts_by_call_state" in details["dispatched_attempt"]
     for detail in details.values():
         assert "SCAN " not in detail
         assert "TEMP B-TREE" not in detail

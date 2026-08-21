@@ -79,6 +79,11 @@ def test_dispatch_intent_is_committed_before_result(tmp_path):
             "SELECT state FROM tool_calls WHERE tool_call_id = ?", (call.tool_call_id,)
         ).fetchone()[0]
     assert state == ToolCallState.DISPATCHED.value
+    recovered = store.get_dispatched_attempt(call.tool_call_id)
+    assert recovered is not None
+    assert recovered.attempt_id == attempt.attempt_id
+    assert recovered.tool_call_id == call.tool_call_id
+    assert recovered.state == ToolCallState.DISPATCHED
 
 
 def test_success_commits_receipt_output_and_event_atomically(tmp_path):

@@ -31,7 +31,9 @@ The implementation deliberately tightened several parts of the proposed plan:
   `tool_batch` consumption. A different consumption kind or event conflicts.
 - Final-answer consumption and `RunCompleted` are committed in one transaction
   through `commit_final_answer`; there is no response-consumed/active-run crash
-  window.
+  window. A standalone legacy `FinalAnswerCommitted` does not consume its model
+  response until a matching terminal event exists, so a v0.4 preterminal crash
+  remains safely resumable after upgrade.
 - Migration backfill accepts legal legacy arbitrary model-call IDs by assigning
   their step from first occurrence. A response without a historical start is
   retained as `legacy-unknown`; multiple active legacy calls fail closed.
@@ -65,7 +67,9 @@ so the next initialization retries safely.
 - `get_model_call`: provides `latest_attempt_no` without scanning attempts.
 - `commit_final_answer`: atomically consumes the model response, appends final
   and completed events, updates run/turn terminal state, and advances execution
-  context.
+  context. It also rejects a missing answer blob before writing either event.
+- Dispatched-tool recovery uses one indexed `tool_call_id` lookup rather than
+  enumerating every dispatched attempt in the Run.
 
 `runtime/agent.py` contains no `load_run_events` call. The bounded 64-event
 prompt working set and 12 transcript-line limit remain unchanged.
@@ -77,6 +81,7 @@ prompt working set and 12 transcript-line limit remain unchanged.
 or temporary B-tree. It verifies use of:
 
 - `tool_calls_by_run_state`;
+- `tool_attempts_by_call_state` for dispatched-call recovery;
 - `model_calls_by_run_step`;
 - `model_calls_pending_response`;
 - the events primary-key auto-index.
@@ -87,6 +92,9 @@ Environment recorded in each raw JSON report: Windows 11, Python 3.13.12,
 SQLite 3.50.4, WAL, `synchronous=FULL`, Intel Family 6 Model 183. Each pair
 alternates randomized legacy/indexed execution order after warmup. The baseline
 functions freeze the removed Python full-history scans; raw samples are retained.
+History length is generated with synthetic low-level cancellation facts solely
+to scale immutable-ledger scan cost; it is not presented as a business-state
+workload.
 
 | History | Samples | Query | Legacy P50 | Indexed P50 | P50 speedup |
 |---:|---:|---|---:|---:|---:|
@@ -111,9 +119,9 @@ raw observation are still reported.
 
 ## Verification
 
-- `uv run pytest -q`: 223 passed, 4 skipped.
+- `uv run pytest -q`: 228 passed, 4 skipped.
 - `uv run ruff check .`: passed.
-- Pyright on the three changed production/benchmark modules: 0 errors, 0
+- Pyright on the changed production/benchmark modules: 0 errors, 0
   warnings. Full-repository Pyright is not a clean gate yet because the project
   already contains unrelated type debt and no configured Pyright dependency.
 - Runtime hot-path/query-plan tests: 10 passed.
@@ -126,8 +134,10 @@ raw observation are still reported.
   history by design.
 - SQLite remains a single-host implementation. This change does not provide a
   distributed cache, remote queue, or cross-database transaction.
+- Upgrades require stopping old writers before migration; v0.4 writers do not
+  maintain the v0.5 operational projection and mixed-version rolling writes are
+  not supported.
 - A valid checkpoint bounds tail replay; an all-corrupt checkpoint set must do
   a full replay to preserve correctness.
 - The benchmark isolates storage decisions. Real model latency and tool
   execution remain dominant in ordinary short runs.
-
