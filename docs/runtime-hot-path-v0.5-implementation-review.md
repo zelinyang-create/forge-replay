@@ -119,7 +119,7 @@ raw observation are still reported.
 
 ## Verification
 
-- `uv run pytest -q`: 228 passed, 4 skipped.
+- `uv run pytest -q`: 229 passed, 4 skipped.
 - `uv run ruff check .`: passed.
 - Pyright on the changed production/benchmark modules: 0 errors, 0
   warnings. Full-repository Pyright is not a clean gate yet because the project

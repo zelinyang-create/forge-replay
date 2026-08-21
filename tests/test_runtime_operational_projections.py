@@ -365,6 +365,56 @@ def test_migration4_keeps_preterminal_legacy_final_response_resumable(tmp_path):
     assert record is not None and record.status == "responded"
 
 
+def test_migration4_consumes_legacy_final_when_run_completed(tmp_path):
+    legacy = build_run(tmp_path, store_type=Migration3Store)
+    projection = legacy.get_run_projection("run-1")
+    response_blob = legacy.put_blob("<final>legacy answer</final>", media_type="text/plain")
+    answer_blob = legacy.put_blob("legacy answer", media_type="text/plain")
+    started = legacy.append_event(
+        session_id=projection.session_id,
+        turn_id=projection.turn_id,
+        run_id="run-1",
+        process_instance_id="legacy-worker",
+        payload=ModelCallStartedPayload(
+            model_call_id="model-call:run-1:0",
+            model_name="legacy-model",
+            attempt_no=1,
+        ),
+    )
+    legacy.append_event(
+        session_id=projection.session_id,
+        turn_id=projection.turn_id,
+        run_id="run-1",
+        process_instance_id="legacy-worker",
+        causation_event_id=str(started.event_id),
+        payload=ModelResponseReceivedPayload(
+            model_call_id="model-call:run-1:0",
+            response_blob_sha256=response_blob.sha256,
+        ),
+    )
+    legacy.append_event(
+        session_id=projection.session_id,
+        turn_id=projection.turn_id,
+        run_id="run-1",
+        process_instance_id="legacy-worker",
+        payload=FinalAnswerCommittedPayload(answer_blob_sha256=answer_blob.sha256),
+    )
+    legacy.complete_run(
+        run_id="run-1",
+        verification_status="not_configured",
+        process_instance_id="legacy-worker",
+    )
+
+    upgraded = SQLiteEventStore(legacy.path)
+
+    assert upgraded.get_latest_unconsumed_model_response("run-1") is None
+    assert upgraded.get_run_projection("run-1").execution_status == ExecutionStatus.COMPLETED
+    record = upgraded.get_model_call("model-call:run-1:0")
+    assert record is not None
+    assert record.status == "consumed"
+    assert record.consumption_kind == "final"
+
+
 def test_failed_legacy_backfill_is_atomic_and_retryable(tmp_path):
     legacy = build_run(tmp_path, store_type=Migration3Store)
     projection = legacy.get_run_projection("run-1")
