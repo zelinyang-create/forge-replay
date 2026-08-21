@@ -24,6 +24,8 @@ The upstream snapshot is preserved as tag `upstream-baseline-717cae4`.
   workers fail closed.
 - Automatic, checksummed checkpoints on the runtime hot path, fallback through
   older snapshots, and a bounded 64-event prompt working set.
+- Indexed transactional model/tool operational projections remove full-history
+  scans from Runtime decisions while keeping the event ledger as audit truth.
 - Per-run Git Worktrees plus strict path validation. User changes in the source
   checkout are refused by default and are never silently reset.
 - Replay-safe file reads, writes, patches, listings, and searches. Mutations use
@@ -118,6 +120,7 @@ All numbers below are local deterministic measurements, not production SLAs:
 | Automatic recovery latency | P50 20.1 ms; P95 39.0 ms | Local recovery handler time, excluding a real model call |
 | 10,000-event projection replay | 41.58 ms full vs 0.78 ms from a 200-event checkpoint tail | 53.21x CPU reducer microbenchmark speedup, not end-to-end resume latency |
 | SQLite projection recovery | P50 125.35 ms full vs 8.57 ms from a 50-event tail | 14.63x end-to-end local ledger recovery speedup over 20 paired iterations |
+| 100,000-event Runtime hot-path queries | P50 1.84-2.67 ms indexed vs 1.35-1.79 s with frozen legacy scans | 645-747x across four local SQLite store calls over 20 paired samples, not Agent latency |
 | Stale-worker fencing | 10,000/10,000 old-epoch writes rejected; 0 accepted | Single-process SQLite stress of epoch takeover, not a distributed soak or capacity SLA |
 | Bailian `qwen3-coder-plus` Held-out coding | 14/24 runs passed (58.3%); task-cluster bootstrap 95% CI 25.0%–87.5% | 8 frozen tasks × 3 repeats, temperature 0, thinking off, process tool disabled |
 | Bailian end-to-end run latency | P50 11.65 s; P95 16.87 s | Model + Harness file-tool loop + durable persistence; hidden evaluator runs afterward |
