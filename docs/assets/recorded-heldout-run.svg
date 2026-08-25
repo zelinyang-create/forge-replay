@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="690" viewBox="0 0 1200 690" role="img" aria-labelledby="title desc">
+  <title id="title">Recorded ForgeReplay held-out execution</title>
+  <desc id="desc">A visual trace of committed run api-004 repeat 1 using qwen3-coder-plus. The run listed files, read solution.py, patched validate_port, completed, and passed hidden tests.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#101827"/>
+      <stop offset="1" stop-color="#07111f"/>
+    </linearGradient>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="130%">
+      <feDropShadow dx="0" dy="12" stdDeviation="18" flood-color="#020617" flood-opacity="0.55"/>
+    </filter>
+  </defs>
+
+  <rect width="1200" height="690" fill="#e8edf5"/>
+  <rect x="45" y="38" width="1110" height="610" rx="18" fill="url(#bg)" filter="url(#shadow)"/>
+
+  <rect x="45" y="38" width="1110" height="58" rx="18" fill="#172033"/>
+  <rect x="45" y="78" width="1110" height="18" fill="#172033"/>
+  <circle cx="80" cy="67" r="7" fill="#ff6b6b"/>
+  <circle cx="104" cy="67" r="7" fill="#ffd166"/>
+  <circle cx="128" cy="67" r="7" fill="#4ade80"/>
+  <text x="600" y="73" text-anchor="middle" fill="#d6deeb" font-family="Segoe UI, Arial, sans-serif" font-size="16" font-weight="600">RECORDED HELD-OUT EXECUTION · api-004 · repeat 1</text>
+
+  <text x="83" y="136" fill="#64748b" font-family="Consolas, Menlo, monospace" font-size="15">MODEL</text>
+  <text x="186" y="136" fill="#e2e8f0" font-family="Consolas, Menlo, monospace" font-size="15">qwen3-coder-plus</text>
+  <text x="560" y="136" fill="#64748b" font-family="Consolas, Menlo, monospace" font-size="15">PROVIDER</text>
+  <text x="672" y="136" fill="#e2e8f0" font-family="Consolas, Menlo, monospace" font-size="15">openai-compatible</text>
+  <line x1="83" y1="158" x2="1117" y2="158" stroke="#263247" stroke-width="1"/>
+
+  <circle cx="105" cy="204" r="18" fill="#123b5d" stroke="#38bdf8" stroke-width="2"/>
+  <text x="105" y="210" text-anchor="middle" fill="#7dd3fc" font-family="Consolas, Menlo, monospace" font-size="15" font-weight="700">1</text>
+  <text x="145" y="198" fill="#38bdf8" font-family="Consolas, Menlo, monospace" font-size="16" font-weight="700">TOOL · list_files</text>
+  <text x="145" y="225" fill="#cbd5e1" font-family="Consolas, Menlo, monospace" font-size="15">path: "."</text>
+  <line x1="105" y1="224" x2="105" y2="274" stroke="#334155" stroke-width="2"/>
+
+  <circle cx="105" cy="292" r="18" fill="#123b5d" stroke="#38bdf8" stroke-width="2"/>
+  <text x="105" y="298" text-anchor="middle" fill="#7dd3fc" font-family="Consolas, Menlo, monospace" font-size="15" font-weight="700">2</text>
+  <text x="145" y="286" fill="#38bdf8" font-family="Consolas, Menlo, monospace" font-size="16" font-weight="700">TOOL · read_file</text>
+  <text x="145" y="313" fill="#cbd5e1" font-family="Consolas, Menlo, monospace" font-size="15">path: "solution.py"</text>
+  <line x1="105" y1="312" x2="105" y2="362" stroke="#334155" stroke-width="2"/>
+
+  <circle cx="105" cy="380" r="18" fill="#422006" stroke="#f59e0b" stroke-width="2"/>
+  <text x="105" y="386" text-anchor="middle" fill="#fbbf24" font-family="Consolas, Menlo, monospace" font-size="15" font-weight="700">3</text>
+  <text x="145" y="374" fill="#fbbf24" font-family="Consolas, Menlo, monospace" font-size="16" font-weight="700">TOOL · patch_file</text>
+  <text x="145" y="401" fill="#cbd5e1" font-family="Consolas, Menlo, monospace" font-size="15">solution.py · validate_port(value)</text>
+  <text x="145" y="426" fill="#94a3b8" font-family="Consolas, Menlo, monospace" font-size="14">adds bool rejection, integer parsing, and 1–65535 range validation</text>
+  <line x1="105" y1="400" x2="105" y2="472" stroke="#334155" stroke-width="2"/>
+
+  <circle cx="105" cy="490" r="18" fill="#0b3b2c" stroke="#34d399" stroke-width="2"/>
+  <text x="105" y="496" text-anchor="middle" fill="#6ee7b7" font-family="Consolas, Menlo, monospace" font-size="15" font-weight="700">4</text>
+  <text x="145" y="484" fill="#6ee7b7" font-family="Consolas, Menlo, monospace" font-size="16" font-weight="700">FINAL</text>
+  <text x="145" y="511" fill="#cbd5e1" font-family="Consolas, Menlo, monospace" font-size="15">Implemented validated port parsing with explicit failure modes.</text>
+
+  <rect x="83" y="557" width="1034" height="58" rx="10" fill="#111c2f" stroke="#263247"/>
+  <circle cx="110" cy="586" r="7" fill="#34d399"/>
+  <text x="130" y="592" fill="#a7f3d0" font-family="Consolas, Menlo, monospace" font-size="15" font-weight="700">outcome=completed</text>
+  <circle cx="350" cy="586" r="7" fill="#34d399"/>
+  <text x="370" y="592" fill="#a7f3d0" font-family="Consolas, Menlo, monospace" font-size="15" font-weight="700">hidden_tests_passed=true</text>
+  <text x="1088" y="592" text-anchor="end" fill="#64748b" font-family="Consolas, Menlo, monospace" font-size="13">committed evidence</text>
+</svg>

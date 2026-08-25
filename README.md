@@ -1,5 +1,8 @@
-&nbsp;
 # ForgeReplay
+
+[![CI](https://github.com/zelinyang-create/forge-replay/actions/workflows/ci.yml/badge.svg)](https://github.com/zelinyang-create/forge-replay/actions/workflows/ci.yml)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)](pyproject.toml)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 ForgeReplay is a durable, replay-aware coding agent harness built on the small
 model/tool loop from
@@ -10,6 +13,39 @@ reduction, and bounded delegation. The `forge_replay` package and its durable
 execution/evaluation layers are the additions in this fork.
 
 The upstream snapshot is preserved as tag `upstream-baseline-717cae4`.
+
+**Recruiter quick links:** [architecture](#architecture) ·
+[measured evidence](#measured-evidence) · [five-minute setup](#quick-start) ·
+[production-readiness review](docs/production-p1-p5-overall-review.md)
+
+## Architecture
+
+```mermaid
+flowchart LR
+    User[CLI / operator] --> Commands[Start · Resume · Approve · Cancel · Export]
+    Commands --> Runtime[Durable agent state machine]
+    Runtime --> Model[Model adapter<br/>Ollama or OpenAI-compatible]
+    Runtime --> Policy[Approval, budget and cancellation policy]
+    Runtime --> Tools[Replay-safe file and process tools]
+
+    Runtime --> Ledger[(Append-only event ledger<br/>SQLite WAL / PostgreSQL reference)]
+    Ledger --> Checkpoints[Checksummed checkpoints]
+    Ledger --> Projections[Indexed operational projections]
+    Checkpoints --> Runtime
+    Projections --> Runtime
+
+    Tools --> Guard[Path guard + effect receipts]
+    Guard --> Worktree[Per-run Git Worktree]
+    Worktree --> Export[Patch + untracked files<br/>SHA-256 manifest]
+
+    Runtime --> Lease[Lease epoch + stream-version fencing]
+    Lease --> Workers[Crash recovery / worker takeover]
+```
+
+The immutable event ledger is the audit truth. Checkpoints and indexed
+projections accelerate recovery and hot-path decisions, while every mutation
+is constrained to an owned worktree and recorded with deterministic identity
+and effect receipts.
 
 ## What ForgeReplay Adds
 
@@ -67,8 +103,10 @@ multi-host soak, multi-AZ failover, 28-day SLOs and penetration testing. See the
 Install Python 3.10+, Git, `uv`, and Ollama, then pull a model:
 
 ```bash
-ollama pull qwen3.5:4b
+git clone https://github.com/zelinyang-create/forge-replay.git
+cd forge-replay
 uv sync
+ollama pull qwen3.5:4b
 ```
 
 Start a durable run in a clean Git repository:
@@ -109,6 +147,19 @@ uv run forge-replay export <run-id>
 The original educational CLI remains available as `mini-coding-agent` for an
 upstream-compatible baseline.
 
+### Recorded Execution Trace
+
+![Recorded held-out ForgeReplay execution](docs/assets/recorded-heldout-run.svg)
+
+This is a visual rendering of the committed `api-004` held-out run: the agent
+listed the workspace, read the target, applied a validated patch, reached a
+normal terminal state, and passed the hidden evaluator. The underlying
+[run record](benchmarks/results/bailian-qwen3-coder-plus-heldout-r3/runs/api-004-r1/run.json),
+[model outputs](benchmarks/results/bailian-qwen3-coder-plus-heldout-r3/runs/api-004-r1/model-outputs.json),
+and [final patch](benchmarks/results/bailian-qwen3-coder-plus-heldout-r3/runs/api-004-r1/final.patch)
+are committed for inspection. It is evidence from one run, not a claim about
+the full suite.
+
 ## Measured Evidence
 
 All numbers below are local deterministic measurements, not production SLAs:
@@ -144,6 +195,38 @@ uv run python -m forge_replay.eval.real_model_benchmark \
   --split held_out --repeats 3 --model qwen3-coder-plus \
   --i-understand-model-generated-code-runs-locally
 ```
+
+### Reproduce the Deterministic Evidence
+
+The deterministic crash and replay benchmarks require no model or API key:
+
+```bash
+uv run python -m forge_replay.eval.harness_conformance \
+  --tasks 12 --output artifacts/harness-conformance.json
+
+uv run python -m forge_replay.eval.projection_benchmark \
+  --events 10000 --tail 200 --iterations 50 \
+  --output artifacts/projection-replay.json
+
+uv run python -m forge_replay.eval.sqlite_recovery_benchmark \
+  --events 2000 --tail 50 --iterations 20 \
+  --output artifacts/sqlite-recovery.json
+
+uv run python -m forge_replay.eval.runtime_hot_path_benchmark \
+  --history-sizes 10000 --iterations 20 --warmups 3 \
+  --output artifacts/runtime-hot-path.json
+```
+
+Validate the implementation before comparing numbers across machines:
+
+```bash
+uv run ruff check .
+uv run pytest -q
+```
+
+Benchmark reports include the Git SHA, Python version, platform and sample
+counts. Compare like-for-like fixtures; CPU microbenchmarks are deliberately
+not presented as end-to-end Agent latency.
 
 ## Safety Boundary
 

@@ -29,6 +29,7 @@ htmlcov/
 
 # Local scratch space
 tmp/
+artifacts/
 
 # Private/local real-model evaluation artifacts. Public reports, patches, model
 # outputs, and run manifests may be committed explicitly.
