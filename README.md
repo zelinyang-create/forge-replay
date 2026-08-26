@@ -1,5 +1,9 @@
 # ForgeReplay
 
+<p align="center">
+  <strong>English</strong> | <a href="README.zh-CN.md">中文</a>
+</p>
+
 [![CI](https://github.com/zelinyang-create/forge-replay/actions/workflows/ci.yml/badge.svg)](https://github.com/zelinyang-create/forge-replay/actions/workflows/ci.yml)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)](pyproject.toml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
