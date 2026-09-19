@@ -66,6 +66,7 @@ from forge_replay.production.shadow_read import (
     ShadowProjectionReadService,
     ShadowProjectionReadSource,
 )
+from forge_replay.production.ui_status import TenantRoutedUiStatusReader
 from forge_replay.production.workspace_snapshot import (
     WorkspaceSnapshot,
     WorkspaceSnapshotManager,
@@ -123,6 +124,7 @@ __all__ = [
     "ShadowRelayResult",
     "SignedPolicyEvaluator",
     "SubprocessCommandTransport",
+    "TenantRoutedUiStatusReader",
     "UnsafeHostExecutionProvider",
     "WorkspaceAgentExecutor",
     "WorkspaceControllerFactory",

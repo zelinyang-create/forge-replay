@@ -21,6 +21,7 @@ from fastapi import FastAPI
 
 from forge_replay.control_plane.api import (
     HmacIdentityVerifier,
+    UIStatusReader,
     create_control_plane_app,
 )
 from forge_replay.control_plane.postgres import PostgresControlPlaneStore
@@ -28,6 +29,7 @@ from forge_replay.domain import ExecutionContext
 from forge_replay.persistence.object_store import BlobObjectUnavailableError
 from forge_replay.persistence.postgres_store import PostgresRuntimeStore
 from forge_replay.ports import BlobObjectStorePort
+from forge_replay.production.postgres_shadow import PostgresShadowProjectionSource
 from forge_replay.records import BlobPlacementPolicy
 
 
@@ -94,19 +96,40 @@ class PostgresAuthorityFactory:
             placement_policy=BlobPlacementPolicy.EXTERNAL_ONLY,
         )
 
+    def shadow_projection_source(
+        self,
+        tenant_id: str,
+    ) -> PostgresShadowProjectionSource:
+        """Build a fresh authoritative projection source for one tenant."""
+
+        if not isinstance(tenant_id, str) or not tenant_id.strip():
+            raise ValueError("tenant_id must not be empty")
+        return PostgresShadowProjectionSource(
+            self.config.dsn,
+            tenant_id=tenant_id,
+            connect=self._connect,
+        )
+
 
 def build_managed_control_plane(
     config: ManagedAuthorityConfig,
     identity_signing_key: bytes,
     *,
     object_store: BlobObjectStorePort | None = None,
+    ui_status_reader: UIStatusReader | None = None,
 ) -> FastAPI:
     """Build a migrated PostgreSQL control plane or fail before serving."""
 
     verifier = HmacIdentityVerifier(identity_signing_key)
     factory = PostgresAuthorityFactory(config, object_store=object_store)
     factory.migrate()
-    return create_control_plane_app(factory.control_store(), verifier)
+    if ui_status_reader is None:
+        return create_control_plane_app(factory.control_store(), verifier)
+    return create_control_plane_app(
+        factory.control_store(),
+        verifier,
+        ui_status_reader=ui_status_reader,
+    )
 
 
 @dataclass(frozen=True)
