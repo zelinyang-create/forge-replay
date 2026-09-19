@@ -14,10 +14,17 @@ from forge_replay.persistence.contracts import (
     SessionNotFoundError,
     ToolCallConflictError,
 )
+from forge_replay.persistence.object_store import (
+    BlobObjectUnavailableError,
+    LocalTenantBlobObjectStore,
+    LocalTenantCasStore,
+)
 from forge_replay.persistence.postgres_store import PostgresRuntimeStore
 from forge_replay.persistence.store import SQLiteEventStore
 from forge_replay.records import (
     ApprovalRecord,
+    BlobObjectRef,
+    BlobPlacementPolicy,
     BudgetReservationRecord,
     CheckpointRecord,
     CreatedRun,
@@ -36,6 +43,9 @@ __all__ = [
     "ApprovalRecord",
     "BlobLimits",
     "BlobMetadataConflictError",
+    "BlobObjectRef",
+    "BlobObjectUnavailableError",
+    "BlobPlacementPolicy",
     "BlobQuotaExceededError",
     "BudgetLimitError",
     "BudgetReservationRecord",
@@ -43,6 +53,8 @@ __all__ = [
     "CreatedRun",
     "LeaseConflictError",
     "LedgerIntegrityError",
+    "LocalTenantBlobObjectStore",
+    "LocalTenantCasStore",
     "MigrationChecksumError",
     "ModelCallRecord",
     "PendingModelResponse",

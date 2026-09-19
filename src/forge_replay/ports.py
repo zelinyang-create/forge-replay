@@ -22,6 +22,7 @@ from forge_replay.domain import (
 from forge_replay.events import EventEnvelope, RuntimeEventPayload
 from forge_replay.records import (
     ApprovalRecord,
+    BlobObjectRef,
     BudgetReservationRecord,
     ModelCallRecord,
     PendingModelResponse,
@@ -40,6 +41,22 @@ class BlobStorePort(Protocol):
     def put_blob(self, content: bytes | str, *, media_type: str) -> StoredBlob: ...
 
     def get_blob(self, sha256: str) -> StoredBlob: ...
+
+
+class BlobObjectStorePort(Protocol):
+    """Tenant-scoped external content-addressed byte storage."""
+
+    def canonical_key(self, *, tenant_id: str, sha256: str) -> str: ...
+
+    def put_if_absent(
+        self,
+        *,
+        tenant_id: str,
+        sha256: str,
+        content: bytes,
+    ) -> BlobObjectRef: ...
+
+    def get(self, *, tenant_id: str, object_key: str) -> bytes: ...
 
 
 class RuntimeStorePort(BlobStorePort, Protocol):

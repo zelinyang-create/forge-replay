@@ -73,9 +73,13 @@ from forge_replay.persistence.contracts import (
     SessionNotFoundError,
     ToolCallConflictError,
 )
+from forge_replay.persistence.object_store import BlobObjectUnavailableError
 from forge_replay.persistence.postgres_schema import apply_postgres_runtime_migrations
+from forge_replay.ports import BlobObjectStorePort
 from forge_replay.records import (
     ApprovalRecord,
+    BlobObjectRef,
+    BlobPlacementPolicy,
     BudgetReservationRecord,
     CheckpointRecord,
     CreatedRun,
@@ -137,6 +141,8 @@ class PostgresRuntimeStore:
         tenant_id: str,
         connect: Callable[..., Any] = psycopg.connect,
         blob_limits: BlobLimits | None = None,
+        object_store: BlobObjectStorePort | None = None,
+        placement_policy: BlobPlacementPolicy = BlobPlacementPolicy.INLINE,
     ) -> None:
         if not dsn.strip():
             raise ValueError("dsn must not be empty")
@@ -146,6 +152,15 @@ class PostgresRuntimeStore:
         self.tenant_id = tenant_id
         self._connect = connect
         self.blob_limits = blob_limits or BlobLimits()
+        self.placement_policy = BlobPlacementPolicy(placement_policy)
+        self.object_store = object_store
+        if (
+            self.placement_policy == BlobPlacementPolicy.EXTERNAL_ONLY
+            and self.object_store is None
+        ):
+            raise BlobObjectUnavailableError(
+                "external-only blob placement requires an object store"
+            )
 
     def connect(self):
         return self._connect(self.dsn, row_factory=dict_row)
@@ -195,14 +210,53 @@ class PostgresRuntimeStore:
             )
 
     def put_blob(self, content: bytes | str, *, media_type: str) -> StoredBlob:
-        raw_content = content.encode("utf-8") if isinstance(content, str) else bytes(content)
+        raw_content, object_ref = self._prepare_blob(content, media_type=media_type)
         with self.connect() as connection:
             self._tenant(connection)
-            return self._put_blob_in_transaction(
+            return self._register_prepared_blob_in_transaction(
                 connection,
                 content=raw_content,
                 media_type=media_type,
+                object_ref=object_ref,
             )
+
+    def _prepare_blob(
+        self,
+        content: bytes | str,
+        *,
+        media_type: str,
+    ) -> tuple[bytes, BlobObjectRef | None]:
+        if not media_type.strip():
+            raise ValueError("media_type must not be empty")
+        raw = content.encode("utf-8") if isinstance(content, str) else bytes(content)
+        if len(raw) > self.blob_limits.max_blob_bytes:
+            raise BlobQuotaExceededError(
+                f"blob size {len(raw)} exceeds limit {self.blob_limits.max_blob_bytes}"
+            )
+        if self.placement_policy == BlobPlacementPolicy.INLINE:
+            return raw, None
+        if self.object_store is None:
+            raise BlobObjectUnavailableError(
+                "external-only blob placement requires an object store"
+            )
+        digest = hashlib.sha256(raw).hexdigest()
+        object_ref = self.object_store.put_if_absent(
+            tenant_id=self.tenant_id,
+            sha256=digest,
+            content=raw,
+        )
+        expected_key = self.object_store.canonical_key(
+            tenant_id=self.tenant_id,
+            sha256=digest,
+        )
+        if (
+            object_ref.tenant_id != self.tenant_id
+            or object_ref.sha256 != digest
+            or object_ref.byte_length != len(raw)
+            or object_ref.object_key != expected_key
+        ):
+            raise LedgerIntegrityError("object store returned invalid blob metadata")
+        return raw, object_ref
 
     def _put_blob_in_transaction(
         self,
@@ -211,37 +265,81 @@ class PostgresRuntimeStore:
         content: bytes,
         media_type: str,
     ) -> StoredBlob:
-        if not media_type.strip():
-            raise ValueError("media_type must not be empty")
+        if self.placement_policy != BlobPlacementPolicy.INLINE:
+            raise BlobObjectUnavailableError(
+                "external blob I/O is forbidden inside a database transaction"
+            )
+        raw, object_ref = self._prepare_blob(content, media_type=media_type)
+        return self._register_prepared_blob_in_transaction(
+            connection,
+            content=raw,
+            media_type=media_type,
+            object_ref=object_ref,
+        )
+
+    def _register_prepared_blob_in_transaction(
+        self,
+        connection: Any,
+        *,
+        content: bytes,
+        media_type: str,
+        object_ref: BlobObjectRef | None,
+    ) -> StoredBlob:
         digest = hashlib.sha256(content).hexdigest()
+        if object_ref is not None and (
+            object_ref.tenant_id != self.tenant_id
+            or object_ref.sha256 != digest
+            or object_ref.byte_length != len(content)
+        ):
+            raise LedgerIntegrityError("prepared blob object metadata is invalid")
+        connection.execute(
+            "INSERT INTO tenant_blob_usage(tenant_id, total_bytes) VALUES (%s, 0) "
+            "ON CONFLICT (tenant_id) DO NOTHING",
+            (self.tenant_id,),
+        )
+        usage = connection.execute(
+            "SELECT total_bytes FROM tenant_blob_usage WHERE tenant_id = %s FOR UPDATE",
+            (self.tenant_id,),
+        ).fetchone()
+        if usage is None:
+            raise LedgerIntegrityError("tenant blob usage row is missing")
         existing = connection.execute(
             "SELECT * FROM blobs WHERE tenant_id = %s AND sha256 = %s FOR UPDATE",
             (self.tenant_id, digest),
         ).fetchone()
         if existing is not None:
-            stored = self._stored_blob_from_row(existing)
-            self._verify_blob(stored)
-            if stored.content != content:
-                raise LedgerIntegrityError(f"blob {digest} content does not match its digest")
-            if stored.media_type != media_type:
+            if int(existing["byte_length"]) != len(content):
+                raise LedgerIntegrityError(f"blob {digest} length metadata conflicts")
+            if str(existing["media_type"]) != media_type:
                 raise BlobMetadataConflictError(
-                    f"blob {digest} already uses media type {stored.media_type}"
+                    f"blob {digest} already uses media type {existing['media_type']}"
                 )
-            return stored
+            inline_content = existing.get("content")
+            existing_key = existing.get("object_key")
+            if (inline_content is None) == (existing_key is None):
+                raise LedgerIntegrityError("blob storage location metadata is invalid")
+            if inline_content is not None and bytes(inline_content) != content:
+                raise LedgerIntegrityError(f"blob {digest} content does not match its digest")
+            if existing_key is not None:
+                if self.object_store is None:
+                    expected_key = object_ref.object_key if object_ref is not None else None
+                else:
+                    expected_key = self.object_store.canonical_key(
+                        tenant_id=self.tenant_id,
+                        sha256=digest,
+                    )
+                if expected_key is None or str(existing_key) != expected_key:
+                    raise LedgerIntegrityError("external blob object key is not canonical")
+            return StoredBlob(
+                digest,
+                len(content),
+                media_type,
+                content,
+                _aware_datetime(existing["created_at"]),
+            )
 
         byte_length = len(content)
-        if byte_length > self.blob_limits.max_blob_bytes:
-            raise BlobQuotaExceededError(
-                f"blob size {byte_length} exceeds limit {self.blob_limits.max_blob_bytes}"
-            )
-        total_row = connection.execute(
-            """
-            SELECT COALESCE(SUM(byte_length), 0) AS total_bytes
-            FROM blobs WHERE tenant_id = %s
-            """,
-            (self.tenant_id,),
-        ).fetchone()
-        total_bytes = int(total_row["total_bytes"])
+        total_bytes = int(usage["total_bytes"])
         if total_bytes + byte_length > self.blob_limits.max_total_bytes:
             raise BlobQuotaExceededError(
                 "blob store total would exceed limit "
@@ -253,16 +351,22 @@ class PostgresRuntimeStore:
             INSERT INTO blobs(
                 tenant_id, sha256, byte_length, media_type, compression,
                 content, object_key, created_at
-            ) VALUES (%s, %s, %s, %s, NULL, %s, NULL, %s)
+            ) VALUES (%s, %s, %s, %s, NULL, %s, %s, %s)
             """,
             (
                 self.tenant_id,
                 digest,
                 byte_length,
                 media_type,
-                content,
+                content if object_ref is None else None,
+                object_ref.object_key if object_ref is not None else None,
                 created_at,
             ),
+        )
+        connection.execute(
+            "UPDATE tenant_blob_usage SET total_bytes = total_bytes + %s, "
+            "updated_at = clock_timestamp() WHERE tenant_id = %s",
+            (byte_length, self.tenant_id),
         )
         return StoredBlob(digest, byte_length, media_type, content, created_at)
 
@@ -275,7 +379,35 @@ class PostgresRuntimeStore:
             ).fetchone()
         if row is None:
             raise KeyError(f"unknown blob: {sha256}")
-        blob = self._stored_blob_from_row(row)
+        if row.get("content") is not None:
+            if row.get("object_key") is not None:
+                raise LedgerIntegrityError("blob storage location metadata is invalid")
+            blob = self._stored_blob_from_row(row)
+        else:
+            if self.object_store is None:
+                raise BlobObjectUnavailableError(
+                    "external blob content requires an object store"
+                )
+            object_key = row.get("object_key")
+            if not isinstance(object_key, str) or not object_key:
+                raise LedgerIntegrityError("external blob object key is missing")
+            expected_key = self.object_store.canonical_key(
+                tenant_id=self.tenant_id,
+                sha256=str(row["sha256"]),
+            )
+            if object_key != expected_key:
+                raise LedgerIntegrityError("external blob object key is not canonical")
+            content = self.object_store.get(
+                tenant_id=self.tenant_id,
+                object_key=object_key,
+            )
+            blob = StoredBlob(
+                sha256=str(row["sha256"]),
+                byte_length=int(row["byte_length"]),
+                media_type=str(row["media_type"]),
+                content=content,
+                created_at=_aware_datetime(row["created_at"]),
+            )
         self._verify_blob(blob)
         return blob
 
@@ -315,12 +447,17 @@ class PostgresRuntimeStore:
         if not base_commit_sha.strip():
             raise ValueError("base_commit_sha must not be empty")
         resolved_root = str(Path(base_repo_root).resolve())
+        message_content, message_object_ref = self._prepare_blob(
+            user_message,
+            media_type="text/plain; charset=utf-8",
+        )
         with self.connect() as connection:
             self._tenant(connection)
-            message_blob = self._put_blob_in_transaction(
+            message_blob = self._register_prepared_blob_in_transaction(
                 connection,
-                content=user_message.encode("utf-8"),
+                content=message_content,
                 media_type="text/plain; charset=utf-8",
+                object_ref=message_object_ref,
             )
             connection.execute(
                 """
@@ -2169,6 +2306,12 @@ class PostgresRuntimeStore:
         if outcome == "succeeded" and receipt is None:
             raise ValueError("successful attempts require a receipt")
         target_state = ToolCallState(outcome)
+        prepared_output: tuple[bytes, BlobObjectRef | None] | None = None
+        if output is not None:
+            prepared_output = self._prepare_blob(
+                output,
+                media_type=output_media_type,
+            )
         with self.connect() as connection:
             self._tenant(connection)
             attempt = connection.execute(
@@ -2194,10 +2337,13 @@ class PostgresRuntimeStore:
                 execution_context=execution_context,
             )
             output_blob = None
-            if output is not None:
-                raw = output.encode("utf-8") if isinstance(output, str) else bytes(output)
-                output_blob = self._put_blob_in_transaction(
-                    connection, content=raw, media_type=output_media_type
+            if prepared_output is not None:
+                raw, object_ref = prepared_output
+                output_blob = self._register_prepared_blob_in_transaction(
+                    connection,
+                    content=raw,
+                    media_type=output_media_type,
+                    object_ref=object_ref,
                 )
             receipt_json = canonical_json(receipt) if receipt is not None else None
             error_json = canonical_json(error) if error is not None else None

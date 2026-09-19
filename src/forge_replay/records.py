@@ -12,6 +12,7 @@ from typing import Any, Literal
 
 from forge_replay.domain import (
     ApprovalDecision,
+    StringEnum,
     ToolCallState,
     ToolEffectClass,
     WorkspaceDisposition,
@@ -27,6 +28,23 @@ class StoredBlob:
     media_type: str
     content: bytes
     created_at: datetime
+
+
+class BlobPlacementPolicy(StringEnum):
+    """Durable byte placement selected by a runtime store."""
+
+    INLINE = "inline"
+    EXTERNAL_ONLY = "external_only"
+
+
+@dataclass(frozen=True)
+class BlobObjectRef:
+    """Validated identity of one tenant-scoped external CAS object."""
+
+    tenant_id: str
+    object_key: str
+    sha256: str
+    byte_length: int
 
 
 @dataclass(frozen=True)
