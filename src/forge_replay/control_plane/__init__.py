@@ -2,6 +2,7 @@
 
 from forge_replay.control_plane.api import (
     AuthenticatedPrincipal,
+    UIEventStream,
     create_control_plane_app,
 )
 from forge_replay.control_plane.artifacts import ArtifactEnvelope, LocalTenantCasStore
@@ -18,5 +19,6 @@ __all__ = [
     "LocalTenantCasStore",
     "PostgresControlPlaneStore",
     "RunVersionConflictError",
+    "UIEventStream",
     "create_control_plane_app",
 ]

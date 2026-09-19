@@ -21,6 +21,7 @@ from fastapi import FastAPI
 
 from forge_replay.control_plane.api import (
     HmacIdentityVerifier,
+    UIEventStream,
     UIStatusReader,
     create_control_plane_app,
 )
@@ -117,18 +118,22 @@ def build_managed_control_plane(
     *,
     object_store: BlobObjectStorePort | None = None,
     ui_status_reader: UIStatusReader | None = None,
+    ui_event_stream: UIEventStream | None = None,
 ) -> FastAPI:
     """Build a migrated PostgreSQL control plane or fail before serving."""
 
     verifier = HmacIdentityVerifier(identity_signing_key)
     factory = PostgresAuthorityFactory(config, object_store=object_store)
     factory.migrate()
-    if ui_status_reader is None:
-        return create_control_plane_app(factory.control_store(), verifier)
+    optional_services: dict[str, Any] = {}
+    if ui_status_reader is not None:
+        optional_services["ui_status_reader"] = ui_status_reader
+    if ui_event_stream is not None:
+        optional_services["ui_event_stream"] = ui_event_stream
     return create_control_plane_app(
         factory.control_store(),
         verifier,
-        ui_status_reader=ui_status_reader,
+        **optional_services,
     )
 
 

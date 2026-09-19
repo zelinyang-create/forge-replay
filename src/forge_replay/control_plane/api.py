@@ -5,13 +5,16 @@ import hmac
 import json
 import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
 from typing import Annotated, Any, Protocol
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
+from fastapi.encoders import jsonable_encoder
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
+from starlette.concurrency import run_in_threadpool
+from starlette.responses import StreamingResponse
 
 from forge_replay.control_plane.postgres import IdempotencyConflictError
 
@@ -85,6 +88,22 @@ class UIStatusReader(Protocol):
     ) -> Any: ...
 
 
+class UIEventStream(Protocol):
+    """Optional SQL-backed UI event stream.
+
+    Implementations may use disposable fanout hints to wake the stream, but
+    every emitted event payload must come from the authoritative SQL source.
+    """
+
+    def stream(
+        self,
+        *,
+        tenant_id: str,
+        run_id: str,
+        after: int = 0,
+    ) -> AsyncIterator[Any]: ...
+
+
 class CreateRunRequest(BaseModel):
     task: str = Field(min_length=1, max_length=20_000)
     repository: str = Field(min_length=1, max_length=2_000)
@@ -96,6 +115,7 @@ def create_control_plane_app(
     verifier: IdentityVerifier,
     *,
     ui_status_reader: UIStatusReader | None = None,
+    ui_event_stream: UIEventStream | None = None,
 ) -> FastAPI:
     app = FastAPI(title="ForgeReplay Control Plane", version="1.0")
     bearer = HTTPBearer(auto_error=False)
@@ -217,7 +237,129 @@ def create_control_plane_app(
             )
         }
 
+    @app.get("/v1/runs/{run_id}/stream")
+    async def stream_events(
+        run_id: str,
+        identity: Annotated[AuthenticatedPrincipal, Depends(principal)],
+        after: Annotated[str, Query()] = "0",
+        last_event_id: Annotated[
+            str | None,
+            Header(alias="Last-Event-ID"),
+        ] = None,
+    ) -> StreamingResponse:
+        if ui_event_stream is None:
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "UI event stream is not enabled",
+            )
+
+        if last_event_id is not None:
+            after_cursor = _parse_event_cursor(
+                last_event_id,
+                field="Last-Event-ID",
+                status_code=status.HTTP_400_BAD_REQUEST,
+            )
+        else:
+            after_cursor = _parse_event_cursor(after, field="after", status_code=422)
+
+        # Establish tenant-scoped existence from PostgreSQL before sending the
+        # response headers.  A streaming-generator lookup would turn a clean
+        # 404 into a late connection failure.
+        run = await run_in_threadpool(
+            service.get_run,
+            tenant_id=identity.tenant_id,
+            run_id=run_id,
+        )
+        if run is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "run not found")
+
+        async def frames() -> AsyncIterator[str]:
+            items = ui_event_stream.stream(
+                tenant_id=identity.tenant_id,
+                run_id=run_id,
+                after=after_cursor,
+            )
+            try:
+                async for item in items:
+                    yield _format_sse_item(item)
+            finally:
+                close = getattr(items, "aclose", None)
+                if callable(close):
+                    await close()
+
+        return StreamingResponse(
+            frames(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
     return app
+
+
+_MAX_EVENT_CURSOR = (1 << 63) - 1
+
+
+def _parse_event_cursor(value: str, *, field: str, status_code: int) -> int:
+    if (
+        not isinstance(value, str)
+        or not value
+        or (value != "0" and (value.startswith("0") or not value.isascii()))
+        or not value.isdecimal()
+    ):
+        raise HTTPException(
+            status_code,
+            f"{field} must be a canonical non-negative decimal integer",
+        )
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code,
+            f"{field} must be a canonical non-negative decimal integer",
+        ) from exc
+    if parsed > _MAX_EVENT_CURSOR:
+        raise HTTPException(
+            status_code,
+            f"{field} must not exceed {_MAX_EVENT_CURSOR}",
+        )
+    return parsed
+
+
+def _format_sse_item(item: Any) -> str:
+    kind = _read_field(item, "kind")
+    cursor = _read_field(item, "cursor")
+    if (
+        isinstance(cursor, bool)
+        or not isinstance(cursor, int)
+        or not 0 <= cursor <= _MAX_EVENT_CURSOR
+    ):
+        raise TypeError("UI event stream cursor must be a non-negative integer")
+
+    payload = _read_field(item, "payload")
+    if kind == "heartbeat":
+        if payload is not None:
+            raise TypeError("UI event stream heartbeat payload must be None")
+        return f": keepalive {cursor}\n\n"
+    if kind != "event" or not isinstance(payload, Mapping):
+        raise TypeError("UI event stream item must be an event or heartbeat")
+
+    encoded = jsonable_encoder(payload)
+    if not isinstance(encoded, dict):
+        raise TypeError("UI event stream event payload must encode as an object")
+    sequence = encoded.get("seq")
+    if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence != cursor:
+        raise TypeError("UI event stream event payload sequence must equal its cursor")
+    data = json.dumps(
+        encoded,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return f"id: {cursor}\nevent: run_event\ndata: {data}\n\n"
 
 
 def _read_field(value: Any, field: str) -> Any:
