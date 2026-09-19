@@ -1,5 +1,10 @@
 """Production boundary adapters for ForgeReplay."""
 
+from forge_replay.production.event_stream import (
+    GapFillingRunEventStream,
+    RunEventStreamItem,
+    RunEventStreamProtocolError,
+)
 from forge_replay.production.ha import RegionalFailoverController
 from forge_replay.production.managed import (
     AgentRuntimeFactory,
@@ -37,6 +42,9 @@ from forge_replay.production.redis_fanout import (
     RunFanoutPublishResult,
     RunFanoutUnavailableError,
     fanout_channel,
+)
+from forge_replay.production.redis_fanout_subscriber import (
+    AsyncRedisRunHintSubscriber,
 )
 from forge_replay.production.redis_shadow import (
     RedisShadowProjectionSink,
@@ -85,11 +93,13 @@ __all__ = [
     "RUN_PROJECTION_DESTINATION",
     "AgentRuntimeFactory",
     "AgentRuntimeSession",
+    "AsyncRedisRunHintSubscriber",
     "AuditHashChain",
     "BudgetLedger",
     "ExecReceipt",
     "ExecRequest",
     "GaReadinessGate",
+    "GapFillingRunEventStream",
     "LeaseGuard",
     "ManagedAuthorityConfig",
     "ManagedLeaseLostError",
@@ -116,6 +126,8 @@ __all__ = [
     "ReleaseGate",
     "RetryableManagedRunError",
     "RunEventHint",
+    "RunEventStreamItem",
+    "RunEventStreamProtocolError",
     "RunFanoutProtocolError",
     "RunFanoutPublishResult",
     "RunFanoutUnavailableError",
