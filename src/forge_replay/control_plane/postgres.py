@@ -36,19 +36,33 @@ CREATE TABLE IF NOT EXISTS run_commands (
     tenant_id text NOT NULL, command_id text NOT NULL, run_id text NOT NULL,
     command_type text NOT NULL, available_at timestamptz NOT NULL,
     status text NOT NULL DEFAULT 'queued', claimed_by text, claimed_at timestamptz,
+    claim_expires_at timestamptz, last_error_json jsonb,
     attempt_count integer NOT NULL DEFAULT 0, PRIMARY KEY (tenant_id, command_id),
     FOREIGN KEY (tenant_id, run_id) REFERENCES runs(tenant_id, run_id)
 );
-CREATE INDEX IF NOT EXISTS run_commands_ready ON run_commands(status, available_at);
+ALTER TABLE run_commands ADD COLUMN IF NOT EXISTS claim_expires_at timestamptz;
+ALTER TABLE run_commands ADD COLUMN IF NOT EXISTS last_error_json jsonb;
+CREATE INDEX IF NOT EXISTS run_commands_ready_v2
+    ON run_commands(tenant_id, available_at) WHERE status = 'queued';
+CREATE INDEX IF NOT EXISTS run_commands_expired_claims
+    ON run_commands(tenant_id, claim_expires_at) WHERE status = 'claimed';
 CREATE TABLE IF NOT EXISTS run_outbox (
     tenant_id text NOT NULL, outbox_id text NOT NULL, run_id text NOT NULL,
     destination text NOT NULL, payload_json jsonb NOT NULL,
     created_at timestamptz NOT NULL DEFAULT clock_timestamp(), published_at timestamptz,
+    claimed_by text, claimed_at timestamptz, claim_expires_at timestamptz,
+    last_error_json jsonb,
     publish_attempts integer NOT NULL DEFAULT 0, PRIMARY KEY (tenant_id, outbox_id),
     FOREIGN KEY (tenant_id, run_id) REFERENCES runs(tenant_id, run_id)
 );
+ALTER TABLE run_outbox ADD COLUMN IF NOT EXISTS claimed_by text;
+ALTER TABLE run_outbox ADD COLUMN IF NOT EXISTS claimed_at timestamptz;
+ALTER TABLE run_outbox ADD COLUMN IF NOT EXISTS claim_expires_at timestamptz;
+ALTER TABLE run_outbox ADD COLUMN IF NOT EXISTS last_error_json jsonb;
 CREATE INDEX IF NOT EXISTS run_outbox_pending ON run_outbox(created_at)
     WHERE published_at IS NULL;
+CREATE INDEX IF NOT EXISTS run_outbox_claimable
+    ON run_outbox(tenant_id, claim_expires_at, created_at) WHERE published_at IS NULL;
 CREATE TABLE IF NOT EXISTS api_idempotency_keys (
     tenant_id text NOT NULL, idempotency_key text NOT NULL, operation text NOT NULL,
     request_sha256 text NOT NULL, resource_id text NOT NULL, response_json jsonb NOT NULL,
@@ -279,29 +293,58 @@ class PostgresControlPlaneStore:
         return next_version
 
     def claim_commands(
-        self, *, tenant_id: str, worker_id: str, limit: int
+        self, *, tenant_id: str, worker_id: str, limit: int,
+        visibility_timeout_seconds: int = 30,
     ) -> tuple[dict[str, Any], ...]:
         if limit < 1 or limit > 100:
             raise ValueError("claim limit must be between 1 and 100")
+        self._validate_visibility_timeout(visibility_timeout_seconds)
         with self.connect() as connection:
             self._tenant(connection, tenant_id)
             rows = connection.execute(
                 "WITH ready AS (SELECT tenant_id, command_id FROM run_commands "
-                "WHERE tenant_id = %s AND status = 'queued' "
+                "WHERE tenant_id = %s AND (status = 'queued' OR "
+                "(status = 'claimed' AND (claim_expires_at IS NULL "
+                "OR claim_expires_at <= clock_timestamp()))) "
                 "AND available_at <= clock_timestamp() ORDER BY available_at "
                 "FOR UPDATE SKIP LOCKED LIMIT %s) UPDATE run_commands c SET status = 'claimed', "
-                "claimed_by = %s, claimed_at = clock_timestamp(), attempt_count = attempt_count + 1 "
+                "claimed_by = %s, claimed_at = clock_timestamp(), "
+                "claim_expires_at = clock_timestamp() + make_interval(secs => %s), "
+                "last_error_json = CASE WHEN c.status = 'claimed' THEN "
+                "jsonb_build_object('reason', 'visibility_timeout') ELSE c.last_error_json END, "
+                "attempt_count = attempt_count + 1 "
                 "FROM ready r WHERE c.tenant_id = r.tenant_id AND c.command_id = r.command_id "
-                "RETURNING c.tenant_id, c.command_id, c.run_id, c.command_type, c.available_at, c.attempt_count",
-                (tenant_id, limit, worker_id),
+                "RETURNING c.tenant_id, c.command_id, c.run_id, c.command_type, c.available_at, "
+                "c.claimed_by, c.claimed_at, c.claim_expires_at, c.attempt_count",
+                (tenant_id, limit, worker_id, visibility_timeout_seconds),
             ).fetchall()
             return tuple(dict(row) for row in rows)
+
+    def reclaim_commands(self, *, tenant_id: str, limit: int = 100) -> int:
+        """Release abandoned command claims so PostgreSQL remains a usable fallback queue."""
+        self._validate_limit(limit)
+        with self.connect() as connection:
+            self._tenant(connection, tenant_id)
+            rows = connection.execute(
+                "WITH expired AS (SELECT tenant_id, command_id FROM run_commands "
+                "WHERE tenant_id = %s AND status = 'claimed' "
+                "AND (claim_expires_at IS NULL OR claim_expires_at <= clock_timestamp()) "
+                "ORDER BY claim_expires_at NULLS FIRST "
+                "FOR UPDATE SKIP LOCKED LIMIT %s) UPDATE run_commands c SET status = 'queued', "
+                "claimed_by = NULL, claimed_at = NULL, claim_expires_at = NULL, "
+                "last_error_json = jsonb_build_object('reason', 'visibility_timeout') "
+                "FROM expired e WHERE c.tenant_id = e.tenant_id AND c.command_id = e.command_id "
+                "RETURNING c.command_id",
+                (tenant_id, limit),
+            ).fetchall()
+            return len(rows)
 
     def acknowledge_command(self, *, tenant_id: str, command_id: str, worker_id: str) -> bool:
         with self.connect() as connection:
             self._tenant(connection, tenant_id)
             row = connection.execute(
-                "UPDATE run_commands SET status = 'done' WHERE tenant_id = %s AND command_id = %s "
+                "UPDATE run_commands SET status = 'done', claim_expires_at = NULL "
+                "WHERE tenant_id = %s AND command_id = %s "
                 "AND status = 'claimed' AND claimed_by = %s RETURNING command_id",
                 (tenant_id, command_id, worker_id),
             ).fetchone()
@@ -310,24 +353,78 @@ class PostgresControlPlaneStore:
     def pending_outbox(
         self, *, tenant_id: str, limit: int = 100
     ) -> tuple[dict[str, Any], ...]:
+        """Compatibility read; relays should use :meth:`claim_outbox`."""
+        self._validate_limit(limit)
         with self.connect() as connection:
             self._tenant(connection, tenant_id)
             rows = connection.execute(
                 "SELECT tenant_id, outbox_id, run_id, destination, payload_json FROM run_outbox "
-                "WHERE tenant_id = %s AND published_at IS NULL ORDER BY created_at "
-                "FOR UPDATE SKIP LOCKED LIMIT %s",
+                "WHERE tenant_id = %s AND published_at IS NULL "
+                "AND (claimed_by IS NULL OR claim_expires_at IS NULL "
+                "OR claim_expires_at <= clock_timestamp()) "
+                "ORDER BY created_at LIMIT %s",
                 (tenant_id, limit),
             ).fetchall()
             return tuple(dict(row) for row in rows)
 
-    def mark_outbox_published(self, *, tenant_id: str, outbox_id: str) -> None:
+    def claim_outbox(
+        self, *, tenant_id: str, publisher_id: str, limit: int = 100,
+        visibility_timeout_seconds: int = 30,
+    ) -> tuple[dict[str, Any], ...]:
+        """Claim unpublished messages, including claims abandoned after their deadline."""
+        self._validate_limit(limit)
+        self._validate_visibility_timeout(visibility_timeout_seconds)
         with self.connect() as connection:
             self._tenant(connection, tenant_id)
-            connection.execute(
-                "UPDATE run_outbox SET published_at = clock_timestamp(), "
-                "publish_attempts = publish_attempts + 1 WHERE tenant_id = %s AND outbox_id = %s "
-                "AND published_at IS NULL", (tenant_id, outbox_id),
-            )
+            rows = connection.execute(
+                "WITH pending AS (SELECT tenant_id, outbox_id FROM run_outbox "
+                "WHERE tenant_id = %s AND published_at IS NULL "
+                "AND (claimed_by IS NULL OR claim_expires_at IS NULL "
+                "OR claim_expires_at <= clock_timestamp()) "
+                "ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT %s) "
+                "UPDATE run_outbox o SET claimed_by = %s, claimed_at = clock_timestamp(), "
+                "claim_expires_at = clock_timestamp() + make_interval(secs => %s), "
+                "last_error_json = CASE WHEN o.claimed_by IS NOT NULL THEN "
+                "jsonb_build_object('reason', 'visibility_timeout') ELSE o.last_error_json END, "
+                "publish_attempts = publish_attempts + 1 FROM pending p "
+                "WHERE o.tenant_id = p.tenant_id AND o.outbox_id = p.outbox_id "
+                "RETURNING o.tenant_id, o.outbox_id, o.run_id, o.destination, o.payload_json, "
+                "o.claimed_by, o.claimed_at, o.claim_expires_at, o.publish_attempts",
+                (tenant_id, limit, publisher_id, visibility_timeout_seconds),
+            ).fetchall()
+            return tuple(dict(row) for row in rows)
+
+    def reclaim_outbox(self, *, tenant_id: str, limit: int = 100) -> int:
+        self._validate_limit(limit)
+        with self.connect() as connection:
+            self._tenant(connection, tenant_id)
+            rows = connection.execute(
+                "WITH expired AS (SELECT tenant_id, outbox_id FROM run_outbox "
+                "WHERE tenant_id = %s AND published_at IS NULL AND claimed_by IS NOT NULL "
+                "AND (claim_expires_at IS NULL OR claim_expires_at <= clock_timestamp()) "
+                "ORDER BY claim_expires_at NULLS FIRST "
+                "FOR UPDATE SKIP LOCKED LIMIT %s) UPDATE run_outbox o SET claimed_by = NULL, "
+                "claimed_at = NULL, claim_expires_at = NULL, "
+                "last_error_json = jsonb_build_object('reason', 'visibility_timeout') "
+                "FROM expired e WHERE o.tenant_id = e.tenant_id AND o.outbox_id = e.outbox_id "
+                "RETURNING o.outbox_id",
+                (tenant_id, limit),
+            ).fetchall()
+            return len(rows)
+
+    def mark_outbox_published(
+        self, *, tenant_id: str, outbox_id: str, publisher_id: str | None = None
+    ) -> bool:
+        with self.connect() as connection:
+            self._tenant(connection, tenant_id)
+            row = connection.execute(
+                "UPDATE run_outbox SET published_at = clock_timestamp(), claim_expires_at = NULL "
+                "WHERE tenant_id = %s AND outbox_id = %s AND published_at IS NULL "
+                "AND ((%s IS NULL AND claimed_by IS NULL) OR claimed_by = %s) "
+                "RETURNING outbox_id",
+                (tenant_id, outbox_id, publisher_id, publisher_id),
+            ).fetchone()
+            return row is not None
 
     def register_artifact(
         self, *, tenant_id: str, run_id: str, sha256: str, size_bytes: int,
@@ -355,16 +452,82 @@ class PostgresControlPlaneStore:
         with self.connect() as connection:
             self._tenant(connection, tenant_id)
             row = connection.execute(
-                "UPDATE runs SET lease_owner = %s, lease_epoch = lease_epoch + 1, "
+                "UPDATE runs SET lease_epoch = CASE WHEN lease_owner = %s "
+                "AND lease_expires_at > clock_timestamp() THEN lease_epoch "
+                "ELSE lease_epoch + 1 END, lease_owner = %s, "
                 "lease_expires_at = clock_timestamp() + make_interval(secs => %s), "
                 "updated_at = clock_timestamp() WHERE tenant_id = %s AND run_id = %s "
                 "AND (lease_owner IS NULL OR lease_owner = %s OR lease_expires_at <= clock_timestamp()) "
                 "RETURNING lease_owner, lease_epoch, lease_expires_at, stream_version",
-                (worker_id, ttl_seconds, tenant_id, run_id, worker_id),
+                (worker_id, worker_id, ttl_seconds, tenant_id, run_id, worker_id),
             ).fetchone()
             if row is None:
                 raise RunVersionConflictError("run is owned by another live worker")
             return dict(row)
+
+    def renew_worker_lease(
+        self, *, tenant_id: str, run_id: str, worker_id: str, lease_epoch: int,
+        ttl_seconds: int = 30,
+    ) -> dict[str, Any]:
+        """Extend a live lease without changing its fencing epoch."""
+        self._validate_lease_ttl(ttl_seconds)
+        with self.connect() as connection:
+            self._tenant(connection, tenant_id)
+            row = connection.execute(
+                "UPDATE runs SET lease_expires_at = "
+                "clock_timestamp() + make_interval(secs => %s), updated_at = clock_timestamp() "
+                "WHERE tenant_id = %s AND run_id = %s AND lease_owner = %s "
+                "AND lease_epoch = %s AND lease_expires_at > clock_timestamp() "
+                "RETURNING lease_owner, lease_epoch, lease_expires_at, stream_version",
+                (ttl_seconds, tenant_id, run_id, worker_id, lease_epoch),
+            ).fetchone()
+            if row is None:
+                raise RunVersionConflictError("worker lease is stale or expired")
+            return dict(row)
+
+    def release_worker_lease(
+        self, *, tenant_id: str, run_id: str, worker_id: str, lease_epoch: int
+    ) -> bool:
+        """Release only the exact fenced lease; the monotonic epoch is preserved."""
+        with self.connect() as connection:
+            self._tenant(connection, tenant_id)
+            row = connection.execute(
+                "UPDATE runs SET lease_owner = NULL, lease_expires_at = NULL, "
+                "updated_at = clock_timestamp() WHERE tenant_id = %s AND run_id = %s "
+                "AND lease_owner = %s AND lease_epoch = %s RETURNING lease_epoch",
+                (tenant_id, run_id, worker_id, lease_epoch),
+            ).fetchone()
+            return row is not None
+
+    def heartbeat_worker(
+        self, *, worker_id: str, capabilities: dict[str, Any],
+        draining: bool | None = None,
+    ) -> dict[str, Any]:
+        """Register or refresh observable worker presence; this is not a fencing lease."""
+        self._validate_worker_id(worker_id)
+        capabilities_json = _canonical_json(capabilities)
+        with self.connect() as connection:
+            row = connection.execute(
+                "INSERT INTO worker_registry(worker_id, capabilities_json, last_heartbeat_at, draining) "
+                "VALUES (%s, %s::jsonb, clock_timestamp(), COALESCE(%s, false)) "
+                "ON CONFLICT (worker_id) DO UPDATE SET "
+                "capabilities_json = EXCLUDED.capabilities_json, "
+                "last_heartbeat_at = clock_timestamp(), "
+                "draining = COALESCE(%s, worker_registry.draining) "
+                "RETURNING worker_id, capabilities_json, last_heartbeat_at, draining",
+                (worker_id, capabilities_json, draining, draining),
+            ).fetchone()
+            return dict(row)
+
+    def set_worker_draining(self, *, worker_id: str, draining: bool = True) -> bool:
+        self._validate_worker_id(worker_id)
+        with self.connect() as connection:
+            row = connection.execute(
+                "UPDATE worker_registry SET draining = %s, last_heartbeat_at = clock_timestamp() "
+                "WHERE worker_id = %s RETURNING worker_id",
+                (draining, worker_id),
+            ).fetchone()
+            return row is not None
 
     def advance_run_as_worker(
         self, *, tenant_id: str, run_id: str, worker_id: str, lease_epoch: int,
@@ -396,6 +559,26 @@ class PostgresControlPlaneStore:
         if not tenant_id or len(tenant_id) > 128:
             raise ValueError("tenant_id is invalid")
         connection.execute("SELECT set_config('app.tenant_id', %s, true)", (tenant_id,))
+
+    @staticmethod
+    def _validate_limit(limit: int) -> None:
+        if limit < 1 or limit > 100:
+            raise ValueError("claim limit must be between 1 and 100")
+
+    @staticmethod
+    def _validate_visibility_timeout(visibility_timeout_seconds: int) -> None:
+        if not 5 <= visibility_timeout_seconds <= 3600:
+            raise ValueError("visibility timeout must be between 5 and 3600 seconds")
+
+    @staticmethod
+    def _validate_lease_ttl(ttl_seconds: int) -> None:
+        if not 5 <= ttl_seconds <= 300:
+            raise ValueError("worker lease ttl must be between 5 and 300 seconds")
+
+    @staticmethod
+    def _validate_worker_id(worker_id: str) -> None:
+        if not worker_id or len(worker_id) > 128:
+            raise ValueError("worker_id is invalid")
 
 
 def _canonical_json(value: Any) -> str:
