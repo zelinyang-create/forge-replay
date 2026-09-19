@@ -5,10 +5,11 @@ import hmac
 import json
 import time
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Annotated, Any, Protocol
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 
@@ -71,13 +72,31 @@ class ControlPlaneService(Protocol):
     ) -> list[dict[str, Any]]: ...
 
 
+class UIStatusReader(Protocol):
+    """Optional stale-tolerant reader for the dedicated UI status endpoint."""
+
+    def read_ui_status(
+        self,
+        *,
+        tenant_id: str,
+        run_id: str,
+        minimum_version: int | None = None,
+        force_sql: bool = False,
+    ) -> Any: ...
+
+
 class CreateRunRequest(BaseModel):
     task: str = Field(min_length=1, max_length=20_000)
     repository: str = Field(min_length=1, max_length=2_000)
     base_sha: str = Field(pattern=r"^[0-9a-f]{40,64}$")
 
 
-def create_control_plane_app(service: ControlPlaneService, verifier: IdentityVerifier) -> FastAPI:
+def create_control_plane_app(
+    service: ControlPlaneService,
+    verifier: IdentityVerifier,
+    *,
+    ui_status_reader: UIStatusReader | None = None,
+) -> FastAPI:
     app = FastAPI(title="ForgeReplay Control Plane", version="1.0")
     bearer = HTTPBearer(auto_error=False)
 
@@ -128,6 +147,54 @@ def create_control_plane_app(service: ControlPlaneService, verifier: IdentityVer
             "idempotent_replay": created.replayed,
         }
 
+    @app.get("/v1/runs/{run_id}/status")
+    def get_ui_status(
+        run_id: str,
+        identity: Annotated[AuthenticatedPrincipal, Depends(principal)],
+        minimum_version: Annotated[int | None, Query(ge=0)] = None,
+        force_sql: bool = False,
+    ):
+        if ui_status_reader is None:
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "UI status reader is not enabled",
+            )
+        result = ui_status_reader.read_ui_status(
+            tenant_id=identity.tenant_id,
+            run_id=run_id,
+            minimum_version=minimum_version,
+            force_sql=force_sql,
+        )
+        snapshot = _read_field(result, "snapshot")
+        if snapshot is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "run not found")
+
+        tenant_id = _string_field(snapshot, "tenant_id")
+        snapshot_run_id = _string_field(snapshot, "run_id")
+        if tenant_id != identity.tenant_id or snapshot_run_id != run_id:
+            raise ValueError("UI status reader returned a different run identity")
+        execution_status = _string_field(snapshot, "execution_status", enum_value=True)
+        phase = _optional_string_field(snapshot, "phase")
+        stream_version = _non_negative_integer_field(snapshot, "stream_version")
+        last_event_seq = _non_negative_integer_field(snapshot, "last_event_seq")
+
+        return {
+            "tenant_id": tenant_id,
+            "run_id": snapshot_run_id,
+            "execution_status": execution_status,
+            "status": execution_status,
+            "phase": phase,
+            "stream_version": stream_version,
+            "last_event_seq": last_event_seq,
+            "updated_at": _read_field(snapshot, "updated_at"),
+            "source": _string_field(result, "source", enum_value=True),
+            "fallback_reason": _optional_string_field(
+                result,
+                "fallback_reason",
+                enum_value=True,
+            ),
+        }
+
     @app.get("/v1/runs/{run_id}")
     def get_run(
         run_id: str,
@@ -151,3 +218,50 @@ def create_control_plane_app(service: ControlPlaneService, verifier: IdentityVer
         }
 
     return app
+
+
+def _read_field(value: Any, field: str) -> Any:
+    if isinstance(value, Mapping):
+        if field not in value:
+            raise TypeError(f"UI status result is missing {field}")
+        return value[field]
+    try:
+        return getattr(value, field)
+    except AttributeError as exc:
+        raise TypeError(f"UI status result is missing {field}") from exc
+
+
+def _string_field(value: Any, field: str, *, enum_value: bool = False) -> str:
+    field_value = _read_field(value, field)
+    if enum_value:
+        field_value = getattr(field_value, "value", field_value)
+    if not isinstance(field_value, str) or not field_value:
+        raise TypeError(f"UI status field {field} must be a non-empty string")
+    return field_value
+
+
+def _optional_string_field(
+    value: Any,
+    field: str,
+    *,
+    enum_value: bool = False,
+) -> str | None:
+    field_value = _read_field(value, field)
+    if field_value is None:
+        return None
+    if enum_value:
+        field_value = getattr(field_value, "value", field_value)
+    if not isinstance(field_value, str) or not field_value:
+        raise TypeError(f"UI status field {field} must be None or a non-empty string")
+    return field_value
+
+
+def _non_negative_integer_field(value: Any, field: str) -> int:
+    field_value = _read_field(value, field)
+    if (
+        isinstance(field_value, bool)
+        or not isinstance(field_value, int)
+        or field_value < 0
+    ):
+        raise TypeError(f"UI status field {field} must be a non-negative integer")
+    return field_value
