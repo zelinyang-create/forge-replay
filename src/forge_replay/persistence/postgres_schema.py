@@ -682,6 +682,51 @@ POSTGRES_RUNTIME_MIGRATIONS = (
             """,
         ),
     ),
+    PostgresMigration(
+        version=7,
+        name="external_blob_accounting",
+        statements=(
+            """
+            CREATE TABLE tenant_blob_usage (
+                tenant_id text NOT NULL PRIMARY KEY REFERENCES tenants(tenant_id),
+                total_bytes bigint NOT NULL DEFAULT 0 CHECK (total_bytes >= 0),
+                updated_at timestamptz NOT NULL DEFAULT clock_timestamp()
+            )
+            """,
+            """
+            INSERT INTO tenant_blob_usage(tenant_id, total_bytes, updated_at)
+            SELECT tenant.tenant_id, COALESCE(SUM(blob.byte_length), 0), clock_timestamp()
+            FROM tenants AS tenant
+            LEFT JOIN blobs AS blob ON blob.tenant_id = tenant.tenant_id
+            GROUP BY tenant.tenant_id
+            """,
+            """
+            CREATE UNIQUE INDEX blobs_tenant_object_key_uq
+            ON blobs(tenant_id, object_key)
+            WHERE object_key IS NOT NULL
+            """,
+            """
+            ALTER TABLE blobs
+            ADD CONSTRAINT blobs_storage_location_xor
+            CHECK (
+                (content IS NOT NULL AND object_key IS NULL)
+                OR (content IS NULL AND object_key IS NOT NULL)
+            ) NOT VALID
+            """,
+            """
+            ALTER TABLE blobs
+            VALIDATE CONSTRAINT blobs_storage_location_xor
+            """,
+            """
+            ALTER TABLE tenant_blob_usage ENABLE ROW LEVEL SECURITY
+            """,
+            """
+            CREATE POLICY runtime_tenant_tenant_blob_usage ON tenant_blob_usage
+            USING (tenant_id = current_setting('app.tenant_id', true))
+            WITH CHECK (tenant_id = current_setting('app.tenant_id', true))
+            """,
+        ),
+    ),
 )
 
 

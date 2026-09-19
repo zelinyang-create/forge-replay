@@ -66,6 +66,7 @@ def _sql() -> str:
         "artifacts",
         "artifact_refs",
         "managed_run_requests",
+        "tenant_blob_usage",
     ],
 )
 def test_runtime_schema_contains_tenant_scoped_table(table: str):
@@ -82,6 +83,7 @@ def test_migrations_are_contiguous_named_and_content_addressed():
         4,
         5,
         6,
+        7,
     ]
     assert all(migration.name for migration in POSTGRES_RUNTIME_MIGRATIONS)
     assert all(re.fullmatch(r"[0-9a-f]{64}", migration.checksum) for migration in POSTGRES_RUNTIME_MIGRATIONS)
@@ -112,9 +114,13 @@ def test_all_published_migrations_are_immutable():
             "managed_run_admission",
             "4ef4e1125a6c5e983444d5e7a5aa3a7f831126b3671ce9af6e78304c83a386c6",
         ),
+        6: (
+            "run_projection_outbox_source",
+            "50d92dfde144371769ec3cbb7601b8ed1d2b1813b02c5c159606e5edebb7d425",
+        ),
     }
 
-    for migration in POSTGRES_RUNTIME_MIGRATIONS[:5]:
+    for migration in POSTGRES_RUNTIME_MIGRATIONS[:6]:
         assert (migration.name, migration.checksum) == published[migration.version]
 
 
@@ -122,7 +128,7 @@ def test_migration_runner_accepts_dict_rows_and_is_idempotent():
     connection = _MigrationConnection()
 
     apply_postgres_runtime_migrations(connection)
-    assert [version for version, _ in connection.applied] == [1, 2, 3, 4, 5, 6]
+    assert [version for version, _ in connection.applied] == [1, 2, 3, 4, 5, 6, 7]
 
     first_execution_count = len(connection.executed)
     apply_postgres_runtime_migrations(connection)
@@ -207,6 +213,7 @@ def test_every_runtime_table_has_tenant_rls_read_and_write_policy():
         "artifacts",
         "artifact_refs",
         "managed_run_requests",
+        "tenant_blob_usage",
     )
     for table in tenant_tables:
         assert f"alter table {table} enable row level security" in sql
@@ -323,6 +330,62 @@ def test_projection_outbox_migration_preserves_existing_tenant_rls():
     assert sql.count("create policy runtime_tenant_run_outbox on run_outbox") == 1
     assert (
         "create policy runtime_tenant_run_outbox on run_outbox "
+        "using (tenant_id = current_setting('app.tenant_id', true)) "
+        "with check (tenant_id = current_setting('app.tenant_id', true))"
+    ) in sql
+
+
+def test_external_blob_accounting_tracks_existing_tenant_bytes():
+    sql = _sql()
+    migration = POSTGRES_RUNTIME_MIGRATIONS[6]
+    definition = re.search(r"create table tenant_blob_usage \((.*?)\);", sql)
+
+    assert migration.version == 7
+    assert migration.name == "external_blob_accounting"
+    assert definition is not None
+    for fragment in (
+        "tenant_id text not null primary key references tenants(tenant_id)",
+        "total_bytes bigint not null default 0 check (total_bytes >= 0)",
+        "updated_at timestamptz not null default clock_timestamp()",
+    ):
+        assert fragment in definition.group(1)
+    assert (
+        "insert into tenant_blob_usage(tenant_id, total_bytes, updated_at) "
+        "select tenant.tenant_id, coalesce(sum(blob.byte_length), 0), "
+        "clock_timestamp() from tenants as tenant left join blobs as blob "
+        "on blob.tenant_id = tenant.tenant_id group by tenant.tenant_id"
+    ) in sql
+
+
+def test_external_blob_storage_has_unique_keys_and_exactly_one_location():
+    sql = _sql()
+
+    assert (
+        "create unique index blobs_tenant_object_key_uq "
+        "on blobs(tenant_id, object_key) where object_key is not null"
+    ) in sql
+    assert (
+        "add constraint blobs_storage_location_xor check ( "
+        "(content is not null and object_key is null) "
+        "or (content is null and object_key is not null) ) not valid"
+    ) in sql
+    assert (
+        "alter table blobs validate constraint blobs_storage_location_xor"
+    ) in sql
+
+
+def test_external_blob_accounting_is_tenant_isolated_without_redefining_blobs():
+    sql = _sql()
+    migration = POSTGRES_RUNTIME_MIGRATIONS[6]
+
+    assert all(
+        "create table blobs" not in statement.lower()
+        for statement in migration.statements
+    )
+    assert sql.count("create table blobs (") == 1
+    assert sql.count("alter table tenant_blob_usage enable row level security") == 1
+    assert (
+        "create policy runtime_tenant_tenant_blob_usage on tenant_blob_usage "
         "using (tenant_id = current_setting('app.tenant_id', true)) "
         "with check (tenant_id = current_setting('app.tenant_id', true))"
     ) in sql
