@@ -181,6 +181,55 @@ def _statement(
     return next(item for item in connection.statements if fragment in item[0])
 
 
+def test_claim_outbox_without_destination_preserves_the_existing_query_and_params():
+    connection = RecordingConnection()
+    store, _ = _make_store(connection)
+
+    assert store.claim_outbox(
+        tenant_id="tenant-a",
+        publisher_id="relay-a",
+        limit=17,
+        visibility_timeout_seconds=45,
+    ) == ()
+
+    sql, params = _statement(connection, "with pending as")
+    assert "destination = %s" not in sql
+    assert params == ("tenant-a", 17, "relay-a", 45)
+
+
+def test_claim_outbox_filters_destination_with_a_bound_parameter():
+    connection = RecordingConnection()
+    store, _ = _make_store(connection)
+
+    assert store.claim_outbox(
+        tenant_id="tenant-a",
+        publisher_id="projection-relay",
+        destination="run-projection-v1",
+        limit=9,
+        visibility_timeout_seconds=60,
+    ) == ()
+
+    sql, params = _statement(connection, "with pending as")
+    assert "tenant_id = %s and destination = %s and published_at is null" in sql
+    assert "run-projection-v1" not in sql
+    assert params == ("tenant-a", "run-projection-v1", 9, "projection-relay", 60)
+
+
+@pytest.mark.parametrize("destination", ["", "   ", 7])
+def test_claim_outbox_rejects_invalid_destination_before_connecting(destination: object):
+    connection = RecordingConnection()
+    store, connect = _make_store(connection)
+
+    with pytest.raises(ValueError, match="destination must be a non-empty string"):
+        store.claim_outbox(
+            tenant_id="tenant-a",
+            publisher_id="projection-relay",
+            destination=destination,  # type: ignore[arg-type]
+        )
+
+    assert connect.calls == []
+
+
 def test_initialize_uses_the_single_canonical_migration_runner(monkeypatch: pytest.MonkeyPatch):
     connection = RecordingConnection()
     store, _ = _make_store(connection)

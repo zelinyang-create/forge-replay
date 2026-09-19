@@ -489,29 +489,59 @@ class PostgresControlPlaneStore:
     def claim_outbox(
         self, *, tenant_id: str, publisher_id: str, limit: int = 100,
         visibility_timeout_seconds: int = 30,
+        destination: str | None = None,
     ) -> tuple[dict[str, Any], ...]:
         """Claim unpublished messages, including claims abandoned after their deadline."""
         self._validate_limit(limit)
         self._validate_visibility_timeout(visibility_timeout_seconds)
+        if destination is not None and (
+            not isinstance(destination, str) or not destination.strip()
+        ):
+            raise ValueError("destination must be a non-empty string")
         with self.connect() as connection:
             self._tenant(connection, tenant_id)
-            rows = connection.execute(
-                "WITH pending AS (SELECT tenant_id, outbox_id FROM run_outbox "
-                "WHERE tenant_id = %s AND published_at IS NULL "
-                "AND (claimed_by IS NULL OR claim_expires_at IS NULL "
-                "OR claim_expires_at <= clock_timestamp()) "
-                "ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT %s) "
-                "UPDATE run_outbox o SET claimed_by = %s, claimed_at = clock_timestamp(), "
-                "claim_expires_at = clock_timestamp() + make_interval(secs => %s), "
-                "last_error_json = CASE WHEN o.claimed_by IS NOT NULL THEN "
-                "jsonb_build_object('reason', 'visibility_timeout') ELSE o.last_error_json END, "
-                "publish_attempts = publish_attempts + 1 FROM pending p "
-                "WHERE o.tenant_id = p.tenant_id AND o.outbox_id = p.outbox_id "
-                "RETURNING o.tenant_id, o.outbox_id, o.run_id, o.destination, o.dedupe_key, "
-                "o.stream_version, o.source_event_id, o.payload_json, o.claimed_by, o.claimed_at, "
-                "o.claim_expires_at, o.publish_attempts",
-                (tenant_id, limit, publisher_id, visibility_timeout_seconds),
-            ).fetchall()
+            if destination is None:
+                rows = connection.execute(
+                    "WITH pending AS (SELECT tenant_id, outbox_id FROM run_outbox "
+                    "WHERE tenant_id = %s AND published_at IS NULL "
+                    "AND (claimed_by IS NULL OR claim_expires_at IS NULL "
+                    "OR claim_expires_at <= clock_timestamp()) "
+                    "ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT %s) "
+                    "UPDATE run_outbox o SET claimed_by = %s, claimed_at = clock_timestamp(), "
+                    "claim_expires_at = clock_timestamp() + make_interval(secs => %s), "
+                    "last_error_json = CASE WHEN o.claimed_by IS NOT NULL THEN "
+                    "jsonb_build_object('reason', 'visibility_timeout') ELSE o.last_error_json END, "
+                    "publish_attempts = publish_attempts + 1 FROM pending p "
+                    "WHERE o.tenant_id = p.tenant_id AND o.outbox_id = p.outbox_id "
+                    "RETURNING o.tenant_id, o.outbox_id, o.run_id, o.destination, o.dedupe_key, "
+                    "o.stream_version, o.source_event_id, o.payload_json, o.claimed_by, "
+                    "o.claimed_at, o.claim_expires_at, o.publish_attempts",
+                    (tenant_id, limit, publisher_id, visibility_timeout_seconds),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    "WITH pending AS (SELECT tenant_id, outbox_id FROM run_outbox "
+                    "WHERE tenant_id = %s AND destination = %s AND published_at IS NULL "
+                    "AND (claimed_by IS NULL OR claim_expires_at IS NULL "
+                    "OR claim_expires_at <= clock_timestamp()) "
+                    "ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT %s) "
+                    "UPDATE run_outbox o SET claimed_by = %s, claimed_at = clock_timestamp(), "
+                    "claim_expires_at = clock_timestamp() + make_interval(secs => %s), "
+                    "last_error_json = CASE WHEN o.claimed_by IS NOT NULL THEN "
+                    "jsonb_build_object('reason', 'visibility_timeout') ELSE o.last_error_json END, "
+                    "publish_attempts = publish_attempts + 1 FROM pending p "
+                    "WHERE o.tenant_id = p.tenant_id AND o.outbox_id = p.outbox_id "
+                    "RETURNING o.tenant_id, o.outbox_id, o.run_id, o.destination, o.dedupe_key, "
+                    "o.stream_version, o.source_event_id, o.payload_json, o.claimed_by, "
+                    "o.claimed_at, o.claim_expires_at, o.publish_attempts",
+                    (
+                        tenant_id,
+                        destination,
+                        limit,
+                        publisher_id,
+                        visibility_timeout_seconds,
+                    ),
+                ).fetchall()
             return tuple(dict(row) for row in rows)
 
     def reclaim_outbox(self, *, tenant_id: str, limit: int = 100) -> int:

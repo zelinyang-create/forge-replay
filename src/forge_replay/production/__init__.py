@@ -20,6 +20,14 @@ from forge_replay.production.managed import (
 from forge_replay.production.model_gateway import BudgetLedger, ModelGateway
 from forge_replay.production.operations import AuditHashChain, GaReadinessGate
 from forge_replay.production.orchestration import MultiWorkerTakeoverCoordinator
+from forge_replay.production.outbox_relay import (
+    RUN_PROJECTION_DESTINATION,
+    ShadowProjectionRebuilder,
+    ShadowProjectionRelay,
+    ShadowRebuildResult,
+    ShadowRelayConfig,
+    ShadowRelayResult,
+)
 from forge_replay.production.policy import PolicyBundle, SignedPolicyEvaluator
 from forge_replay.production.postgres_shadow import PostgresShadowProjectionSource
 from forge_replay.production.redis_shadow import (
@@ -55,6 +63,7 @@ from forge_replay.production.workspace_snapshot import (
 )
 
 __all__ = [
+    "RUN_PROJECTION_DESTINATION",
     "AgentRuntimeFactory",
     "AgentRuntimeSession",
     "AuditHashChain",
@@ -88,9 +97,14 @@ __all__ = [
     "SandboxSpec",
     "ShadowProjectionConfig",
     "ShadowProjectionProtocolError",
+    "ShadowProjectionRebuilder",
+    "ShadowProjectionRelay",
     "ShadowProjectionSnapshot",
     "ShadowProjectionTtlConfig",
     "ShadowProjectionUnavailableError",
+    "ShadowRebuildResult",
+    "ShadowRelayConfig",
+    "ShadowRelayResult",
     "SignedPolicyEvaluator",
     "SubprocessCommandTransport",
     "UnsafeHostExecutionProvider",
