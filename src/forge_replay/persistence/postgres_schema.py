@@ -653,6 +653,35 @@ POSTGRES_RUNTIME_MIGRATIONS = (
             """,
         ),
     ),
+    PostgresMigration(
+        version=6,
+        name="run_projection_outbox_source",
+        statements=(
+            """
+            ALTER TABLE run_outbox
+            ADD COLUMN source_event_id text
+            """,
+            """
+            ALTER TABLE run_outbox
+            ADD CONSTRAINT run_outbox_source_event_fk
+            FOREIGN KEY (tenant_id, source_event_id)
+            REFERENCES run_events(tenant_id, event_id)
+            """,
+            """
+            ALTER TABLE run_outbox
+            ADD CONSTRAINT run_outbox_projection_source_event_required
+            CHECK (
+                destination <> 'run-projection-v1'
+                OR source_event_id IS NOT NULL
+            )
+            """,
+            """
+            CREATE UNIQUE INDEX run_outbox_projection_event_uq
+            ON run_outbox(tenant_id, source_event_id)
+            WHERE destination = 'run-projection-v1'
+            """,
+        ),
+    ),
 )
 
 

@@ -81,6 +81,7 @@ def test_migrations_are_contiguous_named_and_content_addressed():
         3,
         4,
         5,
+        6,
     ]
     assert all(migration.name for migration in POSTGRES_RUNTIME_MIGRATIONS)
     assert all(re.fullmatch(r"[0-9a-f]{64}", migration.checksum) for migration in POSTGRES_RUNTIME_MIGRATIONS)
@@ -89,22 +90,39 @@ def test_migrations_are_contiguous_named_and_content_addressed():
     assert changed.checksum != POSTGRES_RUNTIME_MIGRATIONS[0].checksum
 
 
-def test_published_control_delivery_migration_is_immutable():
-    migration = POSTGRES_RUNTIME_MIGRATIONS[3]
+def test_all_published_migrations_are_immutable():
+    published = {
+        1: (
+            "runtime_core",
+            "e61080f06a854f4e01dc7c771e94f55ba7dc21d9c2855826e77b09aa59ed8ddc",
+        ),
+        2: (
+            "runtime_operational_projections",
+            "2533a7d05d979a8b58cb5f71e4bb59f017369db1fb535e247242996a093028fb",
+        ),
+        3: (
+            "runtime_tenant_rls",
+            "14d8d08851abc8fcc29b74ff2d0acfd58273fc80a5a8d0d0b32546bb5b647952",
+        ),
+        4: (
+            "canonical_control_delivery",
+            "7813df8bcd9f01897983eced2448b999d094e5460c692dca3d7bed382dc068e2",
+        ),
+        5: (
+            "managed_run_admission",
+            "4ef4e1125a6c5e983444d5e7a5aa3a7f831126b3671ce9af6e78304c83a386c6",
+        ),
+    }
 
-    assert migration.version == 4
-    assert migration.name == "canonical_control_delivery"
-    assert (
-        migration.checksum
-        == "7813df8bcd9f01897983eced2448b999d094e5460c692dca3d7bed382dc068e2"
-    )
+    for migration in POSTGRES_RUNTIME_MIGRATIONS[:5]:
+        assert (migration.name, migration.checksum) == published[migration.version]
 
 
 def test_migration_runner_accepts_dict_rows_and_is_idempotent():
     connection = _MigrationConnection()
 
     apply_postgres_runtime_migrations(connection)
-    assert [version for version, _ in connection.applied] == [1, 2, 3, 4, 5]
+    assert [version for version, _ in connection.applied] == [1, 2, 3, 4, 5, 6]
 
     first_execution_count = len(connection.executed)
     apply_postgres_runtime_migrations(connection)
@@ -269,6 +287,45 @@ def test_outbox_supports_at_least_once_claim_and_publish():
         sql,
     )
     assert "create index run_outbox_claimable" in sql
+
+
+def test_projection_outbox_has_a_tenant_scoped_canonical_event_source():
+    sql = _sql()
+    migration = POSTGRES_RUNTIME_MIGRATIONS[5]
+
+    assert migration.version == 6
+    assert migration.name == "run_projection_outbox_source"
+    assert "alter table run_outbox add column source_event_id text" in sql
+    assert "add column source_event_id text not null" not in sql
+    assert (
+        "add constraint run_outbox_source_event_fk "
+        "foreign key (tenant_id, source_event_id) "
+        "references run_events(tenant_id, event_id)"
+    ) in sql
+    assert (
+        "add constraint run_outbox_projection_source_event_required "
+        "check ( destination <> 'run-projection-v1' "
+        "or source_event_id is not null )"
+    ) in sql
+    assert (
+        "create unique index run_outbox_projection_event_uq "
+        "on run_outbox(tenant_id, source_event_id) "
+        "where destination = 'run-projection-v1'"
+    ) in sql
+
+
+def test_projection_outbox_migration_preserves_existing_tenant_rls():
+    sql = _sql()
+    migration = POSTGRES_RUNTIME_MIGRATIONS[5]
+
+    assert all("row level security" not in statement.lower() for statement in migration.statements)
+    assert sql.count("alter table run_outbox enable row level security") == 1
+    assert sql.count("create policy runtime_tenant_run_outbox on run_outbox") == 1
+    assert (
+        "create policy runtime_tenant_run_outbox on run_outbox "
+        "using (tenant_id = current_setting('app.tenant_id', true)) "
+        "with check (tenant_id = current_setting('app.tenant_id', true))"
+    ) in sql
 
 
 def test_api_idempotency_persists_request_digest_and_replay_response():
