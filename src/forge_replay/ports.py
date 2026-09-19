@@ -20,7 +20,7 @@ from forge_replay.domain import (
     ToolEffectClass,
 )
 from forge_replay.events import EventEnvelope, RuntimeEventPayload
-from forge_replay.persistence.store import (
+from forge_replay.records import (
     ApprovalRecord,
     BudgetReservationRecord,
     ModelCallRecord,

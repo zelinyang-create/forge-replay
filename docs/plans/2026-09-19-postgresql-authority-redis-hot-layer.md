@@ -1,0 +1,464 @@
+# PostgreSQL 权威状态与 Redis 派生热层设计
+
+日期：2026-09-19
+
+状态：Accepted for staged implementation
+
+适用范围：ForgeReplay 托管、多 Worker 运行路径；本地 CLI 可继续使用 SQLite 适配器
+
+## 1. 背景与结论
+
+ForgeReplay 当前已经具备追加式事件账本、事务型运行投影、检查点恢复、
+`stream_version` 乐观并发控制和 `lease_epoch` 围栏。现有 SQLite 热路径不是每次
+扫描全部事件：`runs`、`tool_calls`、`model_calls` 等表承担当前状态查询，事件和投影
+在同一事务中更新。
+
+当前主要问题不是缺少 Redis，而是运行时仍由 `SQLiteEventStore` 驱动，而
+`PostgresControlPlaneStore` 是另一套较简化的控制面模型，尚未覆盖完整 Runtime
+契约。若直接增加 Redis 权威状态，将形成 SQLite、PostgreSQL、Redis 三套状态源。
+
+本设计采用以下不可变原则：
+
+> PostgreSQL 是托管运行的唯一正确性平面；Redis 是可清空、可重建的延迟与通知平面。
+
+明确禁止以下模式：
+
+- 业务状态先写 Redis，再批量或定时刷入 SQL；
+- 用 Redis 锁替代 SQL `lease_epoch` 和写入 fencing；
+- 仅在 Redis 保存审批、取消、预算、工具派发或终态；
+- 业务线程直接双写 PostgreSQL 和 Redis，并把两次成功视为一个原子提交；
+- 把 Pub/Sub 消息当成 Run 状态真相。
+
+## 2. 目标与非目标
+
+### 2.1 目标
+
+1. 托管模式只存在一个权威状态源。
+2. 状态变更、事件、强一致投影、命令和 outbox 在一个 PostgreSQL 事务中提交。
+3. Worker 的所有持久化写都受 `lease_owner + lease_epoch + stream_version` 保护。
+4. Redis 整体丢失时不丢已提交事实、不重复已确认副作用、不绕过审批和预算。
+5. Redis 故障时系统可以降级到 PostgreSQL 读取和 durable queue。
+6. SQLite 与 PostgreSQL 适配器通过同一组 store contract/invariant tests。
+7. 只有真实指标达到准入条件时才开启 Redis 读缓存或 Streams 消费。
+
+### 2.2 非目标
+
+- 不宣称任意外部副作用 exactly-once。
+- 不用 Redis 替代 PostgreSQL 备份、PITR 或审计。
+- 不在第一阶段删除 SQLite 本地运行模式。
+- 不在没有负载证据时迁移全部热查询到 Redis。
+- 不把大模型输出、工作区快照或制品长期保存在 Redis。
+
+## 3. 当前架构评估
+
+### 3.1 已有正确性基础
+
+- SQLite 使用 WAL 和 `synchronous=FULL`。
+- `events` 是不可变事实账本。
+- `runs`、`tool_calls`、`tool_attempts`、`model_calls`、`approvals`、
+  `budget_reservations` 是事务型 operational projections。
+- `model_calls` 通过部分唯一索引保证一个 Run 最多一个未消费模型调用。
+- Checkpoint 带状态版本与 SHA-256；损坏时可以回退旧 checkpoint 或全量重放。
+- Runtime 使用 `ExecutionContext` 携带 `lease_epoch` 与 `stream_version`。
+- PostgreSQL 参考控制面已有 run-local stream、durable command queue、outbox、
+  API idempotency 和租户 RLS。
+
+### 3.2 必须先修复的断点
+
+1. `forge-replay` CLI 无条件创建 `SQLiteEventStore`，`--production` 不切换数据面。
+2. PostgreSQL Store 没有实现完整 `RuntimeStorePort`。
+3. Port 层仍引用 SQLite Store 中定义的 DTO，领域契约与适配器边界不完整。
+4. PostgreSQL command claim 缺少 visibility timeout 与 abandoned claim 回收。
+5. PostgreSQL lease 缺少显式 renew/release；同 owner 重复 acquire 会递增 epoch。
+6. Outbox 领取与标记分属不同事务，允许重复发布但没有明确 claim 元数据。
+7. 长模型/工具调用期间缺少独立 heartbeat，租约过期只能阻止旧 Worker 落库，
+   不能自动撤销已派发的外部动作。
+8. 大 Blob 在本地 SQLite 内可接受，托管模式应迁往对象存储，SQL 仅留内容地址和元数据。
+
+## 4. 目标架构
+
+```text
+Client / API / Control Command
+              |
+              v
+       PostgreSQL transaction
+       - validate idempotency
+       - CAS stream_version
+       - validate lease fencing when worker mutation
+       - append run_event
+       - update strong projections
+       - enqueue durable command
+       - insert outbox row
+              |
+              | commit is the only success boundary
+              v
+          Outbox Relay
+              |
+              +--> Redis versioned run cache
+              +--> Redis Pub/Sub for UI hints
+              +--> Redis Stream for optional worker wake-up
+              |
+              v
+          Worker consumer
+              |
+              v
+       PostgreSQL acquire/renew lease
+              |
+              v
+       model/tool external effect
+              |
+              v
+       fenced PostgreSQL transaction
+              |
+              v
+       Redis XACK after SQL commit
+```
+
+### 4.1 PostgreSQL correctness plane
+
+下列数据必须同步、权威地保存在 PostgreSQL：
+
+| 类别 | 数据 | 原因 |
+|---|---|---|
+| 历史 | `run_events`、审计链、tombstone | 回放、审计、追责 |
+| 生命周期 | Run 状态、phase、terminal reason、`stream_version` | 状态机正确性 |
+| 协调安全 | lease owner、epoch、expiry、writer epoch | 防旧 Worker 写入 |
+| 工具执行 | call、attempt、effect class、receipt、uncertain | 副作用恢复 |
+| 模型执行 | call、attempt、response reference、consumption | 避免重复消费 |
+| 人工控制 | approval、grant、cancel command | 权限与控制不可丢 |
+| 成本 | reservation、settlement、durable consumption | 防超支与计费 |
+| 交付 | command、outbox、API idempotency | 至少一次和去重 |
+| 恢复 | checkpoint metadata、snapshot hash | 有界恢复 |
+| 制品 | object key、hash、length、tenant ownership | 完整性和租户边界 |
+
+### 4.2 Redis latency plane
+
+Redis 只能保存能够从 PostgreSQL 或对象存储重建的数据：
+
+| 用途 | 数据结构 | 一致性 |
+|---|---|---|
+| Run 状态缓存 | HASH/JSON | eventual，带 `stream_version` |
+| 最近事件窗口 | STREAM | 可丢失，SQL 回源 |
+| 活跃 Run 索引 | ZSET | 可重建 |
+| Worker presence | STRING/HASH + TTL | 仅观测，不作 fencing |
+| UI 实时通知 | Pub/Sub | 提示型，客户端按 seq 补读 |
+| Worker 唤醒 | Streams consumer group | 至少一次，SQL 命令权威 |
+| API 滑动窗口限流 | Lua + sorted set/token bucket | 快速拒绝；财务预算仍在 SQL |
+| Provider 健康与熔断 | TTL key | 可过期、可重建 |
+
+## 5. Redis Key 与消息设计
+
+Key 必须带环境和 schema version；Redis Cluster 中需要同 Run 同 slot：
+
+```text
+fr:<env>:v1:{t:<tenant>:r:<run>}:projection
+fr:<env>:v1:{t:<tenant>:r:<run>}:recent
+fr:<env>:v1:active:<tenant>:<shard>
+fr:<env>:v1:{q:<worker-pool>:<shard>}:commands
+fr:<env>:v1:worker:<worker-id>:heartbeat
+fr:<env>:v1:rate:<tenant>:<dimension>
+fr:<env>:v1:outbox-dedup:<outbox-id>
+```
+
+Projection 最少字段：
+
+```json
+{
+  "tenant_id": "tenant-1",
+  "run_id": "run-1",
+  "stream_version": 42,
+  "status": "active",
+  "phase": "awaiting_model",
+  "last_event_seq": 42,
+  "updated_at": "2026-09-19T12:00:00Z"
+}
+```
+
+更新必须使用 Lua 或 Redis transaction 比较版本：仅当 incoming version 大于当前版本时覆盖。
+这防止 outbox 重试或跨 Relay 乱序把旧状态覆盖到新状态。
+
+建议 TTL：
+
+- active projection：滑动 1 小时；
+- terminal projection：24 小时，产品确有历史列表需求时可延长；
+- recent events：与 projection 同 TTL，`MAXLEN ~ 128` 或 `256`；
+- worker heartbeat：30 秒；
+- outbox dedup：7 天，仅作优化，不代替 SQL 唯一约束；
+- command stream：不设置简单 TTL，只在 SQL command 已完成且消费组安全越过后 trim。
+
+Command Stream 字段：
+
+```text
+command_id
+outbox_id
+tenant_id
+run_id
+command_type
+expected_stream_version
+worker_pool
+available_at
+```
+
+Redis message ID 不作为业务身份；稳定业务身份始终是 SQL 中的 `command_id`、
+`outbox_id` 和 `event_id`。
+
+## 6. 写入协议与一致性
+
+### 6.1 API/控制命令
+
+1. 验证认证主体、租户与 idempotency key。
+2. 在 PostgreSQL 事务中锁定或 CAS Run。
+3. 若同 idempotency key 已提交且请求摘要相同，返回原响应。
+4. 若摘要不同，返回冲突。
+5. 追加事件、更新强一致投影、插入 command/outbox。
+6. 提交事务后才向调用方确认成功。
+7. Redis 不在请求事务的成功条件中。
+
+### 6.2 Worker mutation
+
+所有 Worker 写入使用：
+
+```text
+tenant_id
+run_id
+lease_owner
+lease_epoch
+lease_expires_at > database_clock
+expected_stream_version
+```
+
+任何条件不匹配都必须影响 0 行并失败关闭。外部动作派发前先提交 durable intent；
+外部动作完成后以同一 fencing token 提交 receipt/result。无法确认结果时进入
+`UNCERTAIN`，不得盲目重试非幂等进程。
+
+### 6.3 Transactional outbox
+
+业务事务只写 PostgreSQL outbox。Relay：
+
+1. 领取未发布行并写入 `claimed_by/claimed_at`；
+2. `XADD` Redis Stream，并发布 cache invalidation/fanout；
+3. 以 outbox ID 标记 SQL 行已发布；
+4. 超过 visibility timeout 的 claim 可重新领取。
+
+`XADD` 成功后、SQL 标记前崩溃会重复发布，这是预期的 at-least-once 语义。
+消费者必须依赖 SQL 唯一键和 CAS 消除重复逻辑效果。
+
+### 6.4 Worker 消费
+
+1. `XREADGROUP` 获取消息。
+2. 回 PostgreSQL 加载 command；已完成或过期消息直接安全确认。
+3. 获取 SQL lease；acquire/takeover 才递增 epoch，renew 不递增。
+4. 执行前再次验证 Run 状态、审批、预算和 stream version。
+5. 执行外部动作。
+6. 在 fenced SQL 事务中提交结果及后续 command/outbox。
+7. SQL commit 后 `XACK`。
+8. Worker 崩溃时使用 `XAUTOCLAIM` 接管 pending message，并重新从 SQL 判断真相。
+
+## 7. 读取协议
+
+### 7.1 强一致读取
+
+审批、取消、预算、工具派发、恢复决策、终态提交等操作只读 PostgreSQL，或在同一
+事务中读取并写入。Redis 命中不能跳过 SQL fencing。
+
+### 7.2 可陈旧读取
+
+UI 状态、活跃列表和进度展示可以 cache-aside：
+
+1. 读取 Redis projection；
+2. miss 时读 SQL 并回填；
+3. 客户端携带的最低版本高于缓存版本时强制回源；
+4. SSE/WebSocket 消息携带 event seq；发现 gap 后从 SQL `after_seq` 补读。
+
+Prompt working set 可以缓存，但 miss/驱逐时必须能从 SQL 最近事件和 Blob Store 重建。
+
+## 8. 故障语义
+
+| 故障窗口 | 正确行为 |
+|---|---|
+| SQL commit 前崩溃 | 没有已提交事实；安全重试命令 |
+| SQL commit 后、Relay 发布前 | outbox 保留；恢复后补发 |
+| Redis 发布后、标记 outbox 前 | 可能重复消息；按稳定 ID 幂等 |
+| Worker 收到消息后、执行前 | pending message 可接管；SQL 判定是否仍需执行 |
+| 外部副作用后、SQL receipt 前 | 对账；不能证明时标记 `UNCERTAIN` |
+| SQL commit 后、XACK 前 | 消息重投；SQL 显示已完成，消费者 no-op 后确认 |
+| Redis 全部丢失 | 从 SQL 重建；0 已提交事实丢失 |
+| Redis 网络分区 | 读回 SQL；Worker 使用 PG queue fallback |
+| PostgreSQL 不可用 | 停止状态推进和新的外部副作用 |
+| Worker 长暂停导致 lease 过期 | 新 Worker 可接管；旧 Worker SQL 写被 epoch 拒绝 |
+
+独立 heartbeat 必须在长模型/工具调用期间运行。Heartbeat 失败或剩余 TTL 低于安全窗口时，
+执行器应尝试取消外部工作；无法确认的结果按 `UNCERTAIN` 处理。
+
+## 9. PostgreSQL Schema 演进
+
+第一阶段至少补齐：
+
+- `run_commands.claimed_by`、`claimed_at`、`claim_expires_at`、`last_error_json`；
+- ready partial index：`(tenant_id, available_at)` where status = `queued`；
+- `run_outbox.claimed_by`、`claimed_at`、`claim_expires_at`、`last_error_json`；
+- pending partial index；
+- 显式 `renew_worker_lease` 与 `release_worker_lease`；
+- command/outbox reclaim API；
+- worker registry heartbeat/upsert 与 draining；
+- 完整 Runtime projection tables；
+- 所有 Worker event 记录 `writer_lease_epoch`；
+- 正式版本化 migration，替换单个大字符串作为长期迁移机制。
+
+托管模式中的大字节放入租户隔离对象存储：对象 key 不直接使用用户输入，SQL 保存
+SHA-256、长度、media type、tenant 和引用关系。
+
+## 10. 分阶段实施
+
+### Phase 0：基线与契约
+
+- 把 Store DTO 移到独立 domain/contracts 模块；Port 不再反向引用 SQLite adapter。
+- 固化 SQLite/PostgreSQL 共用 invariant test suite。
+- 记录 SQL transaction latency、lock wait、query latency、event rate、活跃 Run 数。
+
+### Phase 1：统一 PostgreSQL 权威路径
+
+- 实现完整 `PostgresRuntimeStore`。
+- CLI/服务通过配置选择 local SQLite 或 managed PostgreSQL。
+- 补齐 command reclaim、outbox claim、lease renew/release、heartbeat。
+- 将对象正文移出 PostgreSQL/SQLite 托管路径。
+- 在没有 Redis 时完成多 Worker 正确性与恢复验证。
+
+### Phase 2：Redis Shadow Projection
+
+- 实现 outbox relay。
+- 写 Redis versioned projection，但读取仍使用 SQL。
+- 持续对比 Redis 与 SQL 的 version/status，记录 mismatch。
+- `FLUSHALL`、乱序、重复发布和 Relay crash 测试必须通过。
+
+### Phase 3：逐项启用 Redis Reads
+
+按风险从低到高：
+
+1. UI Run 状态缓存；
+2. SSE/WebSocket fanout；
+3. active-run 索引；
+4. recent prompt/event cache；
+5. 共享 rate limit/circuit breaker；
+6. Redis Streams worker wake-up。
+
+每项使用独立 feature flag，支持立即回退 PostgreSQL。
+
+### Phase 4：容量与生产门禁
+
+- 1% → 5% → 25% → 100% Canary；
+- 对 Redis failover、flush、eviction、网络分区做故障注入；
+- 对 PostgreSQL failover、stale epoch、重复 command、乱序 outbox 做压力测试；
+- 完成备份恢复、PITR 和 Redis 全量重建演练。
+
+## 11. Redis 准入门槛
+
+下列数值是本项目的初始工程门槛，不是通用行业标准，需按生产基线调整：
+
+- 两台以上 Worker 或跨机恢复：必须先迁 PostgreSQL，不能用 Redis 给 SQLite 续命。
+- 读缓存：两倍预计峰值压测下目标 SQL 查询 P95 > 20 ms，或数据库 CPU 持续 > 65%，
+  且热点读写比 >= 10:1、预计命中率 >= 80%。上线后 SQL 读负载至少下降 30%。
+- Redis Streams：优化 PG 索引后 command claim P95 仍 > 25 ms、唤醒延迟 P95 > 100 ms，
+  或持续约 1,000 claim/s 以上。
+- 共享限流：多 API 实例需要统一窗口，判定 P95 目标 < 10 ms，或持续约 500 次判断/s。
+- Redis 上线故障门禁：清空 Redis 后 0 已提交事件丢失、0 权限/预算绕过、
+  0 可观察重复副作用；SQL fallback 恢复 < 60 秒；outbox 投影延迟 P95 < 2 秒。
+
+没有达到门槛时，优先使用 PostgreSQL 索引、连接池、合并领域查询、`LISTEN/NOTIFY`
+或进程内 bounded LRU。
+
+## 12. 观测指标
+
+PostgreSQL：
+
+- transaction/query P50/P95/P99；
+- lock wait、deadlock、connection pool saturation；
+- WAL bytes/s、replication lag；
+- command depth、oldest age、claim/redelivery；
+- outbox pending、oldest age、publish retries；
+- lease conflict、takeover、stale write rejection。
+
+Redis：
+
+- cache hit ratio、version lag、stale-update rejection；
+- timeout/error/fallback QPS；
+- memory、eviction、fragmentation；
+- stream lag、`XPENDING`、oldest pending、redelivery、claim age；
+- Pub/Sub subscriber/fanout failures；
+- full rebuild duration。
+
+业务与安全：
+
+- duplicate logical command；
+- duplicate external side effect；
+- approval/budget bypass；
+- `UNCERTAIN` 比率；
+- recovery RTO/RPO；
+- 每 Run 模型/工具/存储延迟占比。
+
+指标按 tenant tier、worker pool、region 和 release 聚合，避免以 run ID 造成高基数。
+
+## 13. 测试与验收
+
+### 13.1 Store contract
+
+SQLite 与 PostgreSQL 必须共同通过：
+
+- 事件追加和 stream version CAS；
+- lease acquire/renew/release/takeover；
+- stale epoch 100% 拒绝；
+- tool/model call 唯一性；
+- approval/cancel idempotency；
+- budget reserve/settle；
+- checkpoint-tail 恢复和损坏回退；
+- terminal transition 原子性。
+
+### 13.2 PostgreSQL/Redis 集成
+
+- SQL commit/rollback 与 outbox 原子性；
+- visibility timeout/reclaim；
+- 重复、乱序 outbox；
+- `XREADGROUP`、`XACK`、`XAUTOCLAIM`；
+- versioned cache CAS；
+- Redis miss、timeout、flush、eviction、network partition；
+- PostgreSQL fallback。
+
+### 13.3 Kill-window matrix
+
+每个故障窗口至少覆盖：SQL commit 前、commit 后 publish 前、publish 后 mark 前、
+副作用后 receipt 前、SQL result commit 后 XACK 前。验收条件是无已提交事实丢失，
+且重复执行要么被幂等消除，要么进入明确的 `UNCERTAIN` 状态。
+
+### 13.4 容量验证
+
+- 多 Worker 并发 claim；
+- 热租户和 shard 倾斜；
+- 1,000 queued / 20 active 基线；
+- Redis 禁用时 PostgreSQL fallback 容量；
+- Redis 重建期间的延迟和数据库冲击。
+
+## 14. 发布、回滚与完成定义
+
+独立开关：
+
+```text
+redis_cache_write
+redis_cache_read
+redis_fanout
+redis_queue_publish
+redis_queue_consume
+postgres_queue_fallback
+```
+
+回滚顺序：关闭 Redis read/consume，恢复 PostgreSQL read/claim；停止新 Redis 投影；
+保留 outbox 等待修复后重放。Redis 数据从不需要反向迁回 SQL。
+
+本设计完成的定义：
+
+1. 托管 Runtime 不再依赖 SQLite 具体类型或存储路径。
+2. PostgreSQL 是唯一权威状态源，并通过共用 contract tests。
+3. Worker 写入全部受 lease epoch 与 stream version fencing。
+4. Command/outbox 支持 claim、ack、visibility timeout 和 reclaim。
+5. Redis 可以被完全清空而不影响正确性。
+6. Redis 每项能力都有指标、开关、故障演练和 SQL fallback。
+7. 文档中的故障矩阵和容量门禁均有可复现测试证据。
