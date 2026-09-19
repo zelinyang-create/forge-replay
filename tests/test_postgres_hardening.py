@@ -6,10 +6,10 @@ from typing import Any, Self
 import pytest
 
 from forge_replay.control_plane.postgres import (
-    POSTGRES_SCHEMA,
     PostgresControlPlaneStore,
     RunVersionConflictError,
 )
+from forge_replay.persistence.postgres_schema import POSTGRES_RUNTIME_MIGRATIONS
 
 
 class FakeResult:
@@ -57,16 +57,20 @@ def make_store(connect: ScriptedConnect) -> PostgresControlPlaneStore:
     return PostgresControlPlaneStore("postgresql://unused", connect=connect)
 
 
-def test_schema_adds_visibility_claim_metadata_and_claimable_indexes():
-    normalized = " ".join(POSTGRES_SCHEMA.split()).lower()
-    assert "alter table run_commands add column if not exists claim_expires_at" in normalized
-    assert "alter table run_commands add column if not exists last_error_json" in normalized
-    assert "run_commands_ready_v2" in normalized
+def test_canonical_control_migration_owns_delivery_claims_and_indexes():
+    migration = next(
+        item
+        for item in POSTGRES_RUNTIME_MIGRATIONS
+        if item.name == "canonical_control_delivery"
+    )
+    normalized = " ".join(migration.statements).lower()
+    assert "claim_expires_at timestamptz" in normalized
+    assert "last_error_json jsonb" in normalized
+    assert "run_commands_ready" in normalized
     assert "where status = 'queued'" in normalized
-    assert "alter table run_outbox add column if not exists claimed_by" in normalized
-    assert "alter table run_outbox add column if not exists claim_expires_at" in normalized
-    assert "alter table run_outbox add column if not exists last_error_json" in normalized
     assert "run_outbox_claimable" in normalized
+    assert "alter table run_commands add column" not in normalized
+    assert "alter table run_outbox add column" not in normalized
 
 
 def test_command_claim_atomically_includes_expired_claims_and_sets_deadline():
@@ -91,6 +95,8 @@ def test_command_claim_atomically_includes_expired_claims_and_sets_deadline():
     assert "claim_expires_at <= clock_timestamp()" in sql
     assert "for update skip locked" in sql
     assert "make_interval(secs => %s)" in sql
+    assert "c.expected_stream_version" in sql
+    assert "c.payload_json" in sql
     assert params == ("tenant-a", 7, "worker-2", 45)
 
 
@@ -129,6 +135,8 @@ def test_outbox_claim_is_durable_and_publish_ack_is_owner_scoped():
     assert "claim_expires_at <= clock_timestamp()" in claim_sql
     assert "for update skip locked" in claim_sql
     assert "publish_attempts = publish_attempts + 1" in claim_sql
+    assert "o.dedupe_key" in claim_sql
+    assert "o.stream_version" in claim_sql
     assert claim_params == ("tenant-a", 100, "relay-1", 60)
     ack_sql, ack_params = connect.statement_containing("set published_at")
     assert "claimed_by = %s" in ack_sql
@@ -210,15 +218,17 @@ def test_worker_heartbeat_upserts_capabilities_and_preserves_draining_by_default
     store = make_store(connect)
 
     assert store.heartbeat_worker(
-        worker_id="worker-1", capabilities={"sandbox": True}
+        tenant_id="tenant-a", worker_id="worker-1", capabilities={"sandbox": True}
     ) == worker
-    assert store.set_worker_draining(worker_id="worker-1") is True
+    assert store.set_worker_draining(
+        tenant_id="tenant-a", worker_id="worker-1"
+    ) is True
 
     sql, params = connect.statement_containing("insert into worker_registry")
-    assert "on conflict (worker_id) do update" in sql
+    assert "on conflict (tenant_id, worker_id) do update" in sql
     assert "last_heartbeat_at = clock_timestamp()" in sql
     assert "coalesce(%s, worker_registry.draining)" in sql
-    assert params == ("worker-1", '{"sandbox":true}', None, None)
+    assert params == ("tenant-a", "worker-1", '{"sandbox":true}', None, None)
 
 
 @pytest.mark.parametrize("timeout", [0, 4, 3601])

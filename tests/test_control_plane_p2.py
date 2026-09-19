@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import time
 import uuid
 
@@ -13,18 +14,32 @@ from forge_replay.control_plane.api import (
     create_control_plane_app,
 )
 from forge_replay.control_plane.artifacts import LocalTenantCasStore
-from forge_replay.control_plane.postgres import (
-    POSTGRES_SCHEMA,
-    PostgresControlPlaneStore,
-)
+from forge_replay.control_plane.postgres import PostgresControlPlaneStore
+from forge_replay.persistence.postgres_schema import postgres_runtime_schema_sql
 
 
-def test_postgres_schema_contains_required_consistency_primitives():
-    normalized = " ".join(POSTGRES_SCHEMA.split()).lower()
-    assert "create table if not exists run_commands" in normalized
-    assert "create table if not exists run_outbox" in normalized
-    assert "enable row level security" in normalized
-    assert "primary key (tenant_id, run_id, seq)" in normalized
+def test_canonical_postgres_schema_declares_each_authority_table_once():
+    normalized = " ".join(postgres_runtime_schema_sql().split()).lower()
+    for table in (
+        "tenants",
+        "runs",
+        "run_events",
+        "api_idempotency_keys",
+        "run_commands",
+        "run_outbox",
+        "worker_registry",
+        "artifacts",
+        "artifact_refs",
+    ):
+        declarations = re.findall(
+            rf"create table(?: if not exists)? {table}\b",
+            normalized,
+        )
+        assert len(declarations) == 1, f"{table} must have one canonical declaration"
+
+    assert "primary key (tenant_id, event_id)" in normalized
+    assert "alter table run_commands add column" not in normalized
+    assert "alter table run_outbox add column" not in normalized
 
 
 def test_tenant_cas_is_isolated_and_checksum_verified(tmp_path):
@@ -86,17 +101,64 @@ def test_api_requires_identity_idempotency_and_tenant_scope():
     not os.getenv("FORGE_REPLAY_TEST_POSTGRES_DSN"), reason="PostgreSQL DSN not configured"
 )
 def test_postgres_migration_and_idempotent_create_integration():
-    store = PostgresControlPlaneStore(os.environ["FORGE_REPLAY_TEST_POSTGRES_DSN"])
+    dsn = os.environ["FORGE_REPLAY_TEST_POSTGRES_DSN"]
+    store = PostgresControlPlaneStore(dsn)
+    store.initialize()
     store.initialize()
     suffix = uuid.uuid4().hex
+    tenant_id = f"tenant-{suffix}"
+    run_id = f"run-{suffix}"
+    request = {
+        "task": "test canonical control plane",
+        "repository": f"/repo/{suffix}",
+        "base_sha": "a" * 40,
+        "actor_user_id": "integration-user",
+    }
     created = store.create_run(
-        tenant_id=f"tenant-{suffix}", run_id=f"run-{suffix}", idempotency_key="request-1",
-        request={"task": "test"}, command_id=f"command-{suffix}",
+        tenant_id=tenant_id, run_id=run_id, idempotency_key="request-1",
+        request=request, command_id=f"command-{suffix}",
         event_id=f"event-{suffix}", outbox_id=f"outbox-{suffix}",
     )
     replayed = store.create_run(
         tenant_id=created.tenant_id, run_id="ignored-on-replay", idempotency_key="request-1",
-        request={"task": "test"}, command_id="ignored", event_id="ignored", outbox_id="ignored",
+        request=request, command_id="ignored", event_id="ignored", outbox_id="ignored",
     )
+    recovered = PostgresControlPlaneStore(dsn)
+    run = recovered.get_run(tenant_id=tenant_id, run_id=run_id)
+    events = recovered.list_events(tenant_id=tenant_id, run_id=run_id)
+    commands = recovered.claim_commands(
+        tenant_id=tenant_id,
+        worker_id=f"worker-{suffix}",
+        limit=10,
+    )
+    outbox = recovered.claim_outbox(
+        tenant_id=tenant_id,
+        publisher_id=f"relay-{suffix}",
+    )
+
+    assert created.status == "queued"
+    assert created.stream_version == 2
     assert replayed.run_id == created.run_id
     assert replayed.replayed is True
+    assert run is not None
+    assert run["stream_version"] == 2
+    assert run["session_id"] == f"session-{run_id}"
+    assert run["turn_id"] == f"turn-{run_id}"
+    assert [event["seq"] for event in events] == [1, 2]
+    assert all("created_at" in event for event in events)
+    assert len(commands) == 1
+    assert commands[0]["expected_stream_version"] == 2
+    assert commands[0]["payload_json"]["run_id"] == run_id
+    assert recovered.acknowledge_command(
+        tenant_id=tenant_id,
+        command_id=commands[0]["command_id"],
+        worker_id=f"worker-{suffix}",
+    )
+    assert len(outbox) == 1
+    assert outbox[0]["stream_version"] == 2
+    assert outbox[0]["dedupe_key"] == f"create-run:{run_id}:2"
+    assert recovered.mark_outbox_published(
+        tenant_id=tenant_id,
+        outbox_id=outbox[0]["outbox_id"],
+        publisher_id=f"relay-{suffix}",
+    )

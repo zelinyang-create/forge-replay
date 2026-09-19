@@ -11,149 +11,21 @@ from typing import Any
 import psycopg
 from psycopg.rows import dict_row
 
+from forge_replay.domain import ExecutionStatus, RunPhase, WorkspaceDisposition
+from forge_replay.events import (
+    RunCreatedPayload,
+    RunPhaseChangedPayload,
+    SessionCreatedPayload,
+    UserMessageReceivedPayload,
+)
+from forge_replay.persistence.postgres_schema import (
+    apply_postgres_runtime_migrations,
+    postgres_runtime_schema_sql,
+)
+from forge_replay.persistence.postgres_store import PostgresRuntimeStore
 from forge_replay.ports import QueuedRunCommand
 
-POSTGRES_SCHEMA = """
-CREATE TABLE IF NOT EXISTS tenants (
-    tenant_id text PRIMARY KEY,
-    created_at timestamptz NOT NULL DEFAULT clock_timestamp()
-);
-CREATE TABLE IF NOT EXISTS runs (
-    tenant_id text NOT NULL REFERENCES tenants(tenant_id), run_id text NOT NULL,
-    status text NOT NULL, stream_version bigint NOT NULL DEFAULT 0,
-    lease_owner text, lease_epoch bigint NOT NULL DEFAULT 0, lease_expires_at timestamptz,
-    request_json jsonb NOT NULL, created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
-    updated_at timestamptz NOT NULL DEFAULT clock_timestamp(), PRIMARY KEY (tenant_id, run_id)
-);
-CREATE TABLE IF NOT EXISTS run_events (
-    tenant_id text NOT NULL, run_id text NOT NULL, seq bigint NOT NULL,
-    event_id text NOT NULL UNIQUE, event_type text NOT NULL, payload_json jsonb NOT NULL,
-    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
-    PRIMARY KEY (tenant_id, run_id, seq),
-    FOREIGN KEY (tenant_id, run_id) REFERENCES runs(tenant_id, run_id)
-);
-CREATE TABLE IF NOT EXISTS run_commands (
-    tenant_id text NOT NULL, command_id text NOT NULL, run_id text NOT NULL,
-    command_type text NOT NULL, available_at timestamptz NOT NULL,
-    status text NOT NULL DEFAULT 'queued', claimed_by text, claimed_at timestamptz,
-    claim_expires_at timestamptz, last_error_json jsonb,
-    attempt_count integer NOT NULL DEFAULT 0, PRIMARY KEY (tenant_id, command_id),
-    FOREIGN KEY (tenant_id, run_id) REFERENCES runs(tenant_id, run_id)
-);
-ALTER TABLE run_commands ADD COLUMN IF NOT EXISTS claim_expires_at timestamptz;
-ALTER TABLE run_commands ADD COLUMN IF NOT EXISTS last_error_json jsonb;
-CREATE INDEX IF NOT EXISTS run_commands_ready_v2
-    ON run_commands(tenant_id, available_at) WHERE status = 'queued';
-CREATE INDEX IF NOT EXISTS run_commands_expired_claims
-    ON run_commands(tenant_id, claim_expires_at) WHERE status = 'claimed';
-CREATE TABLE IF NOT EXISTS run_outbox (
-    tenant_id text NOT NULL, outbox_id text NOT NULL, run_id text NOT NULL,
-    destination text NOT NULL, payload_json jsonb NOT NULL,
-    created_at timestamptz NOT NULL DEFAULT clock_timestamp(), published_at timestamptz,
-    claimed_by text, claimed_at timestamptz, claim_expires_at timestamptz,
-    last_error_json jsonb,
-    publish_attempts integer NOT NULL DEFAULT 0, PRIMARY KEY (tenant_id, outbox_id),
-    FOREIGN KEY (tenant_id, run_id) REFERENCES runs(tenant_id, run_id)
-);
-ALTER TABLE run_outbox ADD COLUMN IF NOT EXISTS claimed_by text;
-ALTER TABLE run_outbox ADD COLUMN IF NOT EXISTS claimed_at timestamptz;
-ALTER TABLE run_outbox ADD COLUMN IF NOT EXISTS claim_expires_at timestamptz;
-ALTER TABLE run_outbox ADD COLUMN IF NOT EXISTS last_error_json jsonb;
-CREATE INDEX IF NOT EXISTS run_outbox_pending ON run_outbox(created_at)
-    WHERE published_at IS NULL;
-CREATE INDEX IF NOT EXISTS run_outbox_claimable
-    ON run_outbox(tenant_id, claim_expires_at, created_at) WHERE published_at IS NULL;
-CREATE TABLE IF NOT EXISTS api_idempotency_keys (
-    tenant_id text NOT NULL, idempotency_key text NOT NULL, operation text NOT NULL,
-    request_sha256 text NOT NULL, resource_id text NOT NULL, response_json jsonb NOT NULL,
-    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
-    PRIMARY KEY (tenant_id, idempotency_key, operation)
-);
-CREATE TABLE IF NOT EXISTS artifacts (
-    tenant_id text NOT NULL, sha256 text NOT NULL, size_bytes bigint NOT NULL,
-    media_type text NOT NULL, object_key text NOT NULL,
-    created_at timestamptz NOT NULL DEFAULT clock_timestamp(), PRIMARY KEY (tenant_id, sha256)
-);
-CREATE TABLE IF NOT EXISTS artifact_refs (
-    tenant_id text NOT NULL, run_id text NOT NULL, sha256 text NOT NULL, purpose text NOT NULL,
-    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
-    PRIMARY KEY (tenant_id, run_id, sha256, purpose),
-    FOREIGN KEY (tenant_id, run_id) REFERENCES runs(tenant_id, run_id),
-    FOREIGN KEY (tenant_id, sha256) REFERENCES artifacts(tenant_id, sha256)
-);
-CREATE TABLE IF NOT EXISTS workspace_snapshots (
-    tenant_id text NOT NULL, snapshot_id text NOT NULL, run_id text NOT NULL,
-    parent_snapshot_id text, base_commit_sha text NOT NULL, manifest_sha256 text NOT NULL,
-    workspace_root_hash text NOT NULL, created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
-    PRIMARY KEY (tenant_id, snapshot_id),
-    FOREIGN KEY (tenant_id, run_id) REFERENCES runs(tenant_id, run_id)
-);
-CREATE TABLE IF NOT EXISTS sandbox_jobs (
-    tenant_id text NOT NULL, sandbox_execution_id text NOT NULL, run_id text NOT NULL,
-    lease_epoch bigint NOT NULL, provider text NOT NULL, provider_handle text,
-    state text NOT NULL, attestation_json jsonb NOT NULL,
-    updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
-    PRIMARY KEY (tenant_id, sandbox_execution_id),
-    FOREIGN KEY (tenant_id, run_id) REFERENCES runs(tenant_id, run_id)
-);
-CREATE TABLE IF NOT EXISTS worker_registry (
-    worker_id text PRIMARY KEY, capabilities_json jsonb NOT NULL,
-    last_heartbeat_at timestamptz NOT NULL, draining boolean NOT NULL DEFAULT false
-);
-CREATE TABLE IF NOT EXISTS control_plane_generations (
-    cluster_id text PRIMARY KEY, active_region text NOT NULL, generation bigint NOT NULL,
-    promoted_at timestamptz NOT NULL DEFAULT clock_timestamp(), evidence_sha256 text NOT NULL
-);
-CREATE TABLE IF NOT EXISTS audit_anchors (
-    anchor_id text PRIMARY KEY, through_sequence bigint NOT NULL, chain_sha256 text NOT NULL,
-    kms_signature text NOT NULL, created_at timestamptz NOT NULL DEFAULT clock_timestamp()
-);
-CREATE TABLE IF NOT EXISTS deletion_tombstones (
-    tenant_id text NOT NULL, resource_type text NOT NULL, resource_id text NOT NULL,
-    deleted_at timestamptz NOT NULL, reason text NOT NULL,
-    PRIMARY KEY (tenant_id, resource_type, resource_id)
-);
-ALTER TABLE runs ENABLE ROW LEVEL SECURITY;
-ALTER TABLE run_events ENABLE ROW LEVEL SECURITY;
-ALTER TABLE run_commands ENABLE ROW LEVEL SECURITY;
-ALTER TABLE run_outbox ENABLE ROW LEVEL SECURITY;
-ALTER TABLE api_idempotency_keys ENABLE ROW LEVEL SECURITY;
-ALTER TABLE artifacts ENABLE ROW LEVEL SECURITY;
-ALTER TABLE artifact_refs ENABLE ROW LEVEL SECURITY;
-ALTER TABLE workspace_snapshots ENABLE ROW LEVEL SECURITY;
-ALTER TABLE sandbox_jobs ENABLE ROW LEVEL SECURITY;
-ALTER TABLE deletion_tombstones ENABLE ROW LEVEL SECURITY;
-DO $$ BEGIN CREATE POLICY tenant_runs ON runs
-    USING (tenant_id = current_setting('app.tenant_id', true));
-EXCEPTION WHEN duplicate_object THEN NULL; END $$;
-DO $$ BEGIN CREATE POLICY tenant_events ON run_events
-    USING (tenant_id = current_setting('app.tenant_id', true));
-EXCEPTION WHEN duplicate_object THEN NULL; END $$;
-DO $$ BEGIN CREATE POLICY tenant_commands ON run_commands
-    USING (tenant_id = current_setting('app.tenant_id', true));
-EXCEPTION WHEN duplicate_object THEN NULL; END $$;
-DO $$ BEGIN CREATE POLICY tenant_outbox ON run_outbox
-    USING (tenant_id = current_setting('app.tenant_id', true));
-EXCEPTION WHEN duplicate_object THEN NULL; END $$;
-DO $$ BEGIN CREATE POLICY tenant_idempotency ON api_idempotency_keys
-    USING (tenant_id = current_setting('app.tenant_id', true));
-EXCEPTION WHEN duplicate_object THEN NULL; END $$;
-DO $$ BEGIN CREATE POLICY tenant_artifacts ON artifacts
-    USING (tenant_id = current_setting('app.tenant_id', true));
-EXCEPTION WHEN duplicate_object THEN NULL; END $$;
-DO $$ BEGIN CREATE POLICY tenant_artifact_refs ON artifact_refs
-    USING (tenant_id = current_setting('app.tenant_id', true));
-EXCEPTION WHEN duplicate_object THEN NULL; END $$;
-DO $$ BEGIN CREATE POLICY tenant_snapshots ON workspace_snapshots
-    USING (tenant_id = current_setting('app.tenant_id', true));
-EXCEPTION WHEN duplicate_object THEN NULL; END $$;
-DO $$ BEGIN CREATE POLICY tenant_sandbox_jobs ON sandbox_jobs
-    USING (tenant_id = current_setting('app.tenant_id', true));
-EXCEPTION WHEN duplicate_object THEN NULL; END $$;
-DO $$ BEGIN CREATE POLICY tenant_tombstones ON deletion_tombstones
-    USING (tenant_id = current_setting('app.tenant_id', true));
-EXCEPTION WHEN duplicate_object THEN NULL; END $$;
-"""
+POSTGRES_SCHEMA = postgres_runtime_schema_sql()
 
 
 class IdempotencyConflictError(RuntimeError):
@@ -185,7 +57,7 @@ class PostgresControlPlaneStore:
 
     def initialize(self) -> None:
         with self.connect() as connection:
-            connection.execute(POSTGRES_SCHEMA)
+            apply_postgres_runtime_migrations(connection)
 
     def create_run(
         self, *, tenant_id: str, run_id: str, idempotency_key: str,
@@ -193,7 +65,24 @@ class PostgresControlPlaneStore:
     ) -> CreatedRun:
         request_json = _canonical_json(request)
         request_sha = hashlib.sha256(request_json.encode()).hexdigest()
-        response = {"run_id": run_id, "status": "queued", "stream_version": 1}
+        task = _required_request_text(request, "task")
+        repository = _required_request_text(request, "repository")
+        base_commit_sha = _required_request_text(request, "base_sha")
+        actor_user_id = _required_request_text(request, "actor_user_id")
+        session_id = f"session-{run_id}"
+        turn_id = f"turn-{run_id}"
+        process_instance_id = "control-plane-api"
+        config = {
+            "actor_user_id": actor_user_id,
+            "managed_by": "control-plane",
+        }
+        config_json = _canonical_json(config)
+        budget_limits: dict[str, int | float] = {}
+        runtime = PostgresRuntimeStore(
+            self.dsn,
+            tenant_id=tenant_id,
+            connect=self._connect,
+        )
         with self.connect() as connection:
             self._tenant(connection, tenant_id)
             connection.execute(
@@ -211,39 +100,193 @@ class PostgresControlPlaneStore:
                 saved = _json_object(existing["response_json"])
                 return CreatedRun(tenant_id, existing["resource_id"], saved["status"],
                                   int(saved["stream_version"]), True)
-            connection.execute("INSERT INTO tenants(tenant_id) VALUES (%s) ON CONFLICT DO NOTHING", (tenant_id,))
             connection.execute(
-                "INSERT INTO runs(tenant_id, run_id, status, stream_version, request_json) "
-                "VALUES (%s, %s, 'queued', 1, %s::jsonb)", (tenant_id, run_id, request_json),
+                "INSERT INTO tenants(tenant_id) VALUES (%s) ON CONFLICT DO NOTHING",
+                (tenant_id,),
             )
             connection.execute(
-                "INSERT INTO run_events(tenant_id, run_id, seq, event_id, event_type, payload_json) "
-                "VALUES (%s, %s, 1, %s, 'run_created', %s::jsonb)",
-                (tenant_id, run_id, event_id, request_json),
+                "INSERT INTO sessions(tenant_id, session_id, workspace_root, status, "
+                "config_json) VALUES (%s, %s, %s, 'active', %s::jsonb)",
+                (tenant_id, session_id, repository, config_json),
+            )
+            runtime._append_event_in_transaction(
+                connection,
+                session_id=session_id,
+                process_instance_id=process_instance_id,
+                payload=SessionCreatedPayload(
+                    workspace_root=repository,
+                    config_sha256=hashlib.sha256(config_json.encode()).hexdigest(),
+                ),
+            )
+            message_blob = runtime._put_blob_in_transaction(
+                connection,
+                content=task.encode("utf-8"),
+                media_type="text/plain; charset=utf-8",
             )
             connection.execute(
-                "INSERT INTO run_commands(tenant_id, command_id, run_id, command_type, available_at) "
-                "VALUES (%s, %s, %s, 'start', clock_timestamp())", (tenant_id, command_id, run_id),
+                "INSERT INTO turns(tenant_id, turn_id, session_id, user_event_id, status, "
+                "active_run_id) VALUES (%s, %s, %s, 'pending', 'active', %s)",
+                (tenant_id, turn_id, session_id, run_id),
+            )
+            user_event = runtime._append_event_in_transaction(
+                connection,
+                session_id=session_id,
+                turn_id=turn_id,
+                process_instance_id=process_instance_id,
+                payload=UserMessageReceivedPayload(
+                    message_blob_sha256=message_blob.sha256,
+                ),
             )
             connection.execute(
-                "INSERT INTO run_outbox(tenant_id, outbox_id, run_id, destination, payload_json) "
-                "VALUES (%s, %s, %s, 'run-events', %s::jsonb)",
-                (tenant_id, outbox_id, run_id, _canonical_json(response)),
+                "UPDATE turns SET user_event_id = %s WHERE tenant_id = %s AND turn_id = %s",
+                (str(user_event.event_id), tenant_id, turn_id),
+            )
+            connection.execute(
+                "INSERT INTO runs(tenant_id, run_id, turn_id, session_id, execution_status, "
+                "phase, workspace_disposition, base_repo_root, base_commit_sha, started_at, "
+                "budget_limits_json, budget_consumed_json) VALUES (%s, %s, %s, %s, %s, "
+                "NULL, %s, %s, %s, clock_timestamp(), %s::jsonb, '{}'::jsonb)",
+                (
+                    tenant_id,
+                    run_id,
+                    turn_id,
+                    session_id,
+                    ExecutionStatus.ACTIVE.value,
+                    WorkspaceDisposition.NONE.value,
+                    repository,
+                    base_commit_sha,
+                    _canonical_json(budget_limits),
+                ),
+            )
+            run_created = runtime._append_event_in_transaction(
+                connection,
+                session_id=session_id,
+                turn_id=turn_id,
+                run_id=run_id,
+                process_instance_id=process_instance_id,
+                causation_event_id=str(user_event.event_id),
+                correlation_id=run_id,
+                payload=RunCreatedPayload(
+                    base_repo_root=repository,
+                    base_commit_sha=base_commit_sha,
+                    budget_limits=budget_limits,
+                ),
+            )
+            phase_changed = runtime._append_event_in_transaction(
+                connection,
+                session_id=session_id,
+                turn_id=turn_id,
+                run_id=run_id,
+                process_instance_id=process_instance_id,
+                causation_event_id=str(run_created.event_id),
+                correlation_id=run_id,
+                payload=RunPhaseChangedPayload(
+                    previous_phase=None,
+                    next_phase=RunPhase.PREFLIGHTING,
+                    reason="run created",
+                ),
+            )
+            connection.execute(
+                "UPDATE runs SET phase = %s, updated_at = clock_timestamp() "
+                "WHERE tenant_id = %s AND run_id = %s",
+                (RunPhase.PREFLIGHTING.value, tenant_id, run_id),
+            )
+            stream_version = int(phase_changed.seq)
+            response = {
+                "run_id": run_id,
+                "status": "queued",
+                "stream_version": stream_version,
+            }
+            command_payload = {
+                "actor_user_id": actor_user_id,
+                "run_id": run_id,
+                "session_id": session_id,
+                "turn_id": turn_id,
+            }
+            connection.execute(
+                "INSERT INTO managed_run_requests(tenant_id, run_id, session_id, turn_id, "
+                "admission_event_key, request_sha256, request_json, actor_user_id, repository, "
+                "base_commit_sha) VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s)",
+                (
+                    tenant_id,
+                    run_id,
+                    session_id,
+                    turn_id,
+                    event_id,
+                    request_sha,
+                    request_json,
+                    actor_user_id,
+                    repository,
+                    base_commit_sha,
+                ),
+            )
+            connection.execute(
+                "INSERT INTO run_commands(tenant_id, command_id, run_id, command_type, "
+                "idempotency_key, expected_stream_version, payload_json, available_at) "
+                "VALUES (%s, %s, %s, 'start', %s, %s, %s::jsonb, clock_timestamp())",
+                (
+                    tenant_id,
+                    command_id,
+                    run_id,
+                    idempotency_key,
+                    stream_version,
+                    _canonical_json(command_payload),
+                ),
+            )
+            outbox_payload = {
+                **response,
+                "execution_status": ExecutionStatus.ACTIVE.value,
+                "latest_event_id": str(phase_changed.event_id),
+                "phase": RunPhase.PREFLIGHTING.value,
+                "session_id": session_id,
+                "turn_id": turn_id,
+            }
+            connection.execute(
+                "INSERT INTO run_outbox(tenant_id, outbox_id, run_id, destination, "
+                "dedupe_key, stream_version, payload_json) "
+                "VALUES (%s, %s, %s, 'run-events', %s, %s, %s::jsonb)",
+                (
+                    tenant_id,
+                    outbox_id,
+                    run_id,
+                    f"create-run:{run_id}:{stream_version}",
+                    stream_version,
+                    _canonical_json(outbox_payload),
+                ),
             )
             connection.execute(
                 "INSERT INTO api_idempotency_keys(tenant_id, idempotency_key, operation, "
-                "request_sha256, resource_id, response_json) "
-                "VALUES (%s, %s, 'create_run', %s, %s, %s::jsonb)",
-                (tenant_id, idempotency_key, request_sha, run_id, _canonical_json(response)),
+                "request_sha256, request_json, resource_id, response_json) "
+                "VALUES (%s, %s, 'create_run', %s, %s::jsonb, %s, %s::jsonb)",
+                (
+                    tenant_id,
+                    idempotency_key,
+                    request_sha,
+                    request_json,
+                    run_id,
+                    _canonical_json(response),
+                ),
             )
-        return CreatedRun(tenant_id, run_id, "queued", 1, False)
+        return CreatedRun(tenant_id, run_id, "queued", stream_version, False)
 
     def get_run(self, *, tenant_id: str, run_id: str) -> dict[str, Any] | None:
         with self.connect() as connection:
             self._tenant(connection, tenant_id)
             row = connection.execute(
-                "SELECT run_id, status, stream_version, request_json FROM runs "
-                "WHERE tenant_id = %s AND run_id = %s", (tenant_id, run_id),
+                "SELECT r.run_id, CASE "
+                "WHEN r.execution_status <> 'active' THEN r.execution_status "
+                "WHEN start_command.status = 'queued' THEN 'queued' "
+                "WHEN start_command.status = 'claimed' THEN 'starting' "
+                "ELSE COALESCE(r.phase, r.execution_status) END AS status, "
+                "r.execution_status, r.phase, r.stream_version, r.session_id, r.turn_id, "
+                "managed.request_json FROM runs r "
+                "JOIN managed_run_requests managed ON managed.tenant_id = r.tenant_id "
+                "AND managed.run_id = r.run_id "
+                "LEFT JOIN LATERAL (SELECT status FROM run_commands c "
+                "WHERE c.tenant_id = r.tenant_id AND c.run_id = r.run_id "
+                "AND c.command_type = 'start' ORDER BY c.created_at LIMIT 1) start_command "
+                "ON TRUE WHERE r.tenant_id = %s AND r.run_id = %s",
+                (tenant_id, run_id),
             ).fetchone()
             return dict(row) if row is not None else None
 
@@ -251,7 +294,9 @@ class PostgresControlPlaneStore:
         with self.connect() as connection:
             self._tenant(connection, tenant_id)
             rows = connection.execute(
-                "SELECT seq, event_id, event_type, payload_json, created_at FROM run_events "
+                "SELECT seq, event_id, event_type, payload_json, occurred_at, "
+                "occurred_at AS created_at, schema_version, process_instance_id, boot_id, "
+                "causation_event_id, correlation_id, writer_lease_epoch FROM run_events "
                 "WHERE tenant_id = %s AND run_id = %s AND seq > %s ORDER BY seq LIMIT 500",
                 (tenant_id, run_id, after),
             ).fetchall()
@@ -262,35 +307,9 @@ class PostgresControlPlaneStore:
         event_id: str, event_type: str, payload: dict[str, Any],
         command: QueuedRunCommand | None = None, outbox_id: str | None = None,
     ) -> int:
-        next_version = expected_stream_version + 1
-        with self.connect() as connection:
-            self._tenant(connection, tenant_id)
-            row = connection.execute(
-                "UPDATE runs SET status = %s, stream_version = stream_version + 1, "
-                "updated_at = clock_timestamp() WHERE tenant_id = %s AND run_id = %s "
-                "AND stream_version = %s RETURNING stream_version",
-                (status, tenant_id, run_id, expected_stream_version),
-            ).fetchone()
-            if row is None:
-                raise RunVersionConflictError("run stream version changed")
-            connection.execute(
-                "INSERT INTO run_events(tenant_id, run_id, seq, event_id, event_type, payload_json) "
-                "VALUES (%s, %s, %s, %s, %s, %s::jsonb)",
-                (tenant_id, run_id, next_version, event_id, event_type, _canonical_json(payload)),
-            )
-            if command is not None:
-                connection.execute(
-                    "INSERT INTO run_commands(tenant_id, command_id, run_id, command_type, available_at) "
-                    "VALUES (%s, %s, %s, %s, %s) ON CONFLICT (tenant_id, command_id) DO NOTHING",
-                    (tenant_id, command.command_id, run_id, command.command_type, command.available_at),
-                )
-            if outbox_id is not None:
-                connection.execute(
-                    "INSERT INTO run_outbox(tenant_id, outbox_id, run_id, destination, payload_json) "
-                    "VALUES (%s, %s, %s, 'run-events', %s::jsonb)",
-                    (tenant_id, outbox_id, run_id, _canonical_json(payload)),
-                )
-        return next_version
+        raise NotImplementedError(
+            "raw control-plane run advancement is disabled; use typed runtime operations"
+        )
 
     def claim_commands(
         self, *, tenant_id: str, worker_id: str, limit: int,
@@ -312,9 +331,10 @@ class PostgresControlPlaneStore:
                 "claim_expires_at = clock_timestamp() + make_interval(secs => %s), "
                 "last_error_json = CASE WHEN c.status = 'claimed' THEN "
                 "jsonb_build_object('reason', 'visibility_timeout') ELSE c.last_error_json END, "
-                "attempt_count = attempt_count + 1 "
+                "attempt_count = attempt_count + 1, updated_at = clock_timestamp() "
                 "FROM ready r WHERE c.tenant_id = r.tenant_id AND c.command_id = r.command_id "
-                "RETURNING c.tenant_id, c.command_id, c.run_id, c.command_type, c.available_at, "
+                "RETURNING c.tenant_id, c.command_id, c.run_id, c.command_type, "
+                "c.idempotency_key, c.expected_stream_version, c.payload_json, c.available_at, "
                 "c.claimed_by, c.claimed_at, c.claim_expires_at, c.attempt_count",
                 (tenant_id, limit, worker_id, visibility_timeout_seconds),
             ).fetchall()
@@ -332,7 +352,8 @@ class PostgresControlPlaneStore:
                 "ORDER BY claim_expires_at NULLS FIRST "
                 "FOR UPDATE SKIP LOCKED LIMIT %s) UPDATE run_commands c SET status = 'queued', "
                 "claimed_by = NULL, claimed_at = NULL, claim_expires_at = NULL, "
-                "last_error_json = jsonb_build_object('reason', 'visibility_timeout') "
+                "last_error_json = jsonb_build_object('reason', 'visibility_timeout'), "
+                "updated_at = clock_timestamp() "
                 "FROM expired e WHERE c.tenant_id = e.tenant_id AND c.command_id = e.command_id "
                 "RETURNING c.command_id",
                 (tenant_id, limit),
@@ -343,7 +364,8 @@ class PostgresControlPlaneStore:
         with self.connect() as connection:
             self._tenant(connection, tenant_id)
             row = connection.execute(
-                "UPDATE run_commands SET status = 'done', claim_expires_at = NULL "
+                "UPDATE run_commands SET status = 'done', claim_expires_at = NULL, "
+                "completed_at = clock_timestamp(), updated_at = clock_timestamp() "
                 "WHERE tenant_id = %s AND command_id = %s "
                 "AND status = 'claimed' AND claimed_by = %s RETURNING command_id",
                 (tenant_id, command_id, worker_id),
@@ -358,11 +380,12 @@ class PostgresControlPlaneStore:
         with self.connect() as connection:
             self._tenant(connection, tenant_id)
             rows = connection.execute(
-                "SELECT tenant_id, outbox_id, run_id, destination, payload_json FROM run_outbox "
+                "SELECT tenant_id, outbox_id, run_id, destination, dedupe_key, stream_version, "
+                "payload_json FROM run_outbox "
                 "WHERE tenant_id = %s AND published_at IS NULL "
                 "AND (claimed_by IS NULL OR claim_expires_at IS NULL "
                 "OR claim_expires_at <= clock_timestamp()) "
-                "ORDER BY created_at LIMIT %s",
+                "ORDER BY created_at, outbox_id LIMIT %s",
                 (tenant_id, limit),
             ).fetchall()
             return tuple(dict(row) for row in rows)
@@ -388,8 +411,9 @@ class PostgresControlPlaneStore:
                 "jsonb_build_object('reason', 'visibility_timeout') ELSE o.last_error_json END, "
                 "publish_attempts = publish_attempts + 1 FROM pending p "
                 "WHERE o.tenant_id = p.tenant_id AND o.outbox_id = p.outbox_id "
-                "RETURNING o.tenant_id, o.outbox_id, o.run_id, o.destination, o.payload_json, "
-                "o.claimed_by, o.claimed_at, o.claim_expires_at, o.publish_attempts",
+                "RETURNING o.tenant_id, o.outbox_id, o.run_id, o.destination, o.dedupe_key, "
+                "o.stream_version, o.payload_json, o.claimed_by, o.claimed_at, "
+                "o.claim_expires_at, o.publish_attempts",
                 (tenant_id, limit, publisher_id, visibility_timeout_seconds),
             ).fetchall()
             return tuple(dict(row) for row in rows)
@@ -418,7 +442,8 @@ class PostgresControlPlaneStore:
         with self.connect() as connection:
             self._tenant(connection, tenant_id)
             row = connection.execute(
-                "UPDATE run_outbox SET published_at = clock_timestamp(), claim_expires_at = NULL "
+                "UPDATE run_outbox SET published_at = clock_timestamp(), claimed_by = NULL, "
+                "claimed_at = NULL, claim_expires_at = NULL "
                 "WHERE tenant_id = %s AND outbox_id = %s AND published_at IS NULL "
                 "AND ((%s IS NULL AND claimed_by IS NULL) OR claimed_by = %s) "
                 "RETURNING outbox_id",
@@ -500,32 +525,37 @@ class PostgresControlPlaneStore:
             return row is not None
 
     def heartbeat_worker(
-        self, *, worker_id: str, capabilities: dict[str, Any],
+        self, *, tenant_id: str, worker_id: str, capabilities: dict[str, Any],
         draining: bool | None = None,
     ) -> dict[str, Any]:
         """Register or refresh observable worker presence; this is not a fencing lease."""
         self._validate_worker_id(worker_id)
         capabilities_json = _canonical_json(capabilities)
         with self.connect() as connection:
+            self._tenant(connection, tenant_id)
             row = connection.execute(
-                "INSERT INTO worker_registry(worker_id, capabilities_json, last_heartbeat_at, draining) "
-                "VALUES (%s, %s::jsonb, clock_timestamp(), COALESCE(%s, false)) "
-                "ON CONFLICT (worker_id) DO UPDATE SET "
+                "INSERT INTO worker_registry(tenant_id, worker_id, capabilities_json, "
+                "last_heartbeat_at, draining) "
+                "VALUES (%s, %s, %s::jsonb, clock_timestamp(), COALESCE(%s, false)) "
+                "ON CONFLICT (tenant_id, worker_id) DO UPDATE SET "
                 "capabilities_json = EXCLUDED.capabilities_json, "
                 "last_heartbeat_at = clock_timestamp(), "
                 "draining = COALESCE(%s, worker_registry.draining) "
-                "RETURNING worker_id, capabilities_json, last_heartbeat_at, draining",
-                (worker_id, capabilities_json, draining, draining),
+                "RETURNING tenant_id, worker_id, capabilities_json, last_heartbeat_at, draining",
+                (tenant_id, worker_id, capabilities_json, draining, draining),
             ).fetchone()
             return dict(row)
 
-    def set_worker_draining(self, *, worker_id: str, draining: bool = True) -> bool:
+    def set_worker_draining(
+        self, *, tenant_id: str, worker_id: str, draining: bool = True
+    ) -> bool:
         self._validate_worker_id(worker_id)
         with self.connect() as connection:
+            self._tenant(connection, tenant_id)
             row = connection.execute(
                 "UPDATE worker_registry SET draining = %s, last_heartbeat_at = clock_timestamp() "
-                "WHERE worker_id = %s RETURNING worker_id",
-                (draining, worker_id),
+                "WHERE tenant_id = %s AND worker_id = %s RETURNING worker_id",
+                (draining, tenant_id, worker_id),
             ).fetchone()
             return row is not None
 
@@ -534,25 +564,9 @@ class PostgresControlPlaneStore:
         expected_stream_version: int, status: str, event_id: str, event_type: str,
         payload: dict[str, Any],
     ) -> int:
-        next_version = expected_stream_version + 1
-        with self.connect() as connection:
-            self._tenant(connection, tenant_id)
-            row = connection.execute(
-                "UPDATE runs SET status = %s, stream_version = stream_version + 1, "
-                "updated_at = clock_timestamp() WHERE tenant_id = %s AND run_id = %s "
-                "AND lease_owner = %s AND lease_epoch = %s "
-                "AND lease_expires_at > clock_timestamp() AND stream_version = %s "
-                "RETURNING stream_version",
-                (status, tenant_id, run_id, worker_id, lease_epoch, expected_stream_version),
-            ).fetchone()
-            if row is None:
-                raise RunVersionConflictError("worker lease or stream version is stale")
-            connection.execute(
-                "INSERT INTO run_events(tenant_id, run_id, seq, event_id, event_type, payload_json) "
-                "VALUES (%s, %s, %s, %s, %s, %s::jsonb)",
-                (tenant_id, run_id, next_version, event_id, event_type, _canonical_json(payload)),
-            )
-        return next_version
+        raise NotImplementedError(
+            "raw worker run advancement is disabled; use typed runtime operations"
+        )
 
     @staticmethod
     def _tenant(connection, tenant_id: str) -> None:
@@ -590,4 +604,11 @@ def _json_object(value: Any) -> dict[str, Any]:
         value = json.loads(value)
     if not isinstance(value, dict):
         raise TypeError("expected JSON object")
+    return value
+
+
+def _required_request_text(request: dict[str, Any], field: str) -> str:
+    value = request.get(field)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"request.{field} must be a non-empty string")
     return value

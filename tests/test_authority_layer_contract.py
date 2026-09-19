@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import inspect
 import re
 from pathlib import Path
 
 import pytest
 
-from forge_replay.control_plane.postgres import (
-    POSTGRES_SCHEMA,
-    PostgresControlPlaneStore,
+from forge_replay.control_plane.postgres import PostgresControlPlaneStore
+from forge_replay.persistence.postgres_schema import (
+    POSTGRES_RUNTIME_MIGRATIONS,
+    postgres_runtime_schema_sql,
 )
 
 PLAN_PATH = (
@@ -19,12 +21,12 @@ PLAN_PATH = (
 
 
 def _normalized_sql() -> str:
-    return " ".join(POSTGRES_SCHEMA.lower().split())
+    return " ".join(postgres_runtime_schema_sql().lower().split())
 
 
 def _table_definition(table_name: str) -> str:
     match = re.search(
-        rf"create table if not exists {table_name} \((.*?)\);",
+        rf"create table(?: if not exists)? {table_name} \((.*?)\);",
         _normalized_sql(),
     )
     assert match is not None, f"missing PostgreSQL table: {table_name}"
@@ -33,14 +35,14 @@ def _table_definition(table_name: str) -> str:
 
 def _partial_indexes(table_name: str) -> list[tuple[str, str]]:
     return re.findall(
-        rf"create index if not exists \w+ on {table_name}\s*"
+        rf"create index(?: if not exists)? \w+ on {table_name}\s*"
         r"\(([^)]*)\)\s*where\s+([^;]+);",
         _normalized_sql(),
     )
 
 
 @pytest.mark.parametrize("table_name", ["run_commands", "run_outbox"])
-def test_delivery_tables_have_visibility_claim_metadata(table_name: str):
+def test_canonical_delivery_tables_have_visibility_claim_metadata(table_name: str):
     definition = _table_definition(table_name)
     for column in ("claimed_by", "claimed_at", "claim_expires_at", "last_error_json"):
         assert re.search(rf"\b{column}\b", definition), (
@@ -48,7 +50,7 @@ def test_delivery_tables_have_visibility_claim_metadata(table_name: str):
         )
 
 
-def test_delivery_tables_have_tenant_scoped_partial_work_indexes():
+def test_canonical_delivery_tables_have_tenant_scoped_partial_work_indexes():
     command_index = any(
         "tenant_id" in columns
         and "available_at" in columns
@@ -70,6 +72,26 @@ def test_delivery_tables_have_tenant_scoped_partial_work_indexes():
     )
 
 
+def test_control_delivery_is_one_versioned_extension_of_runtime_authority():
+    versions = [migration.version for migration in POSTGRES_RUNTIME_MIGRATIONS]
+    assert versions == list(range(1, len(versions) + 1))
+    control = next(
+        migration
+        for migration in POSTGRES_RUNTIME_MIGRATIONS
+        if migration.name == "canonical_control_delivery"
+    )
+    sql = " ".join(control.statements).lower()
+    for table in (
+        "api_idempotency_keys",
+        "run_commands",
+        "run_outbox",
+        "worker_registry",
+        "artifacts",
+        "artifact_refs",
+    ):
+        assert len(re.findall(rf"create table {table}\b", sql)) == 1
+
+
 @pytest.mark.parametrize(
     "method_name",
     [
@@ -84,6 +106,15 @@ def test_delivery_tables_have_tenant_scoped_partial_work_indexes():
 def test_postgres_store_exposes_phase_one_coordination_operations(method_name: str):
     operation = getattr(PostgresControlPlaneStore, method_name, None)
     assert callable(operation), f"PostgresControlPlaneStore must expose {method_name}()"
+
+
+@pytest.mark.parametrize("method_name", ["heartbeat_worker", "set_worker_draining"])
+def test_worker_registry_operations_require_explicit_tenant(method_name: str):
+    signature = inspect.signature(getattr(PostgresControlPlaneStore, method_name))
+    tenant = signature.parameters.get("tenant_id")
+    assert tenant is not None
+    assert tenant.kind is inspect.Parameter.KEYWORD_ONLY
+    assert tenant.default is inspect.Parameter.empty
 
 
 def test_authority_plan_keeps_redis_out_of_the_commit_boundary():
