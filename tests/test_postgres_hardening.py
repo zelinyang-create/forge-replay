@@ -97,6 +97,7 @@ def test_command_claim_atomically_includes_expired_claims_and_sets_deadline():
     assert "make_interval(secs => %s)" in sql
     assert "c.expected_stream_version" in sql
     assert "c.payload_json" in sql
+    assert "updated_at = clock_timestamp()" in sql
     assert params == ("tenant-a", 7, "worker-2", 45)
 
 
@@ -111,7 +112,181 @@ def test_explicit_command_reclaim_releases_only_expired_claims():
     assert "claim_expires_at <= clock_timestamp()" in sql
     assert "set status = 'queued'" in sql
     assert "claimed_by = null" in sql
+    assert "updated_at = clock_timestamp()" in sql
     assert params == ("tenant-a", 2)
+
+
+def test_command_claim_renewal_is_live_owner_fenced_without_incrementing_attempts():
+    claim = {
+        "tenant_id": "tenant-a",
+        "command_id": "command-1",
+        "run_id": "run-1",
+        "command_type": "start",
+        "claimed_by": "worker-1",
+        "claim_expires_at": "later",
+        "attempt_count": 3,
+    }
+    connect = ScriptedConnect([claim])
+
+    renewed = make_store(connect).renew_command_claim(
+        tenant_id="tenant-a",
+        command_id="command-1",
+        worker_id="worker-1",
+        visibility_timeout_seconds=45,
+    )
+
+    assert renewed == claim
+    sql, params = connect.statement_containing("update run_commands set claim_expires_at")
+    assert "make_interval(secs => %s)" in sql
+    assert "updated_at = clock_timestamp()" in sql
+    assert "attempt_count" not in sql.split(" where ", maxsplit=1)[0]
+    assert "status = 'claimed'" in sql
+    assert "claimed_by = %s" in sql
+    assert "claim_expires_at > clock_timestamp()" in sql
+    assert params == (45, "tenant-a", "command-1", "worker-1")
+
+
+def test_command_claim_renewal_rejects_stale_expired_or_wrong_owner():
+    connect = ScriptedConnect([])
+
+    with pytest.raises(RunVersionConflictError, match="claim.*stale|stale.*claim"):
+        make_store(connect).renew_command_claim(
+            tenant_id="tenant-a",
+            command_id="command-1",
+            worker_id="wrong-worker",
+        )
+
+    sql, _ = connect.statement_containing("update run_commands set claim_expires_at")
+    assert "status = 'claimed'" in sql
+    assert "claimed_by = %s" in sql
+    assert "claim_expires_at > clock_timestamp()" in sql
+
+
+def test_retryable_command_failure_requeues_with_delay_and_clears_claim():
+    connect = ScriptedConnect([{"command_id": "command-1"}])
+
+    failed = make_store(connect).fail_command(
+        tenant_id="tenant-a",
+        command_id="command-1",
+        worker_id="worker-1",
+        error={"class": "TemporaryError", "message": "retry later"},
+        retryable=True,
+        retry_delay_seconds=15,
+    )
+
+    assert failed is True
+    sql, params = connect.statement_containing("update run_commands set status = 'queued'")
+    assignments = sql.split(" where ", maxsplit=1)[0]
+    assert "available_at = clock_timestamp() + make_interval(secs => %s)" in assignments
+    assert "claimed_by = null" in assignments
+    assert "claimed_at = null" in assignments
+    assert "claim_expires_at = null" in assignments
+    assert "completed_at = null" in assignments
+    assert "last_error_json = %s::jsonb" in assignments
+    assert "updated_at = clock_timestamp()" in assignments
+    assert "status = 'claimed'" in sql
+    assert "claimed_by = %s" in sql
+    assert "claim_expires_at > clock_timestamp()" in sql
+    assert 15 in params
+    assert "tenant-a" in params
+    assert "command-1" in params
+    assert "worker-1" in params
+    assert any("TemporaryError" in str(value) for value in params)
+
+
+def test_permanent_command_failure_is_terminal_and_owner_fenced():
+    connect = ScriptedConnect([{"command_id": "command-1"}], [])
+    store = make_store(connect)
+
+    assert store.fail_command(
+        tenant_id="tenant-a",
+        command_id="command-1",
+        worker_id="worker-1",
+        error={"class": "InvalidCommand"},
+        retryable=False,
+    ) is True
+    assert store.fail_command(
+        tenant_id="tenant-a",
+        command_id="command-1",
+        worker_id="stale-worker",
+        error={"class": "InvalidCommand"},
+        retryable=False,
+    ) is False
+
+    sql, params = connect.statement_containing("update run_commands set status = 'failed'")
+    assignments = sql.split(" where ", maxsplit=1)[0]
+    assert "completed_at = clock_timestamp()" in assignments
+    assert "updated_at = clock_timestamp()" in assignments
+    assert "claimed_by = null" in assignments
+    assert "claimed_at = null" in assignments
+    assert "claim_expires_at = null" in assignments
+    assert "status = 'claimed'" in sql
+    assert "claimed_by = %s" in sql
+    assert "claim_expires_at > clock_timestamp()" in sql
+    assert "tenant-a" in params
+    assert "command-1" in params
+    assert "worker-1" in params
+
+
+@pytest.mark.parametrize("delay", [-1, 86401, True, 1.5])
+def test_invalid_command_retry_delay_fails_before_database_access(delay):
+    connect = ScriptedConnect()
+
+    with pytest.raises(ValueError, match="retry delay"):
+        make_store(connect).fail_command(
+            tenant_id="tenant-a",
+            command_id="command-1",
+            worker_id="worker-1",
+            error={"class": "TemporaryError"},
+            retryable=True,
+            retry_delay_seconds=delay,
+        )
+
+    assert connect.statements == []
+
+
+def test_permanent_command_failure_rejects_retry_delay_before_database_access():
+    connect = ScriptedConnect()
+
+    with pytest.raises(ValueError, match="permanent.*delay|delay.*permanent"):
+        make_store(connect).fail_command(
+            tenant_id="tenant-a",
+            command_id="command-1",
+            worker_id="worker-1",
+            error={"class": "InvalidCommand"},
+            retryable=False,
+            retry_delay_seconds=1,
+        )
+
+    assert connect.statements == []
+
+
+def test_command_acknowledgement_requires_a_live_owned_claim_and_sets_timestamps():
+    connect = ScriptedConnect([{"command_id": "command-1"}], [])
+    store = make_store(connect)
+
+    assert store.acknowledge_command(
+        tenant_id="tenant-a",
+        command_id="command-1",
+        worker_id="worker-1",
+    ) is True
+    assert store.acknowledge_command(
+        tenant_id="tenant-a",
+        command_id="command-1",
+        worker_id="stale-worker",
+    ) is False
+
+    sql, params = connect.statement_containing("set status = 'done'")
+    assignments = sql.split(" where ", maxsplit=1)[0]
+    assert "completed_at = clock_timestamp()" in assignments
+    assert "updated_at = clock_timestamp()" in assignments
+    assert "claimed_by = null" in assignments
+    assert "claimed_at = null" in assignments
+    assert "claim_expires_at = null" in assignments
+    assert "status = 'claimed'" in sql
+    assert "claimed_by = %s" in sql
+    assert "claim_expires_at > clock_timestamp()" in sql
+    assert params == ("tenant-a", "command-1", "worker-1")
 
 
 def test_outbox_claim_is_durable_and_publish_ack_is_owner_scoped():

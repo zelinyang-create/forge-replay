@@ -64,7 +64,14 @@ class PostgresControlPlaneStore:
         request: dict[str, Any], command_id: str, event_id: str, outbox_id: str,
     ) -> CreatedRun:
         request_json = _canonical_json(request)
-        request_sha = hashlib.sha256(request_json.encode()).hexdigest()
+        semantic_request = {
+            key: value
+            for key, value in request.items()
+            if key != "correlation_request_id"
+        }
+        request_sha = hashlib.sha256(
+            _canonical_json(semantic_request).encode()
+        ).hexdigest()
         task = _required_request_text(request, "task")
         repository = _required_request_text(request, "repository")
         base_commit_sha = _required_request_text(request, "base_sha")
@@ -340,6 +347,39 @@ class PostgresControlPlaneStore:
             ).fetchall()
             return tuple(dict(row) for row in rows)
 
+    def renew_command_claim(
+        self,
+        *,
+        tenant_id: str,
+        command_id: str,
+        worker_id: str,
+        visibility_timeout_seconds: int = 30,
+    ) -> dict[str, Any]:
+        """Extend one live command claim without incrementing its attempt count."""
+        self._validate_visibility_timeout(visibility_timeout_seconds)
+        with self.connect() as connection:
+            self._tenant(connection, tenant_id)
+            row = connection.execute(
+                "UPDATE run_commands SET claim_expires_at = clock_timestamp() + "
+                "make_interval(secs => %s), updated_at = clock_timestamp() "
+                "WHERE tenant_id = %s AND command_id = %s AND status = 'claimed' "
+                "AND claimed_by = %s AND claim_expires_at > clock_timestamp() "
+                "RETURNING tenant_id, command_id, run_id, command_type, idempotency_key, "
+                "expected_stream_version, payload_json, available_at, claimed_by, claimed_at, "
+                "claim_expires_at, attempt_count",
+                (
+                    visibility_timeout_seconds,
+                    tenant_id,
+                    command_id,
+                    worker_id,
+                ),
+            ).fetchone()
+            if row is None:
+                raise RunVersionConflictError(
+                    "command claim is stale, expired, or owned by another worker"
+                )
+            return dict(row)
+
     def reclaim_commands(self, *, tenant_id: str, limit: int = 100) -> int:
         """Release abandoned command claims so PostgreSQL remains a usable fallback queue."""
         self._validate_limit(limit)
@@ -364,12 +404,64 @@ class PostgresControlPlaneStore:
         with self.connect() as connection:
             self._tenant(connection, tenant_id)
             row = connection.execute(
-                "UPDATE run_commands SET status = 'done', claim_expires_at = NULL, "
+                "UPDATE run_commands SET status = 'done', claimed_by = NULL, "
+                "claimed_at = NULL, claim_expires_at = NULL, "
                 "completed_at = clock_timestamp(), updated_at = clock_timestamp() "
                 "WHERE tenant_id = %s AND command_id = %s "
-                "AND status = 'claimed' AND claimed_by = %s RETURNING command_id",
+                "AND status = 'claimed' AND claimed_by = %s "
+                "AND claim_expires_at > clock_timestamp() RETURNING command_id",
                 (tenant_id, command_id, worker_id),
             ).fetchone()
+            return row is not None
+
+    def fail_command(
+        self,
+        *,
+        tenant_id: str,
+        command_id: str,
+        worker_id: str,
+        error: dict[str, Any],
+        retryable: bool,
+        retry_delay_seconds: int = 0,
+    ) -> bool:
+        """Fail one live owner claim, optionally returning it to the durable queue."""
+        if not isinstance(error, dict):
+            raise TypeError("command error must be an object")
+        if not isinstance(retryable, bool):
+            raise TypeError("retryable must be a boolean")
+        self._validate_retry_delay(retry_delay_seconds)
+        if not retryable and retry_delay_seconds != 0:
+            raise ValueError("permanent command failure cannot have a retry delay")
+        error_json = _canonical_json(error)
+        with self.connect() as connection:
+            self._tenant(connection, tenant_id)
+            if retryable:
+                row = connection.execute(
+                    "UPDATE run_commands SET status = 'queued', available_at = "
+                    "clock_timestamp() + make_interval(secs => %s), claimed_by = NULL, "
+                    "claimed_at = NULL, claim_expires_at = NULL, last_error_json = %s::jsonb, "
+                    "completed_at = NULL, updated_at = clock_timestamp() "
+                    "WHERE tenant_id = %s AND command_id = %s AND status = 'claimed' "
+                    "AND claimed_by = %s AND claim_expires_at > clock_timestamp() "
+                    "RETURNING command_id",
+                    (
+                        retry_delay_seconds,
+                        error_json,
+                        tenant_id,
+                        command_id,
+                        worker_id,
+                    ),
+                ).fetchone()
+            else:
+                row = connection.execute(
+                    "UPDATE run_commands SET status = 'failed', claimed_by = NULL, "
+                    "claimed_at = NULL, claim_expires_at = NULL, "
+                    "last_error_json = %s::jsonb, completed_at = clock_timestamp(), "
+                    "updated_at = clock_timestamp() WHERE tenant_id = %s AND command_id = %s "
+                    "AND status = 'claimed' AND claimed_by = %s "
+                    "AND claim_expires_at > clock_timestamp() RETURNING command_id",
+                    (error_json, tenant_id, command_id, worker_id),
+                ).fetchone()
             return row is not None
 
     def pending_outbox(
@@ -583,6 +675,15 @@ class PostgresControlPlaneStore:
     def _validate_visibility_timeout(visibility_timeout_seconds: int) -> None:
         if not 5 <= visibility_timeout_seconds <= 3600:
             raise ValueError("visibility timeout must be between 5 and 3600 seconds")
+
+    @staticmethod
+    def _validate_retry_delay(retry_delay_seconds: int) -> None:
+        if (
+            isinstance(retry_delay_seconds, bool)
+            or not isinstance(retry_delay_seconds, int)
+            or not 0 <= retry_delay_seconds <= 86_400
+        ):
+            raise ValueError("retry delay must be an integer between 0 and 86400 seconds")
 
     @staticmethod
     def _validate_lease_ttl(ttl_seconds: int) -> None:

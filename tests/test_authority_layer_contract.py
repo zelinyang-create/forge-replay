@@ -97,6 +97,8 @@ def test_control_delivery_is_one_versioned_extension_of_runtime_authority():
     [
         "renew_worker_lease",
         "release_worker_lease",
+        "renew_command_claim",
+        "fail_command",
         "reclaim_commands",
         "claim_outbox",
         "reclaim_outbox",
@@ -115,6 +117,41 @@ def test_worker_registry_operations_require_explicit_tenant(method_name: str):
     assert tenant is not None
     assert tenant.kind is inspect.Parameter.KEYWORD_ONLY
     assert tenant.default is inspect.Parameter.empty
+
+
+@pytest.mark.parametrize(
+    ("method_name", "required_parameters"),
+    [
+        (
+            "renew_command_claim",
+            {
+                "tenant_id",
+                "command_id",
+                "worker_id",
+                "visibility_timeout_seconds",
+            },
+        ),
+        (
+            "fail_command",
+            {
+                "tenant_id",
+                "command_id",
+                "worker_id",
+                "error",
+                "retryable",
+                "retry_delay_seconds",
+            },
+        ),
+    ],
+)
+def test_command_claim_lifecycle_operations_are_explicit_keyword_contracts(
+    method_name: str,
+    required_parameters: set[str],
+):
+    signature = inspect.signature(getattr(PostgresControlPlaneStore, method_name))
+    parameters = {name: value for name, value in signature.parameters.items() if name != "self"}
+    assert set(parameters) == required_parameters
+    assert all(value.kind is inspect.Parameter.KEYWORD_ONLY for value in parameters.values())
 
 
 def test_authority_plan_keeps_redis_out_of_the_commit_boundary():

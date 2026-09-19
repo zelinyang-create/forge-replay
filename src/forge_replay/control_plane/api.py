@@ -104,15 +104,19 @@ def create_control_plane_app(service: ControlPlaneService, verifier: IdentityVer
     ):
         if not idempotency_key or len(idempotency_key) > 200:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "valid Idempotency-Key required")
-        request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
-        payload = {**body.model_dump(), "actor_user_id": identity.user_id}
+        correlation_request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
+        payload = {
+            **body.model_dump(),
+            "actor_user_id": identity.user_id,
+            "correlation_request_id": correlation_request_id,
+        }
         try:
             created = service.create_run(
                 tenant_id=identity.tenant_id,
                 run_id=f"run-{uuid.uuid4()}",
                 idempotency_key=idempotency_key,
                 request=payload,
-                command_id=f"command-{request_id}",
+                command_id=f"command-{uuid.uuid4()}",
                 event_id=f"event-{uuid.uuid4()}",
                 outbox_id=f"outbox-{uuid.uuid4()}",
             )

@@ -97,6 +97,37 @@ def test_api_requires_identity_idempotency_and_tenant_scope():
     assert run.json()["tenant_id"] == "tenant-a"
 
 
+def test_api_request_correlation_does_not_define_durable_command_identity():
+    verifier = HmacIdentityVerifier(b"a-secure-test-key")
+    token = verifier.issue(
+        AuthenticatedPrincipal("tenant-a", "user-a", ("developer",)),
+        expires_at=int(time.time()) + 60,
+    )
+    service = FakeService()
+    client = TestClient(create_control_plane_app(service, verifier))
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "X-Request-ID": "shared-correlation-id",
+    }
+
+    first = client.post(
+        "/v1/runs",
+        json={"task": "first", "repository": "repo-a", "base_sha": "a" * 40},
+        headers={**headers, "Idempotency-Key": "request-1"},
+    )
+    second = client.post(
+        "/v1/runs",
+        json={"task": "second", "repository": "repo-b", "base_sha": "b" * 40},
+        headers={**headers, "Idempotency-Key": "request-2"},
+    )
+
+    assert first.status_code == 202
+    assert second.status_code == 202
+    assert service.created[0]["command_id"] != service.created[1]["command_id"]
+    assert service.created[0]["request"]["correlation_request_id"] == "shared-correlation-id"
+    assert service.created[1]["request"]["correlation_request_id"] == "shared-correlation-id"
+
+
 @pytest.mark.skipif(
     not os.getenv("FORGE_REPLAY_TEST_POSTGRES_DSN"), reason="PostgreSQL DSN not configured"
 )
