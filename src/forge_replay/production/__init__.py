@@ -8,6 +8,7 @@ from forge_replay.production.active_index_read import (
     ActiveRunReadSource,
     ActiveRunSqlPage,
 )
+from forge_replay.production.active_index_ui import TenantRoutedActiveRunReader
 from forge_replay.production.event_stream import (
     GapFillingRunEventStream,
     RunEventStreamItem,
@@ -184,6 +185,7 @@ __all__ = [
     "ShadowRelayResult",
     "SignedPolicyEvaluator",
     "SubprocessCommandTransport",
+    "TenantRoutedActiveRunReader",
     "TenantRoutedUiStatusReader",
     "UnsafeHostExecutionProvider",
     "WorkspaceAgentExecutor",

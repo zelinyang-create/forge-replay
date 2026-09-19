@@ -21,6 +21,7 @@ from fastapi import FastAPI
 
 from forge_replay.control_plane.api import (
     HmacIdentityVerifier,
+    UIActiveRunReader,
     UIEventStream,
     UIStatusReader,
     create_control_plane_app,
@@ -30,6 +31,7 @@ from forge_replay.domain import ExecutionContext
 from forge_replay.persistence.object_store import BlobObjectUnavailableError
 from forge_replay.persistence.postgres_store import PostgresRuntimeStore
 from forge_replay.ports import BlobObjectStorePort
+from forge_replay.production.postgres_active_index import PostgresActiveRunSource
 from forge_replay.production.postgres_shadow import PostgresShadowProjectionSource
 from forge_replay.records import BlobPlacementPolicy
 
@@ -111,6 +113,17 @@ class PostgresAuthorityFactory:
             connect=self._connect,
         )
 
+    def active_run_source(self, tenant_id: str) -> PostgresActiveRunSource:
+        """Build a fresh authoritative active-list source for one tenant."""
+
+        if not isinstance(tenant_id, str) or not tenant_id.strip():
+            raise ValueError("tenant_id must not be empty")
+        return PostgresActiveRunSource(
+            self.config.dsn,
+            tenant_id=tenant_id,
+            connect=self._connect,
+        )
+
 
 def build_managed_control_plane(
     config: ManagedAuthorityConfig,
@@ -119,6 +132,7 @@ def build_managed_control_plane(
     object_store: BlobObjectStorePort | None = None,
     ui_status_reader: UIStatusReader | None = None,
     ui_event_stream: UIEventStream | None = None,
+    ui_active_run_reader: UIActiveRunReader | None = None,
 ) -> FastAPI:
     """Build a migrated PostgreSQL control plane or fail before serving."""
 
@@ -130,6 +144,8 @@ def build_managed_control_plane(
         optional_services["ui_status_reader"] = ui_status_reader
     if ui_event_stream is not None:
         optional_services["ui_event_stream"] = ui_event_stream
+    if ui_active_run_reader is not None:
+        optional_services["ui_active_run_reader"] = ui_active_run_reader
     return create_control_plane_app(
         factory.control_store(),
         verifier,

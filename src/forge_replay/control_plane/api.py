@@ -1,12 +1,16 @@
 """Minimal asynchronous multi-tenant Control Plane API."""
 
+import base64
+import binascii
 import hashlib
 import hmac
 import json
+import re
 import time
 import uuid
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Annotated, Any, Protocol
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
@@ -14,7 +18,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
-from starlette.responses import StreamingResponse
+from starlette.responses import JSONResponse, StreamingResponse
 
 from forge_replay.control_plane.postgres import IdempotencyConflictError
 
@@ -104,6 +108,19 @@ class UIEventStream(Protocol):
     ) -> AsyncIterator[Any]: ...
 
 
+class UIActiveRunReader(Protocol):
+    """Optional tenant-routed reader for the stale-tolerant active-run list."""
+
+    def list_active_runs(
+        self,
+        *,
+        tenant_id: str,
+        after_member: str | None = None,
+        limit: int = 100,
+        force_sql: bool = False,
+    ) -> Any: ...
+
+
 class CreateRunRequest(BaseModel):
     task: str = Field(min_length=1, max_length=20_000)
     repository: str = Field(min_length=1, max_length=2_000)
@@ -116,6 +133,7 @@ def create_control_plane_app(
     *,
     ui_status_reader: UIStatusReader | None = None,
     ui_event_stream: UIEventStream | None = None,
+    ui_active_run_reader: UIActiveRunReader | None = None,
 ) -> FastAPI:
     app = FastAPI(title="ForgeReplay Control Plane", version="1.0")
     bearer = HTTPBearer(auto_error=False)
@@ -166,6 +184,56 @@ def create_control_plane_app(
             "stream_version": created.stream_version,
             "idempotent_replay": created.replayed,
         }
+
+    @app.get("/v1/runs")
+    def list_active_runs(
+        identity: Annotated[AuthenticatedPrincipal, Depends(principal)],
+        cursor: str | None = None,
+        limit: Annotated[int, Query(ge=1, le=200)] = 100,
+        force_sql: bool = False,
+    ) -> JSONResponse:
+        if ui_active_run_reader is None:
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "active-run reader is not enabled",
+            )
+        try:
+            after_member = (
+                None if cursor is None else decode_active_run_cursor_token(cursor)
+            )
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_CONTENT,
+                "invalid active-run cursor",
+            ) from None
+        try:
+            result = ui_active_run_reader.list_active_runs(
+                tenant_id=identity.tenant_id,
+                after_member=after_member,
+                limit=limit,
+                force_sql=force_sql,
+            )
+        except Exception:  # noqa: BLE001 - do not expose Redis/PostgreSQL internals
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "active-run list unavailable",
+            ) from None
+        try:
+            payload = _serialize_active_run_result(
+                result,
+                tenant_id=identity.tenant_id,
+                after_member=after_member,
+                limit=limit,
+            )
+        except Exception:  # noqa: BLE001 - adapter details are not an API contract
+            raise HTTPException(
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+                "active-run reader returned invalid data",
+            ) from None
+        return JSONResponse(
+            content=jsonable_encoder(payload),
+            headers={"Cache-Control": "no-store"},
+        )
 
     @app.get("/v1/runs/{run_id}/status")
     def get_ui_status(
@@ -300,6 +368,162 @@ def create_control_plane_app(
 
 
 _MAX_EVENT_CURSOR = (1 << 63) - 1
+_ACTIVE_RUN_CURSOR_PREFIX = "ari1."
+_ACTIVE_RUN_CURSOR_PAYLOAD_RE = re.compile(r"[A-Za-z0-9_-]+\Z")
+_ACTIVE_RUN_SOURCES = frozenset({"postgres", "redis_candidates"})
+_ACTIVE_RUN_FALLBACK_REASONS = frozenset(
+    {
+        "index_disabled",
+        "force_sql",
+        "index_miss",
+        "index_unavailable",
+        "index_invalid",
+        "index_stale",
+    }
+)
+_NONTERMINAL_EXECUTION_STATUSES = frozenset({"active", "needs_attention"})
+
+
+def encode_active_run_cursor_token(raw_member: str) -> str:
+    """Encode one canonical internal member as an opaque public cursor token."""
+
+    if not isinstance(raw_member, str):
+        raise TypeError("raw active-run cursor must be a string")
+    _parse_active_run_member(raw_member)
+    payload = base64.urlsafe_b64encode(raw_member.encode("utf-8")).decode("ascii")
+    token = _ACTIVE_RUN_CURSOR_PREFIX + payload.rstrip("=")
+    if len(token) > 4096:
+        raise ValueError("active-run cursor token is too long")
+    return token
+
+
+def decode_active_run_cursor_token(token: str) -> str:
+    """Strictly decode and canonicalize an opaque public active-run cursor."""
+
+    if (
+        not isinstance(token, str)
+        or not token.isascii()
+        or not token.startswith(_ACTIVE_RUN_CURSOR_PREFIX)
+        or not 1 <= len(token) <= 4096
+    ):
+        raise ValueError("active-run cursor token is invalid")
+    payload = token[len(_ACTIVE_RUN_CURSOR_PREFIX) :]
+    if _ACTIVE_RUN_CURSOR_PAYLOAD_RE.fullmatch(payload) is None:
+        raise ValueError("active-run cursor token is invalid")
+    padding = "=" * (-len(payload) % 4)
+    try:
+        decoded = base64.b64decode(
+            payload + padding,
+            altchars=b"-_",
+            validate=True,
+        ).decode("utf-8")
+    except (binascii.Error, UnicodeDecodeError, ValueError) as exc:
+        raise ValueError("active-run cursor token is invalid") from exc
+    _parse_active_run_member(decoded)
+    if encode_active_run_cursor_token(decoded) != token:
+        raise ValueError("active-run cursor token is not canonical")
+    return decoded
+
+
+def _parse_active_run_member(value: object) -> tuple[datetime, str]:
+    # Delayed import prevents a module cycle while managed composition imports
+    # this API from inside the production package.
+    from forge_replay.production.redis_active_index import (
+        ActiveRunIndexProtocolError,
+        parse_active_run_cursor,
+    )
+
+    try:
+        return parse_active_run_cursor(value)
+    except ActiveRunIndexProtocolError as exc:
+        raise ValueError("active-run member is invalid") from exc
+
+
+def _serialize_active_run_result(
+    result: Any,
+    *,
+    tenant_id: str,
+    after_member: str | None,
+    limit: int,
+) -> dict[str, Any]:
+    source = _string_field(result, "source", enum_value=True)
+    fallback_reason = _optional_string_field(
+        result,
+        "fallback_reason",
+        enum_value=True,
+    )
+    if source not in _ACTIVE_RUN_SOURCES:
+        raise TypeError("active-run source is invalid")
+    if source == "redis_candidates" and fallback_reason is not None:
+        raise TypeError("Redis-candidate result cannot have a fallback reason")
+    if source == "postgres" and fallback_reason not in _ACTIVE_RUN_FALLBACK_REASONS:
+        raise TypeError("PostgreSQL result must have a known fallback reason")
+
+    items_value = _read_field(result, "items")
+    if isinstance(items_value, (str, bytes)) or not isinstance(items_value, Sequence):
+        raise TypeError("active-run items must be a sequence")
+    if len(items_value) > limit:
+        raise TypeError("active-run result exceeds the requested limit")
+
+    boundary = None if after_member is None else _parse_active_run_member(after_member)
+    previous = None if boundary is None else (boundary[0], boundary[1].encode("utf-8"))
+    seen: set[str] = set()
+    items: list[dict[str, Any]] = []
+    for item in items_value:
+        item_tenant_id = _string_field(item, "tenant_id")
+        run_id = _string_field(item, "run_id")
+        if item_tenant_id != tenant_id or len(run_id) > 512 or "\x00" in run_id:
+            raise TypeError("active-run item identity is invalid")
+        if run_id in seen:
+            raise TypeError("active-run result contains a duplicate run")
+        seen.add(run_id)
+        execution_status = _string_field(item, "execution_status", enum_value=True)
+        if execution_status not in _NONTERMINAL_EXECUTION_STATUSES:
+            raise TypeError("active-run result contains a terminal run")
+        phase = _optional_string_field(item, "phase")
+        stream_version = _non_negative_integer_field(item, "stream_version")
+        last_event_seq = _non_negative_integer_field(item, "last_event_seq")
+        if stream_version != last_event_seq:
+            raise TypeError("active-run item versions do not describe the same fact")
+        updated_at = _read_field(item, "updated_at")
+        if (
+            not isinstance(updated_at, datetime)
+            or updated_at.tzinfo is None
+            or updated_at.utcoffset() is None
+        ):
+            raise TypeError("active-run updated_at must be timezone-aware")
+        current = (updated_at, run_id.encode("utf-8"))
+        if previous is not None and current >= previous:
+            raise TypeError("active-run result is not in descending stable order")
+        previous = current
+        items.append(
+            {
+                "run_id": run_id,
+                "execution_status": execution_status,
+                "phase": phase,
+                "stream_version": stream_version,
+                "last_event_seq": last_event_seq,
+                "updated_at": updated_at,
+            }
+        )
+
+    next_member = _read_field(result, "next_after_member")
+    next_cursor = None
+    if next_member is not None:
+        if not items:
+            raise TypeError("an empty active-run result cannot continue")
+        cursor_updated_at, cursor_run_id = _parse_active_run_member(next_member)
+        last = items[-1]
+        if cursor_run_id != last["run_id"] or cursor_updated_at != last["updated_at"]:
+            raise TypeError("active-run continuation does not identify the last item")
+        next_cursor = encode_active_run_cursor_token(next_member)
+
+    return {
+        "items": items,
+        "next_cursor": next_cursor,
+        "source": source,
+        "fallback_reason": fallback_reason,
+    }
 
 
 def _parse_event_cursor(value: str, *, field: str, status_code: int) -> int:
