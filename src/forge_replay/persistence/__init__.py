@@ -1,6 +1,6 @@
-"""SQLite-backed durable event storage."""
+"""Durable runtime persistence adapters and shared contracts."""
 
-from forge_replay.persistence.store import (
+from forge_replay.persistence.contracts import (
     ApprovalConflictError,
     BlobLimits,
     BlobMetadataConflictError,
@@ -12,9 +12,10 @@ from forge_replay.persistence.store import (
     RunNotFoundError,
     RunStateConflictError,
     SessionNotFoundError,
-    SQLiteEventStore,
     ToolCallConflictError,
 )
+from forge_replay.persistence.postgres_store import PostgresRuntimeStore
+from forge_replay.persistence.store import SQLiteEventStore
 from forge_replay.records import (
     ApprovalRecord,
     BudgetReservationRecord,
@@ -45,6 +46,7 @@ __all__ = [
     "MigrationChecksumError",
     "ModelCallRecord",
     "PendingModelResponse",
+    "PostgresRuntimeStore",
     "RecoveredRun",
     "RunLease",
     "RunNotFoundError",

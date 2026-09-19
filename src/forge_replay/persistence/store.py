@@ -6,7 +6,7 @@ import hashlib
 import json
 import math
 import sqlite3
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -54,6 +54,20 @@ from forge_replay.events import (
     WorkspaceProvisioningStartedPayload,
     new_event,
 )
+from forge_replay.persistence.contracts import (
+    ApprovalConflictError,
+    BlobLimits,
+    BlobMetadataConflictError,
+    BlobQuotaExceededError,
+    BudgetLimitError,
+    LeaseConflictError,
+    LedgerIntegrityError,
+    MigrationChecksumError,
+    RunNotFoundError,
+    RunStateConflictError,
+    SessionNotFoundError,
+    ToolCallConflictError,
+)
 from forge_replay.persistence.schema import MIGRATIONS, SCHEMA_TABLE_SQL, Migration
 from forge_replay.records import (
     ApprovalRecord,
@@ -83,54 +97,6 @@ from forge_replay.runtime.tool_identity import (
 )
 
 
-class LedgerError(RuntimeError):
-    """Base class for durable ledger failures."""
-
-
-class SessionNotFoundError(LedgerError):
-    """Raised when an append targets a session that does not exist."""
-
-
-class LedgerIntegrityError(LedgerError):
-    """Raised when persisted event content fails its integrity check."""
-
-
-class MigrationChecksumError(LedgerError):
-    """Raised when an applied migration no longer matches its source."""
-
-
-class BlobQuotaExceededError(LedgerError):
-    """Raised before a blob would exceed a configured storage quota."""
-
-
-class BlobMetadataConflictError(LedgerIntegrityError):
-    """Raised when identical bytes are assigned conflicting durable metadata."""
-
-
-class RunNotFoundError(LedgerError):
-    """Raised when an operation targets a run that does not exist."""
-
-
-class RunStateConflictError(LedgerError):
-    """Raised when a command was based on a stale or terminal run projection."""
-
-
-class ToolCallConflictError(LedgerError):
-    """Raised when one model response ordinal is reused with different content."""
-
-
-class ApprovalConflictError(LedgerError):
-    """Raised when an approval decision is stale or contradicts a durable decision."""
-
-
-class BudgetLimitError(LedgerError):
-    """Raised when a reservation would exceed a run's durable budget."""
-
-
-class LeaseConflictError(LedgerError):
-    """Raised when another live worker owns the run lease."""
-
-
 class ClosingSQLiteConnection(sqlite3.Connection):
     """Make `with store.connect()` close the OS handle after commit or rollback."""
 
@@ -139,18 +105,6 @@ class ClosingSQLiteConnection(sqlite3.Connection):
             return super().__exit__(exc_type, exc_value, traceback)
         finally:
             self.close()
-
-
-@dataclass(frozen=True)
-class BlobLimits:
-    max_blob_bytes: int = 4 * 1024 * 1024
-    max_total_bytes: int = 64 * 1024 * 1024
-
-    def __post_init__(self) -> None:
-        if self.max_blob_bytes < 1:
-            raise ValueError("max_blob_bytes must be positive")
-        if self.max_total_bytes < self.max_blob_bytes:
-            raise ValueError("max_total_bytes must be at least max_blob_bytes")
 
 
 def canonical_json(value: Any) -> str:
