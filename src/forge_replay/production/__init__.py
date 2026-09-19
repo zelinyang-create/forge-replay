@@ -21,6 +21,12 @@ from forge_replay.production.model_gateway import BudgetLedger, ModelGateway
 from forge_replay.production.operations import AuditHashChain, GaReadinessGate
 from forge_replay.production.orchestration import MultiWorkerTakeoverCoordinator
 from forge_replay.production.policy import PolicyBundle, SignedPolicyEvaluator
+from forge_replay.production.postgres_shadow import PostgresShadowProjectionSource
+from forge_replay.production.redis_shadow import (
+    RedisShadowProjectionSink,
+    ShadowProjectionProtocolError,
+    ShadowProjectionUnavailableError,
+)
 from forge_replay.production.release_gate import ReleaseGate
 from forge_replay.production.sandbox import (
     ExecReceipt,
@@ -32,6 +38,16 @@ from forge_replay.production.sandbox import (
     SandboxSpec,
     SubprocessCommandTransport,
     UnsafeHostExecutionProvider,
+)
+from forge_replay.production.shadow_config import (
+    Phase2RedisFeatureFlags,
+    ShadowProjectionConfig,
+    ShadowProjectionTtlConfig,
+)
+from forge_replay.production.shadow_projection import (
+    ProjectionWriteResult,
+    ProjectionWriteStatus,
+    ShadowProjectionSnapshot,
 )
 from forge_replay.production.workspace_snapshot import (
     WorkspaceSnapshot,
@@ -56,8 +72,13 @@ __all__ = [
     "MultiWorkerTakeoverCoordinator",
     "OciGvisorExecutionProvider",
     "PermanentManagedRunError",
+    "Phase2RedisFeatureFlags",
     "PolicyBundle",
     "PostgresAuthorityFactory",
+    "PostgresShadowProjectionSource",
+    "ProjectionWriteResult",
+    "ProjectionWriteStatus",
+    "RedisShadowProjectionSink",
     "RegionalFailoverController",
     "ReleaseGate",
     "RetryableManagedRunError",
@@ -65,6 +86,11 @@ __all__ = [
     "SandboxHandle",
     "SandboxProcessSupervisor",
     "SandboxSpec",
+    "ShadowProjectionConfig",
+    "ShadowProjectionProtocolError",
+    "ShadowProjectionSnapshot",
+    "ShadowProjectionTtlConfig",
+    "ShadowProjectionUnavailableError",
     "SignedPolicyEvaluator",
     "SubprocessCommandTransport",
     "UnsafeHostExecutionProvider",
