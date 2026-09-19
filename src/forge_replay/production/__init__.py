@@ -1,6 +1,18 @@
 """Production boundary adapters for ForgeReplay."""
 
 from forge_replay.production.ha import RegionalFailoverController
+from forge_replay.production.managed import (
+    LeaseGuard,
+    ManagedAuthorityConfig,
+    ManagedLeaseLostError,
+    ManagedRunExecutor,
+    ManagedWorker,
+    ManagedWorkerConfig,
+    PermanentManagedRunError,
+    PostgresAuthorityFactory,
+    RetryableManagedRunError,
+    build_managed_control_plane,
+)
 from forge_replay.production.model_gateway import BudgetLedger, ModelGateway
 from forge_replay.production.operations import AuditHashChain, GaReadinessGate
 from forge_replay.production.orchestration import MultiWorkerTakeoverCoordinator
@@ -28,12 +40,21 @@ __all__ = [
     "ExecReceipt",
     "ExecRequest",
     "GaReadinessGate",
+    "LeaseGuard",
+    "ManagedAuthorityConfig",
+    "ManagedLeaseLostError",
+    "ManagedRunExecutor",
+    "ManagedWorker",
+    "ManagedWorkerConfig",
     "ModelGateway",
     "MultiWorkerTakeoverCoordinator",
     "OciGvisorExecutionProvider",
+    "PermanentManagedRunError",
     "PolicyBundle",
+    "PostgresAuthorityFactory",
     "RegionalFailoverController",
     "ReleaseGate",
+    "RetryableManagedRunError",
     "SandboxAttestation",
     "SandboxHandle",
     "SandboxProcessSupervisor",
@@ -43,4 +64,5 @@ __all__ = [
     "UnsafeHostExecutionProvider",
     "WorkspaceSnapshot",
     "WorkspaceSnapshotManager",
+    "build_managed_control_plane",
 ]
