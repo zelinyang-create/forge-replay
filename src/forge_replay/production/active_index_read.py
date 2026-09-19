@@ -267,7 +267,6 @@ class ActiveRunIndexReadService:
         )
         if (
             tuple(item.run_id for item in items) != run_ids
-            or candidate_page.next_after_member != next_after_member
             or any(
                 not _candidate_matches_snapshot(candidate, item)
                 for candidate, item in zip(candidates, items, strict=True)

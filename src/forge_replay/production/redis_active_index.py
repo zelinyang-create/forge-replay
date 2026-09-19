@@ -233,6 +233,14 @@ end
 
 local ordering = compare_decimal(incoming_version, stored['stream_version'])
 if ordering < 0 then
+    -- A rebuild resets only the ZSET and deliberately preserves version state.
+    -- Reapply the newer stored membership so an older SQL scan page cannot
+    -- leave a ready index missing a concurrently relayed active run.
+    if stored['index_member'] ~= '' then
+        redis.call('ZADD', KEYS[1], '0', stored['index_member'])
+    else
+        redis.call('ZREM', KEYS[1], ARGV[5])
+    end
     return {'stale', stored['stream_version']}
 end
 if ordering == 0 then
@@ -720,6 +728,12 @@ def parse_active_run_cursor(value: object) -> tuple[datetime, str]:
     return _EPOCH + timedelta(microseconds=int(timestamp_text)), run_id
 
 
+def active_run_cursor(*, updated_at: datetime, run_id: str) -> str:
+    """Encode the canonical cursor shared by Redis and PostgreSQL pagination."""
+
+    return _index_member(updated_at=updated_at, run_id=run_id)
+
+
 def _parse_decimal(value: str) -> int:
     if not value or not value.isascii() or not value.isdecimal():
         raise ActiveRunIndexProtocolError(
@@ -826,6 +840,7 @@ __all__ = [
     "ActiveRunIndexProtocolError",
     "ActiveRunIndexUnavailableError",
     "RedisActiveRunIndex",
+    "active_run_cursor",
     "active_run_index_key",
     "active_run_state_key",
     "parse_active_run_cursor",

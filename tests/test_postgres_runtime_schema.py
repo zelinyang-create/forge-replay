@@ -84,6 +84,7 @@ def test_migrations_are_contiguous_named_and_content_addressed():
         5,
         6,
         7,
+        8,
     ]
     assert all(migration.name for migration in POSTGRES_RUNTIME_MIGRATIONS)
     assert all(re.fullmatch(r"[0-9a-f]{64}", migration.checksum) for migration in POSTGRES_RUNTIME_MIGRATIONS)
@@ -128,7 +129,7 @@ def test_migration_runner_accepts_dict_rows_and_is_idempotent():
     connection = _MigrationConnection()
 
     apply_postgres_runtime_migrations(connection)
-    assert [version for version, _ in connection.applied] == [1, 2, 3, 4, 5, 6, 7]
+    assert [version for version, _ in connection.applied] == [1, 2, 3, 4, 5, 6, 7, 8]
 
     first_execution_count = len(connection.executed)
     apply_postgres_runtime_migrations(connection)

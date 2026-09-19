@@ -13,6 +13,10 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Protocol
 
+from forge_replay.production.redis_active_index import (
+    ActiveRunIndexProtocolError,
+    ActiveRunIndexUnavailableError,
+)
 from forge_replay.production.redis_fanout import RunFanoutPublishResult
 from forge_replay.production.redis_shadow import (
     ShadowProjectionProtocolError,
@@ -59,6 +63,21 @@ class RunEventHintPublisher(Protocol):
         self,
         snapshot: ShadowProjectionSnapshot,
     ) -> RunFanoutPublishResult: ...
+
+
+class ActiveRunIndexSink(Protocol):
+    """Narrow versioned writer/rebuild contract for the disposable run index."""
+
+    def write_snapshot(
+        self,
+        snapshot: ShadowProjectionSnapshot,
+        *,
+        terminal_ttl_seconds: int,
+    ) -> ProjectionWriteResult: ...
+
+    def reset_index(self, *, tenant_id: str) -> None: ...
+
+    def mark_ready(self, *, tenant_id: str) -> None: ...
 
 
 @dataclass(frozen=True)
@@ -118,6 +137,11 @@ class ShadowRelayResult:
     source_errors: int = 0
     sink_errors: int = 0
     protocol_errors: int = 0
+    active_index_applied: int = 0
+    active_index_stale: int = 0
+    active_index_duplicate: int = 0
+    active_index_conflicts: int = 0
+    active_index_errors: int = 0
     fanout_published: int = 0
     fanout_errors: int = 0
     fanout_subscriber_deliveries: int = 0
@@ -140,6 +164,13 @@ class ShadowRebuildResult:
     sink_errors: int = 0
     protocol_errors: int = 0
     pagination_errors: int = 0
+    active_index_reset: int = 0
+    active_index_ready: int = 0
+    active_index_applied: int = 0
+    active_index_stale: int = 0
+    active_index_duplicate: int = 0
+    active_index_conflicts: int = 0
+    active_index_errors: int = 0
     errors: tuple[ShadowRelayError, ...] = ()
 
 
@@ -158,6 +189,11 @@ class _RelayCounters:
     source_errors: int = 0
     sink_errors: int = 0
     protocol_errors: int = 0
+    active_index_applied: int = 0
+    active_index_stale: int = 0
+    active_index_duplicate: int = 0
+    active_index_conflicts: int = 0
+    active_index_errors: int = 0
     fanout_published: int = 0
     fanout_errors: int = 0
     fanout_subscriber_deliveries: int = 0
@@ -179,6 +215,11 @@ class _RelayCounters:
             source_errors=self.source_errors,
             sink_errors=self.sink_errors,
             protocol_errors=self.protocol_errors,
+            active_index_applied=self.active_index_applied,
+            active_index_stale=self.active_index_stale,
+            active_index_duplicate=self.active_index_duplicate,
+            active_index_conflicts=self.active_index_conflicts,
+            active_index_errors=self.active_index_errors,
             fanout_published=self.fanout_published,
             fanout_errors=self.fanout_errors,
             fanout_subscriber_deliveries=self.fanout_subscriber_deliveries,
@@ -199,6 +240,13 @@ class _RebuildCounters:
     sink_errors: int = 0
     protocol_errors: int = 0
     pagination_errors: int = 0
+    active_index_reset: int = 0
+    active_index_ready: int = 0
+    active_index_applied: int = 0
+    active_index_stale: int = 0
+    active_index_duplicate: int = 0
+    active_index_conflicts: int = 0
+    active_index_errors: int = 0
     errors: list[ShadowRelayError] = field(default_factory=list)
 
     def result(self) -> ShadowRebuildResult:
@@ -213,6 +261,13 @@ class _RebuildCounters:
             sink_errors=self.sink_errors,
             protocol_errors=self.protocol_errors,
             pagination_errors=self.pagination_errors,
+            active_index_reset=self.active_index_reset,
+            active_index_ready=self.active_index_ready,
+            active_index_applied=self.active_index_applied,
+            active_index_stale=self.active_index_stale,
+            active_index_duplicate=self.active_index_duplicate,
+            active_index_conflicts=self.active_index_conflicts,
+            active_index_errors=self.active_index_errors,
             errors=tuple(self.errors),
         )
 
@@ -232,6 +287,13 @@ class _StatusCounters(Protocol):
     conflicts: int
 
 
+class _ActiveIndexStatusCounters(Protocol):
+    active_index_applied: int
+    active_index_stale: int
+    active_index_duplicate: int
+    active_index_conflicts: int
+
+
 class ShadowProjectionRelay:
     """Relay one claimed PostgreSQL batch into the disposable Redis shadow."""
 
@@ -244,10 +306,22 @@ class ShadowProjectionRelay:
         projection_config: ShadowProjectionConfig,
         relay_config: ShadowRelayConfig,
         fanout_publisher: RunEventHintPublisher | None = None,
+        active_index_sink: ActiveRunIndexSink | None = None,
     ) -> None:
         if projection_config.features.redis_fanout and fanout_publisher is None:
             raise ValueError(
                 "Redis fanout is enabled but no run event hint publisher was provided"
+            )
+        if (
+            getattr(
+                projection_config.features,
+                "redis_active_index_write",
+                False,
+            )
+            and active_index_sink is None
+        ):
+            raise ValueError(
+                "Redis active-index writes are enabled but no index sink was provided"
             )
         self._outbox_store = outbox_store
         self._source = source
@@ -255,6 +329,7 @@ class ShadowProjectionRelay:
         self._projection_config = projection_config
         self._relay_config = relay_config
         self._fanout_publisher = fanout_publisher
+        self._active_index_sink = active_index_sink
 
     def run_once(self) -> ShadowRelayResult:
         """Claim and process at most one batch, isolating failures per row."""
@@ -428,6 +503,82 @@ class ShadowProjectionRelay:
                 )
                 continue
 
+            if getattr(
+                self._projection_config.features,
+                "redis_active_index_write",
+                False,
+            ):
+                index_sink = self._active_index_sink
+                if index_sink is None:  # pragma: no cover - constructor invariant
+                    counters.active_index_errors += 1
+                    counters.protocol_errors += 1
+                    counters.errors.append(
+                        _diagnostic(
+                            stage="active_index_protocol",
+                            error_type="MissingActiveRunIndexSink",
+                            tenant_id=tenant_id,
+                            run_id=run_id,
+                            outbox_id=outbox_id,
+                        )
+                    )
+                    continue
+                try:
+                    index_result = _write_active_index(
+                        sink=index_sink,
+                        projection_config=self._projection_config,
+                        snapshot=snapshot,
+                    )
+                except (ActiveRunIndexProtocolError, _RelayProtocolError) as exc:
+                    counters.active_index_errors += 1
+                    counters.protocol_errors += 1
+                    counters.errors.append(
+                        _error(
+                            stage="active_index_protocol",
+                            exc=exc,
+                            tenant_id=tenant_id,
+                            run_id=run_id,
+                            outbox_id=outbox_id,
+                        )
+                    )
+                    continue
+                except ActiveRunIndexUnavailableError as exc:
+                    counters.active_index_errors += 1
+                    counters.errors.append(
+                        _error(
+                            stage="active_index",
+                            exc=exc,
+                            tenant_id=tenant_id,
+                            run_id=run_id,
+                            outbox_id=outbox_id,
+                        )
+                    )
+                    continue
+                except Exception as exc:  # noqa: BLE001 - keep row retryable
+                    counters.active_index_errors += 1
+                    counters.errors.append(
+                        _error(
+                            stage="active_index",
+                            exc=exc,
+                            tenant_id=tenant_id,
+                            run_id=run_id,
+                            outbox_id=outbox_id,
+                        )
+                    )
+                    continue
+                _increment_active_index_status(counters, index_result.status)
+                if index_result.status is ProjectionWriteStatus.CONFLICT:
+                    counters.active_index_errors += 1
+                    counters.errors.append(
+                        _diagnostic(
+                            stage="active_index_conflict",
+                            error_type="ActiveRunIndexConflict",
+                            tenant_id=tenant_id,
+                            run_id=run_id,
+                            outbox_id=outbox_id,
+                        )
+                    )
+                    continue
+
             if self._projection_config.features.redis_fanout:
                 # The publisher is guaranteed by the constructor when fanout
                 # is enabled.  Keeping this guard explicit makes a corrupted
@@ -553,6 +704,7 @@ class ShadowProjectionRebuilder:
         sink: ShadowProjectionSink,
         projection_config: ShadowProjectionConfig,
         page_size: int = 100,
+        active_index_sink: ActiveRunIndexSink | None = None,
     ) -> None:
         self._tenant_id = _validate_identity(
             tenant_id,
@@ -569,6 +721,18 @@ class ShadowProjectionRebuilder:
         self._sink = sink
         self._projection_config = projection_config
         self._page_size = page_size
+        self._active_index_enabled = bool(
+            getattr(
+                projection_config.features,
+                "redis_active_index_write",
+                False,
+            )
+        )
+        if self._active_index_enabled and active_index_sink is None:
+            raise ValueError(
+                "Redis active-index writes are enabled but no index sink was provided"
+            )
+        self._active_index_sink = active_index_sink
 
     def run(self) -> ShadowRebuildResult:
         """Scan by a strictly advancing keyset cursor and write every snapshot."""
@@ -577,6 +741,44 @@ class ShadowProjectionRebuilder:
             return ShadowRebuildResult(disabled=True)
 
         counters = _RebuildCounters()
+        if self._active_index_enabled:
+            index_sink = self._active_index_sink
+            if index_sink is None:  # pragma: no cover - constructor invariant
+                counters.active_index_errors += 1
+                counters.protocol_errors += 1
+                counters.errors.append(
+                    _diagnostic(
+                        stage="active_index_reset_protocol",
+                        error_type="MissingActiveRunIndexSink",
+                        tenant_id=self._tenant_id,
+                    )
+                )
+                return counters.result()
+            try:
+                index_sink.reset_index(tenant_id=self._tenant_id)
+            except ActiveRunIndexProtocolError as exc:
+                counters.active_index_errors += 1
+                counters.protocol_errors += 1
+                counters.errors.append(
+                    _error(
+                        stage="active_index_reset_protocol",
+                        exc=exc,
+                        tenant_id=self._tenant_id,
+                    )
+                )
+                return counters.result()
+            except Exception as exc:  # noqa: BLE001 - failed reset forbids rebuild
+                counters.active_index_errors += 1
+                counters.errors.append(
+                    _error(
+                        stage="active_index_reset",
+                        exc=exc,
+                        tenant_id=self._tenant_id,
+                    )
+                )
+                return counters.result()
+            counters.active_index_reset += 1
+
         after: tuple[str, str] | None = None
         while True:
             try:
@@ -674,12 +876,108 @@ class ShadowProjectionRebuilder:
                             run_id=snapshot.run_id,
                         )
                     )
+                    continue
+
+                if self._active_index_enabled:
+                    index_sink = self._active_index_sink
+                    if index_sink is None:  # pragma: no cover - constructor invariant
+                        counters.active_index_errors += 1
+                        counters.protocol_errors += 1
+                        counters.errors.append(
+                            _diagnostic(
+                                stage="active_index_protocol",
+                                error_type="MissingActiveRunIndexSink",
+                                tenant_id=snapshot.tenant_id,
+                                run_id=snapshot.run_id,
+                            )
+                        )
+                        continue
+                    try:
+                        index_result = _write_active_index(
+                            sink=index_sink,
+                            projection_config=self._projection_config,
+                            snapshot=snapshot,
+                        )
+                    except (
+                        ActiveRunIndexProtocolError,
+                        _RelayProtocolError,
+                    ) as exc:
+                        counters.active_index_errors += 1
+                        counters.protocol_errors += 1
+                        counters.errors.append(
+                            _error(
+                                stage="active_index_protocol",
+                                exc=exc,
+                                tenant_id=snapshot.tenant_id,
+                                run_id=snapshot.run_id,
+                            )
+                        )
+                        continue
+                    except Exception as exc:  # noqa: BLE001 - keep scanning unready
+                        counters.active_index_errors += 1
+                        counters.errors.append(
+                            _error(
+                                stage="active_index",
+                                exc=exc,
+                                tenant_id=snapshot.tenant_id,
+                                run_id=snapshot.run_id,
+                            )
+                        )
+                        continue
+                    _increment_active_index_status(counters, index_result.status)
+                    if index_result.status is ProjectionWriteStatus.CONFLICT:
+                        counters.active_index_errors += 1
+                        counters.errors.append(
+                            _diagnostic(
+                                stage="active_index_conflict",
+                                error_type="ActiveRunIndexConflict",
+                                tenant_id=snapshot.tenant_id,
+                                run_id=snapshot.run_id,
+                            )
+                        )
 
             # The final key was checked against the prior cursor before writes,
             # so a misbehaving source cannot keep this loop on the same page.
             after = next_after
             if len(page) < self._page_size:
                 break
+
+        if self._active_index_enabled and not counters.errors:
+            index_sink = self._active_index_sink
+            if index_sink is None:  # pragma: no cover - constructor invariant
+                counters.active_index_errors += 1
+                counters.protocol_errors += 1
+                counters.errors.append(
+                    _diagnostic(
+                        stage="active_index_ready_protocol",
+                        error_type="MissingActiveRunIndexSink",
+                        tenant_id=self._tenant_id,
+                    )
+                )
+            else:
+                try:
+                    index_sink.mark_ready(tenant_id=self._tenant_id)
+                except ActiveRunIndexProtocolError as exc:
+                    counters.active_index_errors += 1
+                    counters.protocol_errors += 1
+                    counters.errors.append(
+                        _error(
+                            stage="active_index_ready_protocol",
+                            exc=exc,
+                            tenant_id=self._tenant_id,
+                        )
+                    )
+                except Exception as exc:  # noqa: BLE001 - index remains unready
+                    counters.active_index_errors += 1
+                    counters.errors.append(
+                        _error(
+                            stage="active_index_ready",
+                            exc=exc,
+                            tenant_id=self._tenant_id,
+                        )
+                    )
+                else:
+                    counters.active_index_ready += 1
 
         return counters.result()
 
@@ -753,10 +1051,49 @@ def _write_projection(
 ) -> ProjectionWriteResult:
     ttl_seconds = projection_config.ttl.for_snapshot(snapshot)
     result = sink.write_projection(snapshot, ttl_seconds=ttl_seconds)
+    return _validate_write_result(
+        result,
+        snapshot=snapshot,
+        operation="write_projection",
+    )
+
+
+def _write_active_index(
+    *,
+    sink: ActiveRunIndexSink,
+    projection_config: ShadowProjectionConfig,
+    snapshot: ShadowProjectionSnapshot,
+) -> ProjectionWriteResult:
+    result = sink.write_snapshot(
+        snapshot,
+        terminal_ttl_seconds=projection_config.ttl.terminal_seconds,
+    )
+    return _validate_write_result(
+        result,
+        snapshot=snapshot,
+        operation="active-index write",
+    )
+
+
+def _validate_write_result(
+    result: object,
+    *,
+    snapshot: ShadowProjectionSnapshot,
+    operation: str,
+) -> ProjectionWriteResult:
     if not isinstance(result, ProjectionWriteResult):
-        raise _RelayProtocolError("write_projection returned an invalid result")
+        raise _RelayProtocolError(f"{operation} returned an invalid result")
     if result.incoming_version != snapshot.stream_version:
-        raise _RelayProtocolError("write result refers to a different incoming version")
+        raise _RelayProtocolError(
+            f"{operation} result refers to a different incoming version"
+        )
+    if result.status not in {
+        ProjectionWriteStatus.APPLIED,
+        ProjectionWriteStatus.STALE,
+        ProjectionWriteStatus.DUPLICATE,
+        ProjectionWriteStatus.CONFLICT,
+    }:
+        raise _RelayProtocolError(f"{operation} result contains an unknown status")
     if result.status is ProjectionWriteStatus.APPLIED:
         valid_version = result.stored_version == result.incoming_version
     elif result.status is ProjectionWriteStatus.STALE:
@@ -764,7 +1101,7 @@ def _write_projection(
     else:
         valid_version = result.stored_version == result.incoming_version
     if not valid_version:
-        raise _RelayProtocolError("write result contains inconsistent versions")
+        raise _RelayProtocolError(f"{operation} result contains inconsistent versions")
     return result
 
 
@@ -782,6 +1119,22 @@ def _increment_status(
         counters.conflicts += 1
     else:  # pragma: no cover - enum exhaustiveness guard
         raise _RelayProtocolError("write result contains an unknown status")
+
+
+def _increment_active_index_status(
+    counters: _ActiveIndexStatusCounters,
+    status: ProjectionWriteStatus,
+) -> None:
+    if status is ProjectionWriteStatus.APPLIED:
+        counters.active_index_applied += 1
+    elif status is ProjectionWriteStatus.STALE:
+        counters.active_index_stale += 1
+    elif status is ProjectionWriteStatus.DUPLICATE:
+        counters.active_index_duplicate += 1
+    elif status is ProjectionWriteStatus.CONFLICT:
+        counters.active_index_conflicts += 1
+    else:  # pragma: no cover - enum exhaustiveness guard
+        raise _RelayProtocolError("active-index result contains an unknown status")
 
 
 def _error(
@@ -835,6 +1188,7 @@ def _validate_identity(value: object, *, field_name: str, maximum: int) -> str:
 
 __all__ = [
     "RUN_PROJECTION_DESTINATION",
+    "ActiveRunIndexSink",
     "RunEventHintPublisher",
     "ShadowOutboxStore",
     "ShadowProjectionRebuilder",

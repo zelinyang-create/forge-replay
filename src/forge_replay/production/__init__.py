@@ -35,6 +35,7 @@ from forge_replay.production.operations import AuditHashChain, GaReadinessGate
 from forge_replay.production.orchestration import MultiWorkerTakeoverCoordinator
 from forge_replay.production.outbox_relay import (
     RUN_PROJECTION_DESTINATION,
+    ActiveRunIndexSink,
     ShadowProjectionRebuilder,
     ShadowProjectionRelay,
     ShadowRebuildResult,
@@ -42,6 +43,7 @@ from forge_replay.production.outbox_relay import (
     ShadowRelayResult,
 )
 from forge_replay.production.policy import PolicyBundle, SignedPolicyEvaluator
+from forge_replay.production.postgres_active_index import PostgresActiveRunSource
 from forge_replay.production.postgres_shadow import PostgresShadowProjectionSource
 from forge_replay.production.redis_active_index import (
     ActiveRunIndexEntry,
@@ -49,6 +51,7 @@ from forge_replay.production.redis_active_index import (
     ActiveRunIndexProtocolError,
     ActiveRunIndexUnavailableError,
     RedisActiveRunIndex,
+    active_run_cursor,
 )
 from forge_replay.production.redis_fanout import (
     RedisRunEventHintPublisher,
@@ -112,6 +115,7 @@ __all__ = [
     "ActiveRunIndexPage",
     "ActiveRunIndexProtocolError",
     "ActiveRunIndexReadService",
+    "ActiveRunIndexSink",
     "ActiveRunIndexUnavailableError",
     "ActiveRunReadProtocolError",
     "ActiveRunReadResult",
@@ -139,6 +143,7 @@ __all__ = [
     "Phase2RedisFeatureFlags",
     "Phase3RedisFeatureFlags",
     "PolicyBundle",
+    "PostgresActiveRunSource",
     "PostgresAuthorityFactory",
     "PostgresShadowProjectionSource",
     "ProjectionWriteResult",
@@ -185,6 +190,7 @@ __all__ = [
     "WorkspaceControllerFactory",
     "WorkspaceSnapshot",
     "WorkspaceSnapshotManager",
+    "active_run_cursor",
     "build_managed_control_plane",
     "fanout_channel",
 ]

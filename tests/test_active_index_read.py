@@ -393,6 +393,28 @@ def test_candidate_ids_are_tenant_scoped_then_verified_by_sql() -> None:
     ]
 
 
+def test_final_redis_page_does_not_depend_on_sql_candidate_page_has_more_hint() -> None:
+    value = snapshot("run-final")
+    source = FakeSource()
+    # A candidate-limited SQL query cannot know whether Redis has another
+    # page. Its local continuation hint must not override the verified Redis
+    # page boundary.
+    source.candidate_page = ActiveRunSqlPage(
+        (value,),
+        cursor("run-final"),
+    )
+    index = FakeIndex(CandidatePage((candidate(value),), None))
+
+    result = service(source, index).list_active_runs(
+        tenant_id="tenant-a",
+        limit=1,
+    )
+
+    assert result.source is ActiveRunReadSource.REDIS_CANDIDATES
+    assert result.items == (value,)
+    assert result.next_after_member is None
+
+
 def test_stale_terminal_or_missing_candidate_reloads_the_whole_sql_page() -> None:
     source = FakeSource()
     source.candidate_page = ActiveRunSqlPage((snapshot("run-still-active"),), None)

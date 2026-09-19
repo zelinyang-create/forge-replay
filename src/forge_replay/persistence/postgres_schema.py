@@ -727,6 +727,22 @@ POSTGRES_RUNTIME_MIGRATIONS = (
             """,
         ),
     ),
+    PostgresMigration(
+        version=8,
+        name="active_run_keyset_index",
+        statements=(
+            """
+            CREATE INDEX runs_nonterminal_updated
+            ON runs (
+                tenant_id,
+                updated_at DESC,
+                run_id COLLATE "C" DESC
+            )
+            INCLUDE (execution_status, phase, stream_version, last_event_seq)
+            WHERE execution_status IN ('active', 'needs_attention')
+            """,
+        ),
+    ),
 )
 
 

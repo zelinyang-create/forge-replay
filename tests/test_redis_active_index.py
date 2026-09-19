@@ -107,6 +107,12 @@ class FakeRedis:
             incoming_number = int(incoming_version)
             stored_number = int(stored_version)
             if incoming_number < stored_number:
+                self._apply_membership(
+                    index_key=index_key,
+                    old_member="",
+                    new_member=stored["index_member"],
+                    is_indexed=bool(stored["index_member"]),
+                )
                 return [b"stale", stored_version.encode()]
             if incoming_number == stored_number:
                 if stored["canonical_sha256"] != incoming_hash:
@@ -311,6 +317,23 @@ def test_reset_hides_partial_rebuild_until_marked_ready():
     index.mark_ready(tenant_id=value.tenant_id)
     page = index.read_page(tenant_id=value.tenant_id)
     assert page is not None and page.run_ids == (value.run_id,)
+
+
+def test_stale_rebuild_replays_newer_stored_membership_after_reset():
+    _, index = ready_index()
+    newer = snapshot(version=9)
+    older = snapshot(version=8)
+    index.write_snapshot(newer)
+    index.reset_index(tenant_id=newer.tenant_id)
+
+    result = index.write_snapshot(older)
+    index.mark_ready(tenant_id=newer.tenant_id)
+
+    assert result.status is ProjectionWriteStatus.STALE
+    page = index.read_page(tenant_id=newer.tenant_id)
+    assert page is not None
+    assert page.run_ids == (newer.run_id,)
+    assert page.items[0].stream_version == newer.stream_version
 
 
 def test_lexicographic_pagination_is_stable_and_exclusive():
