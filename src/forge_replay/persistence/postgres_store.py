@@ -2581,7 +2581,48 @@ class PostgresRuntimeStore:
             if run_cursor.rowcount != 1:
                 raise RunStateConflictError("run stream version changed during append")
             self._apply_operational_projection_in_transaction(connection, event)
+            self._insert_run_projection_outbox_in_transaction(connection, event)
         return event
+
+    def _insert_run_projection_outbox_in_transaction(
+        self,
+        connection: Any,
+        event: EventEnvelope,
+    ) -> None:
+        """Publish a minimal, versioned projection hint in the event transaction."""
+        if event.run_id is None or event.seq < 1:
+            raise LedgerIntegrityError(
+                "run projection outbox requires a run-local event"
+            )
+        event_id = str(event.event_id)
+        payload = {
+            "kind": "run_projection_changed",
+            "outbox_schema_version": 1,
+            "tenant_id": self.tenant_id,
+            "run_id": event.run_id,
+            "stream_version": event.seq,
+            "source_event_id": event_id,
+            "source_event_type": event.event_type.value,
+            "source_event_schema_version": event.schema_version,
+            "source_event_occurred_at": event.occurred_at.isoformat(),
+        }
+        connection.execute(
+            """
+            INSERT INTO run_outbox(
+                tenant_id, outbox_id, run_id, destination, dedupe_key,
+                stream_version, source_event_id, payload_json
+            ) VALUES (%s, %s, %s, 'run-projection-v1', %s, %s, %s, %s::jsonb)
+            """,
+            (
+                self.tenant_id,
+                f"run-projection-v1:{event_id}",
+                event.run_id,
+                f"run-projection-v1:{event.run_id}:{event.seq}",
+                event.seq,
+                event_id,
+                canonical_json(payload),
+            ),
+        )
 
     def _apply_operational_projection_in_transaction(
         self,

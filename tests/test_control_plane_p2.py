@@ -39,7 +39,8 @@ def test_canonical_postgres_schema_declares_each_authority_table_once():
 
     assert "primary key (tenant_id, event_id)" in normalized
     assert "alter table run_commands add column" not in normalized
-    assert "alter table run_outbox add column" not in normalized
+    assert "alter table run_outbox add column claimed_by" not in normalized
+    assert normalized.count("alter table run_outbox add column source_event_id text") == 1
 
 
 def test_tenant_cas_is_isolated_and_checksum_verified(tmp_path):
@@ -93,6 +94,7 @@ def test_api_requires_identity_idempotency_and_tenant_scope():
     assert response.status_code == 202
     assert service.created[0]["tenant_id"] == "tenant-a"
     assert service.created[0]["request"]["actor_user_id"] == "user-a"
+    assert "outbox_id" not in service.created[0]
     run = client.get("/v1/runs/run-stable", headers=headers)
     assert run.json()["tenant_id"] == "tenant-a"
 
@@ -124,6 +126,8 @@ def test_api_request_correlation_does_not_define_durable_command_identity():
     assert first.status_code == 202
     assert second.status_code == 202
     assert service.created[0]["command_id"] != service.created[1]["command_id"]
+    assert "outbox_id" not in service.created[0]
+    assert "outbox_id" not in service.created[1]
     assert service.created[0]["request"]["correlation_request_id"] == "shared-correlation-id"
     assert service.created[1]["request"]["correlation_request_id"] == "shared-correlation-id"
 
@@ -148,11 +152,11 @@ def test_postgres_migration_and_idempotent_create_integration():
     created = store.create_run(
         tenant_id=tenant_id, run_id=run_id, idempotency_key="request-1",
         request=request, command_id=f"command-{suffix}",
-        event_id=f"event-{suffix}", outbox_id=f"outbox-{suffix}",
+        event_id=f"event-{suffix}",
     )
     replayed = store.create_run(
         tenant_id=created.tenant_id, run_id="ignored-on-replay", idempotency_key="request-1",
-        request=request, command_id="ignored", event_id="ignored", outbox_id="ignored",
+        request=request, command_id="ignored", event_id="ignored",
     )
     recovered = PostgresControlPlaneStore(dsn)
     run = recovered.get_run(tenant_id=tenant_id, run_id=run_id)
@@ -185,11 +189,18 @@ def test_postgres_migration_and_idempotent_create_integration():
         command_id=commands[0]["command_id"],
         worker_id=f"worker-{suffix}",
     )
-    assert len(outbox) == 1
-    assert outbox[0]["stream_version"] == 2
-    assert outbox[0]["dedupe_key"] == f"create-run:{run_id}:2"
-    assert recovered.mark_outbox_published(
-        tenant_id=tenant_id,
-        outbox_id=outbox[0]["outbox_id"],
-        publisher_id=f"relay-{suffix}",
-    )
+    assert len(outbox) == 2
+    assert {item["stream_version"] for item in outbox} == {1, 2}
+    assert {item["dedupe_key"] for item in outbox} == {
+        f"run-projection-v1:{run_id}:1",
+        f"run-projection-v1:{run_id}:2",
+    }
+    for item in outbox:
+        assert item["outbox_id"] == f"run-projection-v1:{item['source_event_id']}"
+        assert item["payload_json"]["source_event_id"] == item["source_event_id"]
+        assert "task" not in item["payload_json"]
+        assert recovered.mark_outbox_published(
+            tenant_id=tenant_id,
+            outbox_id=item["outbox_id"],
+            publisher_id=f"relay-{suffix}",
+        )

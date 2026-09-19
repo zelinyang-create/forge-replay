@@ -61,7 +61,7 @@ class PostgresControlPlaneStore:
 
     def create_run(
         self, *, tenant_id: str, run_id: str, idempotency_key: str,
-        request: dict[str, Any], command_id: str, event_id: str, outbox_id: str,
+        request: dict[str, Any], command_id: str, event_id: str,
     ) -> CreatedRun:
         request_json = _canonical_json(request)
         semantic_request = {
@@ -238,27 +238,6 @@ class PostgresControlPlaneStore:
                     idempotency_key,
                     stream_version,
                     _canonical_json(command_payload),
-                ),
-            )
-            outbox_payload = {
-                **response,
-                "execution_status": ExecutionStatus.ACTIVE.value,
-                "latest_event_id": str(phase_changed.event_id),
-                "phase": RunPhase.PREFLIGHTING.value,
-                "session_id": session_id,
-                "turn_id": turn_id,
-            }
-            connection.execute(
-                "INSERT INTO run_outbox(tenant_id, outbox_id, run_id, destination, "
-                "dedupe_key, stream_version, payload_json) "
-                "VALUES (%s, %s, %s, 'run-events', %s, %s, %s::jsonb)",
-                (
-                    tenant_id,
-                    outbox_id,
-                    run_id,
-                    f"create-run:{run_id}:{stream_version}",
-                    stream_version,
-                    _canonical_json(outbox_payload),
                 ),
             )
             connection.execute(
@@ -473,7 +452,7 @@ class PostgresControlPlaneStore:
             self._tenant(connection, tenant_id)
             rows = connection.execute(
                 "SELECT tenant_id, outbox_id, run_id, destination, dedupe_key, stream_version, "
-                "payload_json FROM run_outbox "
+                "source_event_id, payload_json FROM run_outbox "
                 "WHERE tenant_id = %s AND published_at IS NULL "
                 "AND (claimed_by IS NULL OR claim_expires_at IS NULL "
                 "OR claim_expires_at <= clock_timestamp()) "
@@ -504,7 +483,7 @@ class PostgresControlPlaneStore:
                 "publish_attempts = publish_attempts + 1 FROM pending p "
                 "WHERE o.tenant_id = p.tenant_id AND o.outbox_id = p.outbox_id "
                 "RETURNING o.tenant_id, o.outbox_id, o.run_id, o.destination, o.dedupe_key, "
-                "o.stream_version, o.payload_json, o.claimed_by, o.claimed_at, "
+                "o.stream_version, o.source_event_id, o.payload_json, o.claimed_by, o.claimed_at, "
                 "o.claim_expires_at, o.publish_attempts",
                 (tenant_id, limit, publisher_id, visibility_timeout_seconds),
             ).fetchall()

@@ -21,6 +21,8 @@ from forge_replay.events import (
     ModelCallStartedPayload,
     ModelResponseReceivedPayload,
     RunPhaseChangedPayload,
+    SessionCreatedPayload,
+    UserMessageReceivedPayload,
     new_event,
 )
 from forge_replay.persistence import (
@@ -69,7 +71,10 @@ class RecordingConnection:
         self.rolled_back = exc_type is not None
 
     def execute(self, statement: str, params: tuple[Any, ...] | None = None):
-        self.statements.append((" ".join(statement.split()), params))
+        normalized = " ".join(statement.split())
+        self.statements.append((normalized, params))
+        if normalized.startswith("INSERT INTO run_outbox"):
+            return FakeCursor()
         assert self.results, f"unexpected SQL: {statement}"
         return self.results.pop(0)
 
@@ -200,6 +205,94 @@ def test_append_event_commits_tenant_scoped_stream_cas_and_model_projection():
     assert "stream_version = %s" in sql
     assert "writer_lease_epoch" in sql
     assert "INSERT INTO model_calls" in sql
+    assert sql.count("INSERT INTO run_outbox") == 1
+    run_cas = next(
+        index
+        for index, (statement, _) in enumerate(connection.statements)
+        if statement.startswith("UPDATE runs SET stream_version")
+    )
+    projection = next(
+        index
+        for index, (statement, _) in enumerate(connection.statements)
+        if statement.startswith("INSERT INTO model_calls")
+    )
+    outbox = next(
+        index
+        for index, (statement, _) in enumerate(connection.statements)
+        if statement.startswith("INSERT INTO run_outbox")
+    )
+    assert run_cas < projection < outbox
+
+    _, outbox_params = connection.statements[outbox]
+    assert outbox_params is not None
+    assert outbox_params[:6] == (
+        "tenant-1",
+        f"run-projection-v1:{event.event_id}",
+        "run-1",
+        "run-projection-v1:run-1:5",
+        5,
+        str(event.event_id),
+    )
+    outbox_sql = connection.statements[outbox][0]
+    assert "'run-projection-v1'" in outbox_sql
+    payload = json.loads(outbox_params[6])
+    assert payload == {
+        "kind": "run_projection_changed",
+        "outbox_schema_version": 1,
+        "run_id": "run-1",
+        "source_event_id": str(event.event_id),
+        "source_event_occurred_at": event.occurred_at.isoformat(),
+        "source_event_schema_version": event.schema_version,
+        "source_event_type": event.event_type.value,
+        "stream_version": 5,
+        "tenant_id": "tenant-1",
+    }
+    assert "model_name" not in outbox_params[6]
+    assert "payload" not in payload
+    assert not connection.results
+
+
+@pytest.mark.parametrize(
+    ("turn_id", "payload"),
+    [
+        (
+            None,
+            SessionCreatedPayload(
+                workspace_root="C:/repo",
+                config_sha256="a" * 64,
+            ),
+        ),
+        (
+            "turn-1",
+            UserMessageReceivedPayload(message_blob_sha256="b" * 64),
+        ),
+    ],
+)
+def test_session_and_turn_scoped_events_do_not_emit_projection_outbox(
+    turn_id: str | None,
+    payload: SessionCreatedPayload | UserMessageReceivedPayload,
+):
+    connection = RecordingConnection(
+        [
+            cursor({"next_seq": 7}),
+            cursor(),
+            cursor(rowcount=1),
+        ]
+    )
+    store = store_for(connection)
+
+    store._append_event_in_transaction(
+        connection,
+        session_id="session-1",
+        turn_id=turn_id,
+        process_instance_id="api-1",
+        payload=payload,
+    )
+
+    assert not any(
+        statement.startswith("INSERT INTO run_outbox")
+        for statement, _ in connection.statements
+    )
     assert not connection.results
 
 

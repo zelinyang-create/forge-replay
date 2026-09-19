@@ -92,6 +92,36 @@ class FakeRuntimeStore:
         if run_id is not None:
             self._run_seq += 1
             seq = self._run_seq
+            event_id = f"event-{event_type}"
+            payload_json = json.dumps(
+                {
+                    "kind": "run_projection_changed",
+                    "outbox_schema_version": 1,
+                    "run_id": run_id,
+                    "source_event_id": event_id,
+                    "source_event_occurred_at": "fake-occurred-at",
+                    "source_event_schema_version": 1,
+                    "source_event_type": event_type,
+                    "stream_version": seq,
+                    "tenant_id": self.tenant_id,
+                },
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            connection.execute(
+                "INSERT INTO run_outbox(tenant_id, outbox_id, run_id, destination, "
+                "dedupe_key, stream_version, source_event_id, payload_json) "
+                "VALUES (%s, %s, %s, 'run-projection-v1', %s, %s, %s, %s::jsonb)",
+                (
+                    self.tenant_id,
+                    f"run-projection-v1:{event_id}",
+                    run_id,
+                    f"run-projection-v1:{run_id}:{seq}",
+                    seq,
+                    event_id,
+                    payload_json,
+                ),
+            )
         else:
             seq = 0
         return SimpleNamespace(event_id=f"event-{event_type}", seq=seq)
@@ -151,7 +181,6 @@ def test_create_run_commits_canonical_events_projection_command_and_outbox_toget
         request=_request(),
         command_id="command-1",
         event_id="admission-1",
-        outbox_id="outbox-1",
     )
 
     assert created.tenant_id == "tenant-a"
@@ -178,7 +207,6 @@ def test_create_run_commits_canonical_events_projection_command_and_outbox_toget
         "insert into runs",
         "insert into managed_run_requests",
         "insert into run_commands",
-        "insert into run_outbox",
         "insert into api_idempotency_keys",
     ]
     positions = [
@@ -196,20 +224,26 @@ def test_create_run_commits_canonical_events_projection_command_and_outbox_toget
         "turn_id": "turn-run-1",
     }
 
-    _, outbox_params = _statement(connection, "insert into run_outbox")
-    assert outbox_params[:5] == (
-        "tenant-a",
-        "outbox-1",
-        "run-1",
-        "create-run:run-1:2",
-        2,
-    )
-    outbox_payload = json.loads(outbox_params[5])
-    assert outbox_payload["execution_status"] == "active"
-    assert outbox_payload["phase"] == "preflighting"
-    assert outbox_payload["session_id"] == "session-run-1"
-    assert outbox_payload["turn_id"] == "turn-run-1"
-    assert outbox_payload["stream_version"] == 2
+    outbox_statements = [
+        (sql, params)
+        for sql, params in connection.statements
+        if "insert into run_outbox" in sql
+    ]
+    assert len(outbox_statements) == 2
+    assert [params[4] for _, params in outbox_statements] == [1, 2]
+    assert [params[3] for _, params in outbox_statements] == [
+        "run-projection-v1:run-1:1",
+        "run-projection-v1:run-1:2",
+    ]
+    for sql, params in outbox_statements:
+        assert params[1] == f"run-projection-v1:{params[5]}"
+        assert "'run-projection-v1'" in sql
+        payload = json.loads(params[6])
+        assert payload["source_event_id"] == params[5]
+        assert "task" not in payload
+        assert "actor_user_id" not in payload
+        assert "payload" not in payload
+    assert all("create-run:" not in str(params) for _, params in outbox_statements)
 
 
 def test_create_run_replays_saved_response_without_rewriting_authority():
@@ -242,7 +276,6 @@ def test_create_run_replays_saved_response_without_rewriting_authority():
         request=request,
         command_id="command-ignored",
         event_id="event-ignored",
-        outbox_id="outbox-ignored",
     )
 
     assert replayed.run_id == "run-original"
@@ -278,7 +311,6 @@ def test_create_run_rejects_idempotency_key_reuse_with_a_different_request():
             request=_request(task="different task"),
             command_id="command-2",
             event_id="event-2",
-            outbox_id="outbox-2",
         )
 
     assert not any("insert into" in sql for sql, _ in connection.statements)

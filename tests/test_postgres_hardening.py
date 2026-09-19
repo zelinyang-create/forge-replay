@@ -312,6 +312,7 @@ def test_outbox_claim_is_durable_and_publish_ack_is_owner_scoped():
     assert "publish_attempts = publish_attempts + 1" in claim_sql
     assert "o.dedupe_key" in claim_sql
     assert "o.stream_version" in claim_sql
+    assert "o.source_event_id" in claim_sql
     assert claim_params == ("tenant-a", 100, "relay-1", 60)
     ack_sql, ack_params = connect.statement_containing("set published_at")
     assert "claimed_by = %s" in ack_sql

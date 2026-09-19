@@ -118,7 +118,6 @@ def create_control_plane_app(service: ControlPlaneService, verifier: IdentityVer
                 request=payload,
                 command_id=f"command-{uuid.uuid4()}",
                 event_id=f"event-{uuid.uuid4()}",
-                outbox_id=f"outbox-{uuid.uuid4()}",
             )
         except IdempotencyConflictError as exc:
             raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc

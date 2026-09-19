@@ -126,6 +126,37 @@ def test_postgres_runtime_store_is_not_a_sqlite_dynamic_forwarder_or_stub():
     assert "apply_postgres_runtime_migrations" in class_source
 
 
+def test_run_event_outbox_has_one_canonical_producer_after_projection():
+    module = inspect.getmodule(PostgresRuntimeStore)
+    assert module is not None
+    source = inspect.getsource(module)
+    append_source = inspect.getsource(PostgresRuntimeStore._append_event_in_transaction)
+    producer = getattr(
+        PostgresRuntimeStore,
+        "_insert_run_projection_outbox_in_transaction",
+        None,
+    )
+
+    assert callable(producer)
+    producer_source = inspect.getsource(producer)
+    assert source.count("INSERT INTO run_events(") == 1
+    assert source.count("INSERT INTO run_outbox(") == 1
+    assert "INSERT INTO run_outbox(" in producer_source
+    assert "INSERT INTO run_outbox(" not in append_source
+    projection_call = append_source.index("_apply_operational_projection_in_transaction")
+    outbox_call = append_source.index("_insert_run_projection_outbox_in_transaction")
+    assert projection_call < outbox_call
+
+    control_plane_source = inspect.getsource(
+        __import__(
+            "forge_replay.control_plane.postgres",
+            fromlist=["PostgresControlPlaneStore"],
+        )
+    )
+    assert "INSERT INTO run_events(" not in control_plane_source
+    assert "INSERT INTO run_outbox(" not in control_plane_source
+
+
 def test_runtime_schema_makes_tenant_and_run_identity_part_of_the_stream():
     schema = _normalized_schema()
     tenant_tables = (
