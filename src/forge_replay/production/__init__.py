@@ -35,6 +35,7 @@ from forge_replay.production.redis_shadow import (
     ShadowProjectionProtocolError,
     ShadowProjectionUnavailableError,
 )
+from forge_replay.production.redis_shadow_reader import RedisShadowProjectionReader
 from forge_replay.production.release_gate import ReleaseGate
 from forge_replay.production.sandbox import (
     ExecReceipt,
@@ -49,6 +50,8 @@ from forge_replay.production.sandbox import (
 )
 from forge_replay.production.shadow_config import (
     Phase2RedisFeatureFlags,
+    Phase3RedisFeatureFlags,
+    RedisReadAdmissionEvidence,
     ShadowProjectionConfig,
     ShadowProjectionTtlConfig,
 )
@@ -56,6 +59,12 @@ from forge_replay.production.shadow_projection import (
     ProjectionWriteResult,
     ProjectionWriteStatus,
     ShadowProjectionSnapshot,
+)
+from forge_replay.production.shadow_read import (
+    ShadowProjectionFallbackReason,
+    ShadowProjectionReadResult,
+    ShadowProjectionReadService,
+    ShadowProjectionReadSource,
 )
 from forge_replay.production.workspace_snapshot import (
     WorkspaceSnapshot,
@@ -82,11 +91,14 @@ __all__ = [
     "OciGvisorExecutionProvider",
     "PermanentManagedRunError",
     "Phase2RedisFeatureFlags",
+    "Phase3RedisFeatureFlags",
     "PolicyBundle",
     "PostgresAuthorityFactory",
     "PostgresShadowProjectionSource",
     "ProjectionWriteResult",
     "ProjectionWriteStatus",
+    "RedisReadAdmissionEvidence",
+    "RedisShadowProjectionReader",
     "RedisShadowProjectionSink",
     "RegionalFailoverController",
     "ReleaseGate",
@@ -96,7 +108,11 @@ __all__ = [
     "SandboxProcessSupervisor",
     "SandboxSpec",
     "ShadowProjectionConfig",
+    "ShadowProjectionFallbackReason",
     "ShadowProjectionProtocolError",
+    "ShadowProjectionReadResult",
+    "ShadowProjectionReadService",
+    "ShadowProjectionReadSource",
     "ShadowProjectionRebuilder",
     "ShadowProjectionRelay",
     "ShadowProjectionSnapshot",
