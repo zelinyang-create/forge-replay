@@ -4,6 +4,7 @@ import hashlib
 import json
 from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from typing import Any
 from uuid import UUID
 
@@ -13,8 +14,10 @@ from forge_replay.domain import (
     ApprovalDecision,
     ControlCommandContext,
     ExecutionContext,
+    RunPhase,
     ToolCallState,
     ToolEffectClass,
+    WorkspaceDisposition,
 )
 from forge_replay.events import (
     ApprovalDecidedPayload,
@@ -32,7 +35,7 @@ from forge_replay.persistence import (
     PostgresRuntimeStore,
     RunStateConflictError,
 )
-from forge_replay.records import StoredBlob
+from forge_replay.records import RunWorkspaceRecord, StoredBlob
 
 
 class FakeCursor:
@@ -138,6 +141,118 @@ def store_for(connection: RecordingConnection) -> PostgresRuntimeStore:
         tenant_id="tenant-1",
         connect=ConnectionFactory(connection),
     )
+
+
+def test_postgres_workspace_begin_passes_writer_epoch_and_advances_context(
+    monkeypatch,
+):
+    connection = RecordingConnection([cursor(), cursor()])
+    store = store_for(connection)
+    context = execution_context()
+    row = run_row(phase=RunPhase.PREFLIGHTING.value)
+    captured_epochs = []
+    next_seq = iter((5, 6))
+
+    monkeypatch.setattr(
+        store,
+        "_require_execution_context",
+        lambda _connection, **_kwargs: row,
+    )
+    monkeypatch.setattr(
+        store,
+        "_recover_run_projection_in_transaction",
+        lambda _connection, **_kwargs: SimpleNamespace(
+            projection=SimpleNamespace(phase=RunPhase.PREFLIGHTING)
+        ),
+    )
+
+    def append(_connection, **kwargs):
+        captured_epochs.append(kwargs["writer_lease_epoch"])
+        return new_event(
+            session_id=kwargs["session_id"],
+            turn_id=kwargs["turn_id"],
+            run_id=kwargs["run_id"],
+            seq=next(next_seq),
+            process_instance_id=kwargs["process_instance_id"],
+            payload=kwargs["payload"],
+        )
+
+    monkeypatch.setattr(store, "_append_event_in_transaction", append)
+
+    store.begin_workspace_provisioning(
+        run_id="run-1",
+        dirty_mode="refuse",
+        process_instance_id="worker-1",
+        execution_context=context,
+    )
+
+    assert captured_epochs == [context.lease_epoch, context.lease_epoch]
+    assert context.stream_version == 6
+
+
+def test_postgres_workspace_attach_passes_writer_epoch_and_advances_context(
+    tmp_path, monkeypatch
+):
+    connection = RecordingConnection([cursor(), cursor()])
+    store = store_for(connection)
+    context = execution_context()
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    marker = tmp_path / "owner.json"
+    marker.write_text("{}", encoding="utf-8")
+    row = run_row(phase=RunPhase.PROVISIONING.value)
+    captured_epochs = []
+    next_seq = iter((5, 6))
+    record = RunWorkspaceRecord(
+        run_id="run-1",
+        base_repo_root=row["base_repo_root"],
+        base_commit_sha=row["base_commit_sha"],
+        worktree_path=str(worktree.resolve()),
+        worktree_branch="forge/run-1",
+        disposition=WorkspaceDisposition.ACTIVE,
+    )
+
+    monkeypatch.setattr(
+        store,
+        "_require_execution_context",
+        lambda _connection, **_kwargs: row,
+    )
+    monkeypatch.setattr(
+        store,
+        "_recover_run_projection_in_transaction",
+        lambda _connection, **_kwargs: SimpleNamespace(
+            projection=SimpleNamespace(phase=RunPhase.PROVISIONING)
+        ),
+    )
+
+    def append(_connection, **kwargs):
+        captured_epochs.append(kwargs["writer_lease_epoch"])
+        return new_event(
+            session_id=kwargs["session_id"],
+            turn_id=kwargs["turn_id"],
+            run_id=kwargs["run_id"],
+            seq=next(next_seq),
+            process_instance_id=kwargs["process_instance_id"],
+            payload=kwargs["payload"],
+        )
+
+    monkeypatch.setattr(store, "_append_event_in_transaction", append)
+    monkeypatch.setattr(store, "get_run_workspace", lambda _run_id: record)
+
+    result = store.attach_provisioned_workspace(
+        run_id="run-1",
+        worktree_path=worktree,
+        branch="forge/run-1",
+        base_commit_sha=row["base_commit_sha"],
+        ownership_marker=marker,
+        ownership_token="secret",
+        process_instance_id="worker-1",
+        execution_context=context,
+    )
+
+    assert result == record
+    assert captured_epochs == [context.lease_epoch, context.lease_epoch]
+    assert context.stream_version == 6
 
 
 def stored_event_row(event) -> dict[str, Any]:

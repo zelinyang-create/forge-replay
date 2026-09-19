@@ -27,6 +27,7 @@ from forge_replay.events import (
 from forge_replay.persistence import (
     BudgetLimitError,
     LeaseConflictError,
+    RunStateConflictError,
 )
 from forge_replay.ports import RuntimeStorePort
 from forge_replay.runtime.file_executor import DurableFileExecutor
@@ -162,20 +163,34 @@ class DurableAgentRuntime:
             raise ValueError("checkpoint interval must be positive")
         self.checkpoint_interval_events = checkpoint_interval_events
 
-    def run(self, run_id: str) -> AgentOutcome:
-        lease = self.store.acquire_run_lease(
-            run_id=run_id,
-            owner=self.process_instance_id,
-        )
-        projection = self.store.get_run_projection(run_id)
-        execution_context = ExecutionContext(
-            run_id=run_id,
-            worker_id=self.process_instance_id,
-            lease_epoch=lease.epoch,
-            lease_expires_at=lease.expires_at,
-            stream_version=projection.last_event_seq,
-        )
+    def run(
+        self,
+        run_id: str,
+        *,
+        execution_context: ExecutionContext | None = None,
+    ) -> AgentOutcome:
+        owned_lease = None
         try:
+            if execution_context is None:
+                owned_lease = self.store.acquire_run_lease(
+                    run_id=run_id,
+                    owner=self.process_instance_id,
+                )
+                projection = self.store.get_run_projection(run_id)
+                execution_context = ExecutionContext(
+                    run_id=run_id,
+                    worker_id=self.process_instance_id,
+                    lease_epoch=owned_lease.epoch,
+                    lease_expires_at=owned_lease.expires_at,
+                    stream_version=projection.last_event_seq,
+                )
+            else:
+                if execution_context.run_id != run_id:
+                    raise ValueError("execution context belongs to a different run")
+                if execution_context.worker_id != self.process_instance_id:
+                    raise ValueError("execution context belongs to a different worker")
+                self.store.synchronize_execution_context(execution_context)
+
             try:
                 return self._run_with_lease(run_id, execution_context)
             except BudgetLimitError as exc:
@@ -197,12 +212,13 @@ class DurableAgentRuntime:
                 )
                 return AgentOutcome(status="needs_attention", detail=str(exc))
         finally:
-            try:
-                self.store.release_run_lease(lease)
-            except LeaseConflictError:
-                # A newer fencing epoch owns the run; the stale worker must not
-                # mutate or release that lease.
-                pass
+            if owned_lease is not None:
+                try:
+                    self.store.release_run_lease(owned_lease)
+                except LeaseConflictError:
+                    # A newer fencing epoch owns the run; the stale worker must not
+                    # mutate or release that lease.
+                    pass
 
     def _run_with_lease(
         self,
@@ -222,13 +238,9 @@ class DurableAgentRuntime:
                 detail=f"run status is {projection.execution_status.value}",
             )
         if projection.phase != RunPhase.AWAITING_MODEL:
-            self.store.transition_run_phase(
-                run_id=run_id,
-                expected_previous_phase=projection.phase,
-                next_phase=RunPhase.AWAITING_MODEL,
-                reason="runtime ready for model",
-                process_instance_id=self.process_instance_id,
-                execution_context=execution_context,
+            raise RunStateConflictError(
+                f"run {run_id} phase is {projection.phase}; "
+                "workspace provisioning must complete before agent execution"
             )
 
         for _ in range(self.max_steps * 2):

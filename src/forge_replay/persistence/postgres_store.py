@@ -481,11 +481,14 @@ class PostgresRuntimeStore:
         run_id: str,
         dirty_mode: Literal["refuse", "head-only"],
         process_instance_id: str,
+        execution_context: ExecutionContext | None = None,
     ) -> EventEnvelope | None:
         with self.connect() as connection:
             self._tenant(connection)
             row = self._require_execution_context(
-                connection, run_id=run_id, execution_context=None
+                connection,
+                run_id=run_id,
+                execution_context=execution_context,
             )
             projection = self._recover_run_projection_in_transaction(
                 connection, run_id=run_id, run_row=row
@@ -501,13 +504,14 @@ class PostgresRuntimeStore:
                 run_id=run_id,
                 process_instance_id=process_instance_id,
                 correlation_id=run_id,
+                writer_lease_epoch=self._lease_epoch(execution_context),
                 payload=WorkspaceProvisioningStartedPayload(
                     base_repo_root=str(row["base_repo_root"]),
                     base_commit_sha=str(row["base_commit_sha"]),
                     dirty_mode=dirty_mode,
                 ),
             )
-            self._append_event_in_transaction(
+            phase_event = self._append_event_in_transaction(
                 connection,
                 session_id=str(row["session_id"]),
                 turn_id=str(row["turn_id"]),
@@ -515,6 +519,7 @@ class PostgresRuntimeStore:
                 process_instance_id=process_instance_id,
                 causation_event_id=str(intent.event_id),
                 correlation_id=run_id,
+                writer_lease_epoch=self._lease_epoch(execution_context),
                 payload=RunPhaseChangedPayload(
                     previous_phase=RunPhase.PREFLIGHTING,
                     next_phase=RunPhase.PROVISIONING,
@@ -525,6 +530,7 @@ class PostgresRuntimeStore:
                 "UPDATE runs SET phase = %s WHERE tenant_id = %s AND run_id = %s",
                 (RunPhase.PROVISIONING.value, self.tenant_id, run_id),
             )
+        self._advance_execution_context(execution_context, phase_event.seq)
         return intent
 
     def attach_provisioned_workspace(
@@ -537,13 +543,16 @@ class PostgresRuntimeStore:
         ownership_marker: str | Path,
         ownership_token: str,
         process_instance_id: str,
+        execution_context: ExecutionContext | None = None,
     ) -> RunWorkspaceRecord:
         resolved_worktree = str(Path(worktree_path).resolve(strict=True))
         resolved_marker = str(Path(ownership_marker).resolve(strict=True))
         with self.connect() as connection:
             self._tenant(connection)
             row = self._require_execution_context(
-                connection, run_id=run_id, execution_context=None
+                connection,
+                run_id=run_id,
+                execution_context=execution_context,
             )
             if row["base_commit_sha"] != base_commit_sha:
                 raise RunStateConflictError("worktree base commit does not match the run")
@@ -563,6 +572,7 @@ class PostgresRuntimeStore:
                 run_id=run_id,
                 process_instance_id=process_instance_id,
                 correlation_id=run_id,
+                writer_lease_epoch=self._lease_epoch(execution_context),
                 payload=WorkspaceProvisionedPayload(
                     worktree_path=resolved_worktree,
                     branch=branch,
@@ -570,7 +580,7 @@ class PostgresRuntimeStore:
                     ownership_token_sha256=sha256_text(ownership_token),
                 ),
             )
-            self._append_event_in_transaction(
+            phase_event = self._append_event_in_transaction(
                 connection,
                 session_id=str(row["session_id"]),
                 turn_id=str(row["turn_id"]),
@@ -578,6 +588,7 @@ class PostgresRuntimeStore:
                 process_instance_id=process_instance_id,
                 causation_event_id=str(provisioned.event_id),
                 correlation_id=run_id,
+                writer_lease_epoch=self._lease_epoch(execution_context),
                 payload=RunPhaseChangedPayload(
                     previous_phase=RunPhase.PROVISIONING,
                     next_phase=RunPhase.AWAITING_MODEL,
@@ -599,6 +610,7 @@ class PostgresRuntimeStore:
                     run_id,
                 ),
             )
+        self._advance_execution_context(execution_context, phase_event.seq)
         return self.get_run_workspace(run_id)
 
     def set_workspace_disposition(

@@ -1,6 +1,13 @@
-from forge_replay.domain import ApprovalDecision, ToolCallState
+import pytest
+
+from forge_replay.domain import (
+    ApprovalDecision,
+    ExecutionContext,
+    RunPhase,
+    ToolCallState,
+)
 from forge_replay.events import ModelCallStartedPayload, ModelResponseReceivedPayload
-from forge_replay.persistence import SQLiteEventStore
+from forge_replay.persistence import RunStateConflictError, SQLiteEventStore
 from forge_replay.runtime.agent import DurableAgentRuntime
 from forge_replay.runtime.file_executor import DurableFileExecutor
 from forge_replay.runtime.model import ModelProviderError, ModelResult, ScriptedModel
@@ -9,7 +16,7 @@ from forge_replay.tools import ProcessSupervisor, ReplaySafeFileTools
 from forge_replay.workspace import WorkspacePathGuard
 
 
-def build_runtime(tmp_path, outputs, *, auto_files=False):
+def build_runtime(tmp_path, outputs, *, auto_files=False, ready=True):
     workspace = tmp_path / "worktree"
     workspace.mkdir()
     (workspace / "README.md").write_text("hello durable world\n", encoding="utf-8")
@@ -30,6 +37,14 @@ def build_runtime(tmp_path, outputs, *, auto_files=False):
         budget_limits={"model_calls": 6},
         process_instance_id="worker-1",
     )
+    if ready:
+        store.transition_run_phase(
+            run_id="run-1",
+            expected_previous_phase=RunPhase.PREFLIGHTING,
+            next_phase=RunPhase.AWAITING_MODEL,
+            reason="test workspace is ready",
+            process_instance_id="setup",
+        )
     guard = WorkspacePathGuard(workspace)
     files = ReplaySafeFileTools(guard)
     runtime = DurableAgentRuntime(
@@ -346,8 +361,10 @@ def test_runtime_renews_lease_before_bounded_actions(tmp_path, monkeypatch):
     _, store, runtime = build_runtime(tmp_path, ["<final>done</final>"])
     original_acquire = store.acquire_run_lease
     original_renew = store.renew_run_lease
+    original_release = store.release_run_lease
     acquisitions = []
     renewals = []
+    releases = []
 
     def counting_acquire(**kwargs):
         acquisitions.append(kwargs["run_id"])
@@ -357,11 +374,103 @@ def test_runtime_renews_lease_before_bounded_actions(tmp_path, monkeypatch):
         renewals.append(execution_context.run_id)
         return original_renew(execution_context, **kwargs)
 
+    def counting_release(lease):
+        releases.append(lease.run_id)
+        return original_release(lease)
+
     monkeypatch.setattr(store, "acquire_run_lease", counting_acquire)
     monkeypatch.setattr(store, "renew_run_lease", counting_renew)
+    monkeypatch.setattr(store, "release_run_lease", counting_release)
     assert runtime.run("run-1").status == "completed"
     assert acquisitions == ["run-1"]
+    assert releases == ["run-1"]
     assert len(renewals) >= 2
+
+
+@pytest.mark.parametrize("outputs", [["<final>done</final>"], []])
+def test_runtime_borrows_context_without_acquiring_or_releasing_lease(
+    tmp_path, monkeypatch, outputs
+):
+    _, store, runtime = build_runtime(tmp_path, outputs)
+    lease = store.acquire_run_lease(run_id="run-1", owner="worker-1")
+    projection = store.get_run_projection("run-1")
+    context = ExecutionContext(
+        run_id="run-1",
+        worker_id="worker-1",
+        lease_epoch=lease.epoch,
+        lease_expires_at=lease.expires_at,
+        stream_version=projection.last_event_seq,
+    )
+    original_sync = store.synchronize_execution_context
+    syncs = []
+
+    def forbidden(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("borrowed execution must not own lease lifecycle")
+
+    def counting_sync(borrowed):
+        syncs.append(borrowed)
+        return original_sync(borrowed)
+
+    monkeypatch.setattr(store, "acquire_run_lease", forbidden)
+    monkeypatch.setattr(store, "release_run_lease", forbidden)
+    monkeypatch.setattr(store, "synchronize_execution_context", counting_sync)
+
+    outcome = runtime.run("run-1", execution_context=context)
+
+    assert outcome.status in {"completed", "needs_attention"}
+    assert syncs and all(item is context for item in syncs)
+    assert context.stream_version == store.get_run_projection("run-1").last_event_seq
+
+
+@pytest.mark.parametrize(
+    ("run_id", "worker_id", "message"),
+    [
+        ("other-run", "worker-1", "different run"),
+        ("run-1", "other-worker", "different worker"),
+    ],
+)
+def test_runtime_rejects_mismatched_borrowed_context_before_model(
+    tmp_path, run_id, worker_id, message
+):
+    _, store, runtime = build_runtime(tmp_path, ["<final>must not run</final>"])
+    lease = store.acquire_run_lease(run_id="run-1", owner="worker-1")
+    context = ExecutionContext(
+        run_id=run_id,
+        worker_id=worker_id,
+        lease_epoch=lease.epoch,
+        lease_expires_at=lease.expires_at,
+        stream_version=store.get_run_projection("run-1").last_event_seq,
+    )
+
+    with pytest.raises(ValueError, match=message):
+        runtime.run("run-1", execution_context=context)
+
+    assert runtime.model.prompts == []
+
+
+@pytest.mark.parametrize(
+    "phase",
+    [RunPhase.PREFLIGHTING, RunPhase.PROVISIONING, RunPhase.BLOCKED_DIRTY],
+)
+def test_runtime_refuses_pre_workspace_phases_without_calling_model(tmp_path, phase):
+    _, store, runtime = build_runtime(
+        tmp_path, ["<final>must not run</final>"], ready=False
+    )
+    if phase != RunPhase.PREFLIGHTING:
+        store.transition_run_phase(
+            run_id="run-1",
+            expected_previous_phase=RunPhase.PREFLIGHTING,
+            next_phase=phase,
+            reason="phase gate test",
+            process_instance_id="setup",
+        )
+
+    with pytest.raises(RunStateConflictError, match="provisioning must complete"):
+        runtime.run("run-1")
+
+    assert store.get_run_projection("run-1").phase == phase
+    assert runtime.model.prompts == []
 
 
 def test_runtime_can_remove_process_tool_from_model_contract(tmp_path):

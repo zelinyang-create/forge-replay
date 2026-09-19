@@ -263,12 +263,18 @@ class WorkspaceStorePort(Protocol):
 
     def get_run_workspace(self, run_id: str) -> RunWorkspaceRecord: ...
 
+    def synchronize_execution_context(
+        self,
+        execution_context: ExecutionContext,
+    ) -> int: ...
+
     def begin_workspace_provisioning(
         self,
         *,
         run_id: str,
         dirty_mode: Literal["refuse", "head-only"],
         process_instance_id: str,
+        execution_context: ExecutionContext | None = None,
     ) -> EventEnvelope | None: ...
 
     def attach_provisioned_workspace(
@@ -281,6 +287,7 @@ class WorkspaceStorePort(Protocol):
         ownership_marker: str | Path,
         ownership_token: str,
         process_instance_id: str,
+        execution_context: ExecutionContext | None = None,
     ) -> RunWorkspaceRecord: ...
 
 

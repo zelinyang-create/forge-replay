@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Literal
 
+from forge_replay.domain import ExecutionContext
 from forge_replay.persistence import RunWorkspaceRecord
 from forge_replay.ports import WorkspaceStorePort
 from forge_replay.workspace.git_worktree import GitWorktreeManager
@@ -31,7 +32,16 @@ class WorkspaceController:
         run_id: str,
         *,
         dirty_mode: Literal["refuse", "head-only"] = "refuse",
+        execution_context: ExecutionContext | None = None,
     ) -> RunWorkspaceRecord:
+        if execution_context is not None:
+            if execution_context.run_id != run_id:
+                raise ValueError("execution context targets a different run")
+            if execution_context.worker_id != self.process_instance_id:
+                raise ValueError(
+                    "execution context worker does not match the process instance"
+                )
+            self.store.synchronize_execution_context(execution_context)
         current = self.store.get_run_workspace(run_id)
         if current.worktree_path is not None:
             return current
@@ -39,6 +49,7 @@ class WorkspaceController:
             run_id=run_id,
             dirty_mode=dirty_mode,
             process_instance_id=self.process_instance_id,
+            execution_context=execution_context,
         )
         owned = self.manager.load_owned(run_id)
         if owned is None:
@@ -59,4 +70,5 @@ class WorkspaceController:
             ownership_marker=owned.ownership_marker,
             ownership_token=owned.ownership_token,
             process_instance_id=self.process_instance_id,
+            execution_context=execution_context,
         )

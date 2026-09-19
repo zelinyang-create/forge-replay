@@ -902,13 +902,18 @@ class SQLiteEventStore:
         run_id: str,
         dirty_mode: Literal["refuse", "head-only"],
         process_instance_id: str,
+        execution_context: ExecutionContext | None = None,
     ) -> EventEnvelope | None:
         """Commit workspace provisioning intent before invoking Git."""
 
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
-                row = self._require_run_row(connection, run_id)
+                row = self._require_execution_context(
+                    connection,
+                    run_id=run_id,
+                    execution_context=execution_context,
+                )
                 projection = self._recover_run_projection_in_transaction(
                     connection, run_id=run_id, run_row=row
                 ).projection
@@ -952,6 +957,7 @@ class SQLiteEventStore:
             except BaseException:
                 connection.execute("ROLLBACK")
                 raise
+        self._advance_execution_context(execution_context, phase_event.seq)
         return intent
 
     def attach_provisioned_workspace(
@@ -964,6 +970,7 @@ class SQLiteEventStore:
         ownership_marker: str | Path,
         ownership_token: str,
         process_instance_id: str,
+        execution_context: ExecutionContext | None = None,
     ) -> RunWorkspaceRecord:
         """Commit an externally created worktree after identity validation."""
 
@@ -972,7 +979,11 @@ class SQLiteEventStore:
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
-                row = self._require_run_row(connection, run_id)
+                row = self._require_execution_context(
+                    connection,
+                    run_id=run_id,
+                    execution_context=execution_context,
+                )
                 if row["base_commit_sha"] != base_commit_sha:
                     raise RunStateConflictError("worktree base commit does not match the run")
                 if row["worktree_path"] is not None:
@@ -1035,6 +1046,7 @@ class SQLiteEventStore:
             except BaseException:
                 connection.execute("ROLLBACK")
                 raise
+        self._advance_execution_context(execution_context, phase_event.seq)
         return self.get_run_workspace(run_id)
 
     def set_workspace_disposition(
