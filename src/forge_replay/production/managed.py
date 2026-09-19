@@ -25,7 +25,10 @@ from forge_replay.control_plane.api import (
 )
 from forge_replay.control_plane.postgres import PostgresControlPlaneStore
 from forge_replay.domain import ExecutionContext
+from forge_replay.persistence.object_store import BlobObjectUnavailableError
 from forge_replay.persistence.postgres_store import PostgresRuntimeStore
+from forge_replay.ports import BlobObjectStorePort
+from forge_replay.records import BlobPlacementPolicy
 
 
 class RetryableManagedRunError(RuntimeError):
@@ -58,9 +61,15 @@ class PostgresAuthorityFactory:
         self,
         config: ManagedAuthorityConfig,
         *,
+        object_store: BlobObjectStorePort | None = None,
         connect: Callable[..., Any] = psycopg.connect,
     ) -> None:
+        if object_store is None:
+            raise BlobObjectUnavailableError(
+                "managed PostgreSQL authority requires an external blob object store"
+            )
         self.config = config
+        self.object_store = object_store
         self._connect = connect
 
     def migrate(self) -> None:
@@ -70,6 +79,8 @@ class PostgresAuthorityFactory:
         return PostgresControlPlaneStore(
             self.config.dsn,
             connect=self._connect,
+            object_store=self.object_store,
+            placement_policy=BlobPlacementPolicy.EXTERNAL_ONLY,
         )
 
     def runtime_store(self, tenant_id: str) -> PostgresRuntimeStore:
@@ -79,17 +90,21 @@ class PostgresAuthorityFactory:
             self.config.dsn,
             tenant_id=tenant_id,
             connect=self._connect,
+            object_store=self.object_store,
+            placement_policy=BlobPlacementPolicy.EXTERNAL_ONLY,
         )
 
 
 def build_managed_control_plane(
     config: ManagedAuthorityConfig,
     identity_signing_key: bytes,
+    *,
+    object_store: BlobObjectStorePort | None = None,
 ) -> FastAPI:
     """Build a migrated PostgreSQL control plane or fail before serving."""
 
     verifier = HmacIdentityVerifier(identity_signing_key)
-    factory = PostgresAuthorityFactory(config)
+    factory = PostgresAuthorityFactory(config, object_store=object_store)
     factory.migrate()
     return create_control_plane_app(factory.control_store(), verifier)
 

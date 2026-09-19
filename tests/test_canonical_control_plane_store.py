@@ -62,14 +62,46 @@ class SingleConnectionFactory:
 class FakeRuntimeStore:
     instances: ClassVar[list[FakeRuntimeStore]] = []
 
-    def __init__(self, dsn: str, *, tenant_id: str, connect: object):
+    def __init__(
+        self,
+        dsn: str,
+        *,
+        tenant_id: str,
+        connect: object,
+        object_store: object | None = None,
+        placement_policy: object = None,
+    ):
         self.dsn = dsn
         self.tenant_id = tenant_id
         self.connect = connect
+        self.object_store = object_store
+        self.placement_policy = placement_policy
         self.connections: list[object] = []
         self.payload_types: list[str] = []
         self._run_seq = 0
         self.__class__.instances.append(self)
+
+    def _prepare_blob(
+        self, content: bytes | str, *, media_type: str
+    ) -> tuple[bytes, None]:
+        assert media_type == "text/plain; charset=utf-8"
+        raw = content.encode() if isinstance(content, str) else bytes(content)
+        return raw, None
+
+    def _register_prepared_blob_in_transaction(
+        self,
+        connection: object,
+        *,
+        content: bytes,
+        media_type: str,
+        object_ref: object | None,
+    ) -> SimpleNamespace:
+        assert object_ref is None
+        return self._put_blob_in_transaction(
+            connection,
+            content=content,
+            media_type=media_type,
+        )
 
     def _put_blob_in_transaction(
         self, connection: object, *, content: bytes, media_type: str

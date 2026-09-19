@@ -293,8 +293,10 @@ def test_managed_authority_dsn_is_required_and_fails_closed(dsn: object):
 
 def test_authority_factory_builds_only_postgres_stores_with_explicit_tenant():
     connect = object()
+    object_store = object()
     factory = PostgresAuthorityFactory(
         ManagedAuthorityConfig("postgresql://authority"),
+        object_store=object_store,  # type: ignore[arg-type]
         connect=connect,  # type: ignore[arg-type]
     )
 
@@ -303,9 +305,11 @@ def test_authority_factory_builds_only_postgres_stores_with_explicit_tenant():
 
     assert control.dsn == "postgresql://authority"
     assert control._connect is connect
+    assert control.object_store is object_store
     assert runtime.dsn == "postgresql://authority"
     assert runtime.tenant_id == "tenant-a"
     assert runtime._connect is connect
+    assert runtime.object_store is object_store
     with pytest.raises(ValueError, match="tenant_id"):
         factory.runtime_store(" ")
 
@@ -316,10 +320,17 @@ def test_managed_control_plane_migrates_before_building_app(
     actions: list[str] = []
     service = object()
     app = object()
+    object_store = object()
 
     class Factory:
-        def __init__(self, config: ManagedAuthorityConfig):
+        def __init__(
+            self,
+            config: ManagedAuthorityConfig,
+            *,
+            object_store: object | None = None,
+        ):
             assert config.dsn == "postgresql://authority"
+            assert object_store is not None
 
         def migrate(self) -> None:
             actions.append("migrate")
@@ -339,6 +350,7 @@ def test_managed_control_plane_migrates_before_building_app(
     built = build_managed_control_plane(
         ManagedAuthorityConfig("postgresql://authority"),
         b"a-secure-signing-key",
+        object_store=object_store,  # type: ignore[arg-type]
     )
 
     assert built is app
@@ -349,10 +361,16 @@ def test_managed_control_plane_never_serves_when_migration_fails(
     monkeypatch: pytest.MonkeyPatch,
 ):
     built = False
+    object_store = object()
 
     class Factory:
-        def __init__(self, _config: ManagedAuthorityConfig):
-            pass
+        def __init__(
+            self,
+            _config: ManagedAuthorityConfig,
+            *,
+            object_store: object | None = None,
+        ):
+            assert object_store is not None
 
         def migrate(self) -> None:
             raise RuntimeError("migration failed")
@@ -369,6 +387,7 @@ def test_managed_control_plane_never_serves_when_migration_fails(
         build_managed_control_plane(
             ManagedAuthorityConfig("postgresql://authority"),
             b"a-secure-signing-key",
+            object_store=object_store,  # type: ignore[arg-type]
         )
     assert built is False
 

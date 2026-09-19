@@ -18,12 +18,14 @@ from forge_replay.events import (
     SessionCreatedPayload,
     UserMessageReceivedPayload,
 )
+from forge_replay.persistence.object_store import BlobObjectUnavailableError
 from forge_replay.persistence.postgres_schema import (
     apply_postgres_runtime_migrations,
     postgres_runtime_schema_sql,
 )
 from forge_replay.persistence.postgres_store import PostgresRuntimeStore
-from forge_replay.ports import QueuedRunCommand
+from forge_replay.ports import BlobObjectStorePort, QueuedRunCommand
+from forge_replay.records import BlobPlacementPolicy
 
 POSTGRES_SCHEMA = postgres_runtime_schema_sql()
 
@@ -48,9 +50,25 @@ class CreatedRun:
 class PostgresControlPlaneStore:
     """Short PostgreSQL transactions; external work never runs inside them."""
 
-    def __init__(self, dsn: str, *, connect: Callable[..., Any] = psycopg.connect):
+    def __init__(
+        self,
+        dsn: str,
+        *,
+        connect: Callable[..., Any] = psycopg.connect,
+        object_store: BlobObjectStorePort | None = None,
+        placement_policy: BlobPlacementPolicy = BlobPlacementPolicy.INLINE,
+    ) -> None:
         self.dsn = dsn
         self._connect = connect
+        self.object_store = object_store
+        self.placement_policy = BlobPlacementPolicy(placement_policy)
+        if (
+            self.placement_policy == BlobPlacementPolicy.EXTERNAL_ONLY
+            and self.object_store is None
+        ):
+            raise BlobObjectUnavailableError(
+                "external-only control plane requires an object store"
+            )
 
     def connect(self):
         return self._connect(self.dsn, row_factory=dict_row)
@@ -89,6 +107,12 @@ class PostgresControlPlaneStore:
             self.dsn,
             tenant_id=tenant_id,
             connect=self._connect,
+            object_store=self.object_store,
+            placement_policy=self.placement_policy,
+        )
+        message_content, message_object_ref = runtime._prepare_blob(
+            task,
+            media_type="text/plain; charset=utf-8",
         )
         with self.connect() as connection:
             self._tenant(connection, tenant_id)
@@ -125,10 +149,11 @@ class PostgresControlPlaneStore:
                     config_sha256=hashlib.sha256(config_json.encode()).hexdigest(),
                 ),
             )
-            message_blob = runtime._put_blob_in_transaction(
+            message_blob = runtime._register_prepared_blob_in_transaction(
                 connection,
-                content=task.encode("utf-8"),
+                content=message_content,
                 media_type="text/plain; charset=utf-8",
+                object_ref=message_object_ref,
             )
             connection.execute(
                 "INSERT INTO turns(tenant_id, turn_id, session_id, user_event_id, status, "
