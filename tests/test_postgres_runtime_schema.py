@@ -59,6 +59,12 @@ def _sql() -> str:
         "approvals",
         "budget_reservations",
         "control_commands",
+        "api_idempotency_keys",
+        "run_commands",
+        "run_outbox",
+        "worker_registry",
+        "artifacts",
+        "artifact_refs",
     ],
 )
 def test_runtime_schema_contains_tenant_scoped_table(table: str):
@@ -68,7 +74,12 @@ def test_runtime_schema_contains_tenant_scoped_table(table: str):
 
 
 def test_migrations_are_contiguous_named_and_content_addressed():
-    assert [migration.version for migration in POSTGRES_RUNTIME_MIGRATIONS] == [1, 2, 3]
+    assert [migration.version for migration in POSTGRES_RUNTIME_MIGRATIONS] == [
+        1,
+        2,
+        3,
+        4,
+    ]
     assert all(migration.name for migration in POSTGRES_RUNTIME_MIGRATIONS)
     assert all(re.fullmatch(r"[0-9a-f]{64}", migration.checksum) for migration in POSTGRES_RUNTIME_MIGRATIONS)
 
@@ -80,7 +91,7 @@ def test_migration_runner_accepts_dict_rows_and_is_idempotent():
     connection = _MigrationConnection()
 
     apply_postgres_runtime_migrations(connection)
-    assert [version for version, _ in connection.applied] == [1, 2, 3]
+    assert [version for version, _ in connection.applied] == [1, 2, 3, 4]
 
     first_execution_count = len(connection.executed)
     apply_postgres_runtime_migrations(connection)
@@ -145,7 +156,7 @@ def test_operational_idempotency_and_model_single_active_work_are_enforced():
 
 def test_every_runtime_table_has_tenant_rls_read_and_write_policy():
     sql = _sql()
-    for table in (
+    tenant_tables = (
         "sessions",
         "turns",
         "runs",
@@ -158,7 +169,121 @@ def test_every_runtime_table_has_tenant_rls_read_and_write_policy():
         "approvals",
         "budget_reservations",
         "control_commands",
-    ):
+        "api_idempotency_keys",
+        "run_commands",
+        "run_outbox",
+        "worker_registry",
+        "artifacts",
+        "artifact_refs",
+    )
+    for table in tenant_tables:
         assert f"alter table {table} enable row level security" in sql
         assert f"create policy runtime_tenant_{table} on {table}" in sql
-    assert sql.count("with check (tenant_id = current_setting('app.tenant_id', true))") == 12
+    assert sql.count(
+        "with check (tenant_id = current_setting('app.tenant_id', true))"
+    ) == len(tenant_tables)
+
+
+def test_control_delivery_tables_reference_the_canonical_run_table():
+    sql = _sql()
+
+    assert sql.count("create table runs (") == 1
+    assert sql.count("create table run_events (") == 1
+    for table in ("run_commands", "run_outbox", "artifact_refs"):
+        definition = re.search(rf"create table {table} \((.*?)\);", sql)
+        assert definition is not None
+        assert (
+            "foreign key (tenant_id, run_id) references runs(tenant_id, run_id)"
+            in definition.group(1)
+        )
+
+
+def test_command_queue_supports_idempotent_claim_and_reclaim():
+    sql = _sql()
+    definition = re.search(r"create table run_commands \((.*?)\);", sql)
+    assert definition is not None
+    for column in (
+        "idempotency_key",
+        "expected_stream_version",
+        "claimed_by",
+        "claimed_at",
+        "claim_expires_at",
+        "attempt_count",
+        "last_error_json",
+    ):
+        assert re.search(rf"\b{column}\b", definition.group(1))
+
+    assert "expected_stream_version bigint not null" in definition.group(1)
+    assert "create unique index run_commands_idempotency_uq" in sql
+    assert "where idempotency_key is not null" in sql
+    assert re.search(
+        r"create index run_commands_ready "
+        r"on run_commands\(tenant_id, available_at, command_id\) "
+        r"where status = 'queued'",
+        sql,
+    )
+    assert re.search(
+        r"create index run_commands_expired_claims "
+        r"on run_commands\(tenant_id, claim_expires_at, command_id\) "
+        r"where status = 'claimed'",
+        sql,
+    )
+
+
+def test_outbox_supports_at_least_once_claim_and_publish():
+    sql = _sql()
+    definition = re.search(r"create table run_outbox \((.*?)\);", sql)
+    assert definition is not None
+    for column in (
+        "dedupe_key",
+        "stream_version",
+        "published_at",
+        "claimed_by",
+        "claimed_at",
+        "claim_expires_at",
+        "publish_attempts",
+        "last_error_json",
+    ):
+        assert re.search(rf"\b{column}\b", definition.group(1))
+
+    assert "stream_version bigint not null" in definition.group(1)
+    assert "create unique index run_outbox_dedupe_uq" in sql
+    assert re.search(
+        r"create index run_outbox_pending "
+        r"on run_outbox\(tenant_id, created_at, outbox_id\) "
+        r"where published_at is null",
+        sql,
+    )
+    assert "create index run_outbox_claimable" in sql
+
+
+def test_api_idempotency_persists_request_digest_and_replay_response():
+    sql = _sql()
+    definition = re.search(r"create table api_idempotency_keys \((.*?)\);", sql)
+    assert definition is not None
+    for fragment in (
+        "request_sha256 char(64) not null",
+        "request_json jsonb not null",
+        "resource_id text not null",
+        "response_json jsonb not null",
+        "primary key (tenant_id, idempotency_key, operation)",
+        "foreign key (tenant_id, resource_id) references runs(tenant_id, run_id)",
+    ):
+        assert fragment in definition.group(1)
+
+
+def test_workers_and_artifacts_are_tenant_owned():
+    sql = _sql()
+    workers = re.search(r"create table worker_registry \((.*?)\);", sql)
+    artifacts = re.search(r"create table artifacts \((.*?)\);", sql)
+    refs = re.search(r"create table artifact_refs \((.*?)\);", sql)
+    assert workers is not None and artifacts is not None and refs is not None
+
+    assert "primary key (tenant_id, worker_id)" in workers.group(1)
+    assert "create index worker_registry_available" in sql
+    assert "primary key (tenant_id, sha256)" in artifacts.group(1)
+    assert "unique (tenant_id, object_key)" in artifacts.group(1)
+    assert (
+        "foreign key (tenant_id, sha256) references artifacts(tenant_id, sha256)"
+        in refs.group(1)
+    )

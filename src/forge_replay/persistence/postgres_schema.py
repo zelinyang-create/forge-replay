@@ -439,6 +439,173 @@ POSTGRES_RUNTIME_MIGRATIONS = (
             )
         ),
     ),
+    PostgresMigration(
+        version=4,
+        name="canonical_control_delivery",
+        statements=(
+            """
+            CREATE TABLE api_idempotency_keys (
+                tenant_id text NOT NULL REFERENCES tenants(tenant_id),
+                idempotency_key text NOT NULL,
+                operation text NOT NULL,
+                request_sha256 char(64) NOT NULL,
+                request_json jsonb NOT NULL,
+                resource_id text NOT NULL,
+                response_json jsonb NOT NULL,
+                created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+                expires_at timestamptz,
+                PRIMARY KEY (tenant_id, idempotency_key, operation),
+                FOREIGN KEY (tenant_id, resource_id)
+                    REFERENCES runs(tenant_id, run_id)
+            )
+            """,
+            """
+            CREATE INDEX api_idempotency_expiry
+            ON api_idempotency_keys(tenant_id, expires_at)
+            WHERE expires_at IS NOT NULL
+            """,
+            """
+            CREATE TABLE run_commands (
+                tenant_id text NOT NULL,
+                command_id text NOT NULL,
+                run_id text NOT NULL,
+                command_type text NOT NULL,
+                idempotency_key text,
+                expected_stream_version bigint NOT NULL
+                    CHECK (expected_stream_version >= 0),
+                payload_json jsonb NOT NULL DEFAULT '{}'::jsonb,
+                available_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+                status text NOT NULL DEFAULT 'queued' CHECK (
+                    status IN ('queued', 'claimed', 'done', 'failed', 'cancelled')
+                ),
+                claimed_by text,
+                claimed_at timestamptz,
+                claim_expires_at timestamptz,
+                attempt_count integer NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+                last_error_json jsonb,
+                completed_at timestamptz,
+                created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+                updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+                PRIMARY KEY (tenant_id, command_id),
+                FOREIGN KEY (tenant_id, run_id)
+                    REFERENCES runs(tenant_id, run_id)
+            )
+            """,
+            """
+            CREATE UNIQUE INDEX run_commands_idempotency_uq
+            ON run_commands(tenant_id, run_id, command_type, idempotency_key)
+            WHERE idempotency_key IS NOT NULL
+            """,
+            """
+            CREATE INDEX run_commands_ready
+            ON run_commands(tenant_id, available_at, command_id)
+            WHERE status = 'queued'
+            """,
+            """
+            CREATE INDEX run_commands_expired_claims
+            ON run_commands(tenant_id, claim_expires_at, command_id)
+            WHERE status = 'claimed'
+            """,
+            """
+            CREATE TABLE run_outbox (
+                tenant_id text NOT NULL,
+                outbox_id text NOT NULL,
+                run_id text NOT NULL,
+                destination text NOT NULL,
+                dedupe_key text,
+                stream_version bigint NOT NULL CHECK (stream_version >= 0),
+                payload_json jsonb NOT NULL,
+                created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+                published_at timestamptz,
+                claimed_by text,
+                claimed_at timestamptz,
+                claim_expires_at timestamptz,
+                publish_attempts integer NOT NULL DEFAULT 0
+                    CHECK (publish_attempts >= 0),
+                last_error_json jsonb,
+                PRIMARY KEY (tenant_id, outbox_id),
+                FOREIGN KEY (tenant_id, run_id)
+                    REFERENCES runs(tenant_id, run_id)
+            )
+            """,
+            """
+            CREATE UNIQUE INDEX run_outbox_dedupe_uq
+            ON run_outbox(tenant_id, destination, dedupe_key)
+            WHERE dedupe_key IS NOT NULL
+            """,
+            """
+            CREATE INDEX run_outbox_pending
+            ON run_outbox(tenant_id, created_at, outbox_id)
+            WHERE published_at IS NULL
+            """,
+            """
+            CREATE INDEX run_outbox_claimable
+            ON run_outbox(tenant_id, claim_expires_at, created_at, outbox_id)
+            WHERE published_at IS NULL
+            """,
+            """
+            CREATE TABLE worker_registry (
+                tenant_id text NOT NULL REFERENCES tenants(tenant_id),
+                worker_id text NOT NULL,
+                capabilities_json jsonb NOT NULL,
+                last_heartbeat_at timestamptz NOT NULL,
+                draining boolean NOT NULL DEFAULT false,
+                registered_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+                PRIMARY KEY (tenant_id, worker_id)
+            )
+            """,
+            """
+            CREATE INDEX worker_registry_available
+            ON worker_registry(tenant_id, last_heartbeat_at DESC, worker_id)
+            WHERE draining = false
+            """,
+            """
+            CREATE TABLE artifacts (
+                tenant_id text NOT NULL REFERENCES tenants(tenant_id),
+                sha256 char(64) NOT NULL,
+                size_bytes bigint NOT NULL CHECK (size_bytes >= 0),
+                media_type text NOT NULL,
+                object_key text NOT NULL,
+                created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+                PRIMARY KEY (tenant_id, sha256),
+                UNIQUE (tenant_id, object_key)
+            )
+            """,
+            """
+            CREATE TABLE artifact_refs (
+                tenant_id text NOT NULL,
+                run_id text NOT NULL,
+                sha256 char(64) NOT NULL,
+                purpose text NOT NULL,
+                created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+                PRIMARY KEY (tenant_id, run_id, sha256, purpose),
+                FOREIGN KEY (tenant_id, run_id)
+                    REFERENCES runs(tenant_id, run_id),
+                FOREIGN KEY (tenant_id, sha256)
+                    REFERENCES artifacts(tenant_id, sha256)
+            )
+            """,
+        )
+        + tuple(
+            statement
+            for table in (
+                "api_idempotency_keys",
+                "run_commands",
+                "run_outbox",
+                "worker_registry",
+                "artifacts",
+                "artifact_refs",
+            )
+            for statement in (
+                f"ALTER TABLE {table} ENABLE ROW LEVEL SECURITY",
+                f"""
+                CREATE POLICY runtime_tenant_{table} ON {table}
+                USING (tenant_id = current_setting('app.tenant_id', true))
+                WITH CHECK (tenant_id = current_setting('app.tenant_id', true))
+                """,
+            )
+        ),
+    ),
 )
 
 
