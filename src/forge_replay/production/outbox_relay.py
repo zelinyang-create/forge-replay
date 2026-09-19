@@ -13,6 +13,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Protocol
 
+from forge_replay.production.redis_fanout import RunFanoutPublishResult
 from forge_replay.production.redis_shadow import (
     ShadowProjectionProtocolError,
     ShadowProjectionUnavailableError,
@@ -49,6 +50,15 @@ class ShadowOutboxStore(Protocol):
         outbox_id: str,
         publisher_id: str,
     ) -> bool: ...
+
+
+class RunEventHintPublisher(Protocol):
+    """Narrow publisher contract for disposable run-event wake-up hints."""
+
+    def publish(
+        self,
+        snapshot: ShadowProjectionSnapshot,
+    ) -> RunFanoutPublishResult: ...
 
 
 @dataclass(frozen=True)
@@ -108,6 +118,9 @@ class ShadowRelayResult:
     source_errors: int = 0
     sink_errors: int = 0
     protocol_errors: int = 0
+    fanout_published: int = 0
+    fanout_errors: int = 0
+    fanout_subscriber_deliveries: int = 0
     mark_lost: int = 0
     errors: tuple[ShadowRelayError, ...] = ()
 
@@ -145,6 +158,9 @@ class _RelayCounters:
     source_errors: int = 0
     sink_errors: int = 0
     protocol_errors: int = 0
+    fanout_published: int = 0
+    fanout_errors: int = 0
+    fanout_subscriber_deliveries: int = 0
     mark_lost: int = 0
     errors: list[ShadowRelayError] = field(default_factory=list)
 
@@ -163,6 +179,9 @@ class _RelayCounters:
             source_errors=self.source_errors,
             sink_errors=self.sink_errors,
             protocol_errors=self.protocol_errors,
+            fanout_published=self.fanout_published,
+            fanout_errors=self.fanout_errors,
+            fanout_subscriber_deliveries=self.fanout_subscriber_deliveries,
             mark_lost=self.mark_lost,
             errors=tuple(self.errors),
         )
@@ -202,6 +221,10 @@ class _RelayProtocolError(RuntimeError):
     """An adapter returned a value outside its declared narrow contract."""
 
 
+class _ProjectionSourceConsistencyError(_RelayProtocolError):
+    """The SQL projection read is older than the claimed outbox version."""
+
+
 class _StatusCounters(Protocol):
     applied: int
     stale: int
@@ -220,12 +243,18 @@ class ShadowProjectionRelay:
         sink: ShadowProjectionSink,
         projection_config: ShadowProjectionConfig,
         relay_config: ShadowRelayConfig,
+        fanout_publisher: RunEventHintPublisher | None = None,
     ) -> None:
+        if projection_config.features.redis_fanout and fanout_publisher is None:
+            raise ValueError(
+                "Redis fanout is enabled but no run event hint publisher was provided"
+            )
         self._outbox_store = outbox_store
         self._source = source
         self._sink = sink
         self._projection_config = projection_config
         self._relay_config = relay_config
+        self._fanout_publisher = fanout_publisher
 
     def run_once(self) -> ShadowRelayResult:
         """Claim and process at most one batch, isolating failures per row."""
@@ -275,7 +304,7 @@ class ShadowProjectionRelay:
                 counters.errors.append(_error(stage="claim_row", exc=exc))
                 continue
 
-            tenant_id, run_id, outbox_id = identity
+            tenant_id, run_id, outbox_id, claimed_stream_version = identity
             try:
                 snapshot = self._source.load_projection(
                     tenant_id=tenant_id,
@@ -301,7 +330,23 @@ class ShadowProjectionRelay:
                     raise _RelayProtocolError(
                         "load_projection returned a different projection identity"
                     )
+                if snapshot.stream_version < claimed_stream_version:
+                    raise _ProjectionSourceConsistencyError(
+                        "load_projection returned a version older than the claim"
+                    )
                 counters.snapshots_loaded += 1
+            except _ProjectionSourceConsistencyError as exc:
+                counters.protocol_errors += 1
+                counters.errors.append(
+                    _error(
+                        stage="source_consistency",
+                        exc=exc,
+                        tenant_id=tenant_id,
+                        run_id=run_id,
+                        outbox_id=outbox_id,
+                    )
+                )
+                continue
             except _RelayProtocolError as exc:
                 counters.protocol_errors += 1
                 counters.errors.append(
@@ -382,6 +427,68 @@ class ShadowProjectionRelay:
                     )
                 )
                 continue
+
+            if self._projection_config.features.redis_fanout:
+                # The publisher is guaranteed by the constructor when fanout
+                # is enabled.  Keeping this guard explicit makes a corrupted
+                # runtime configuration fail retryably rather than acknowledging
+                # the authoritative outbox row without its wake-up hint.
+                publisher = self._fanout_publisher
+                if publisher is None:  # pragma: no cover - constructor invariant
+                    counters.fanout_errors += 1
+                    counters.protocol_errors += 1
+                    counters.errors.append(
+                        _diagnostic(
+                            stage="fanout_protocol",
+                            error_type="MissingFanoutPublisher",
+                            tenant_id=tenant_id,
+                            run_id=run_id,
+                            outbox_id=outbox_id,
+                        )
+                    )
+                    continue
+                try:
+                    publish_result = publisher.publish(snapshot)
+                    if not isinstance(publish_result, RunFanoutPublishResult):
+                        raise _RelayProtocolError(
+                            "fanout publisher returned an invalid result"
+                        )
+                    subscriber_count = publish_result.subscriber_count
+                    if (
+                        isinstance(subscriber_count, bool)
+                        or not isinstance(subscriber_count, int)
+                        or subscriber_count < 0
+                    ):
+                        raise _RelayProtocolError(
+                            "fanout publisher returned an invalid subscriber count"
+                        )
+                except _RelayProtocolError as exc:
+                    counters.fanout_errors += 1
+                    counters.protocol_errors += 1
+                    counters.errors.append(
+                        _error(
+                            stage="fanout_protocol",
+                            exc=exc,
+                            tenant_id=tenant_id,
+                            run_id=run_id,
+                            outbox_id=outbox_id,
+                        )
+                    )
+                    continue
+                except Exception as exc:  # noqa: BLE001 - keep the row retryable
+                    counters.fanout_errors += 1
+                    counters.errors.append(
+                        _error(
+                            stage="fanout",
+                            exc=exc,
+                            tenant_id=tenant_id,
+                            run_id=run_id,
+                            outbox_id=outbox_id,
+                        )
+                    )
+                    continue
+                counters.fanout_published += 1
+                counters.fanout_subscriber_deliveries += subscriber_count
 
             try:
                 marked = self._outbox_store.mark_outbox_published(
@@ -582,7 +689,7 @@ def _claimed_identity(
     *,
     tenant_id: str,
     publisher_id: str,
-) -> tuple[str, str, str]:
+) -> tuple[str, str, str, int]:
     if not isinstance(row, Mapping):
         raise TypeError("claimed outbox row must be a mapping")
     row_tenant_id = _validate_identity(
@@ -594,6 +701,13 @@ def _claimed_identity(
     outbox_id = _validate_identity(
         row.get("outbox_id"), field_name="outbox_id", maximum=512
     )
+    stream_version = row.get("stream_version")
+    if (
+        isinstance(stream_version, bool)
+        or not isinstance(stream_version, int)
+        or stream_version < 0
+    ):
+        raise ValueError("claimed outbox stream_version must be a non-negative integer")
     if row_tenant_id != tenant_id:
         raise ValueError("claimed outbox row belongs to a different tenant")
 
@@ -603,7 +717,7 @@ def _claimed_identity(
     claimed_by = row.get("claimed_by")
     if claimed_by != publisher_id:
         raise ValueError("claimed outbox row is not owned by this publisher")
-    return row_tenant_id, run_id, outbox_id
+    return row_tenant_id, run_id, outbox_id, stream_version
 
 
 def _validate_page(
@@ -721,6 +835,7 @@ def _validate_identity(value: object, *, field_name: str, maximum: int) -> str:
 
 __all__ = [
     "RUN_PROJECTION_DESTINATION",
+    "RunEventHintPublisher",
     "ShadowOutboxStore",
     "ShadowProjectionRebuilder",
     "ShadowProjectionRelay",

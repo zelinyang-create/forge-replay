@@ -55,6 +55,7 @@ def claim(
     destination: str = RUN_PROJECTION_DESTINATION,
     publisher_id: str = "relay-1",
     payload_json: object = None,
+    stream_version: int = 7,
 ) -> dict[str, object]:
     return {
         "tenant_id": tenant_id,
@@ -62,6 +63,7 @@ def claim(
         "outbox_id": outbox_id or f"outbox-{run_id}",
         "destination": destination,
         "claimed_by": publisher_id,
+        "stream_version": stream_version,
         "payload_json": payload_json,
     }
 
@@ -390,6 +392,29 @@ def test_batch_counts_missing_malformed_and_each_write_outcome():
             "run_id": "run",
             "outbox_id": "no-owner",
             "destination": RUN_PROJECTION_DESTINATION,
+        },
+        {
+            "tenant_id": "tenant-a",
+            "run_id": "run",
+            "outbox_id": "no-stream-version",
+            "destination": RUN_PROJECTION_DESTINATION,
+            "claimed_by": "relay-1",
+        },
+        {
+            "tenant_id": "tenant-a",
+            "run_id": "run",
+            "outbox_id": "bool-stream-version",
+            "destination": RUN_PROJECTION_DESTINATION,
+            "claimed_by": "relay-1",
+            "stream_version": True,
+        },
+        {
+            "tenant_id": "tenant-a",
+            "run_id": "run",
+            "outbox_id": "negative-stream-version",
+            "destination": RUN_PROJECTION_DESTINATION,
+            "claimed_by": "relay-1",
+            "stream_version": -1,
         },
         {"tenant_id": "tenant-a", "run_id": "run", "outbox_id": 123},
         {"tenant_id": "tenant-a", "run_id": "run\x00bad", "outbox_id": "outbox"},
