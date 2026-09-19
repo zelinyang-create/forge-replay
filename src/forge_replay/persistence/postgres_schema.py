@@ -606,6 +606,53 @@ POSTGRES_RUNTIME_MIGRATIONS = (
             )
         ),
     ),
+    PostgresMigration(
+        version=5,
+        name="managed_run_admission",
+        statements=(
+            """
+            CREATE UNIQUE INDEX turns_tenant_session_turn_uq
+            ON turns(tenant_id, session_id, turn_id)
+            """,
+            """
+            CREATE TABLE managed_run_requests (
+                tenant_id text NOT NULL,
+                run_id text NOT NULL,
+                session_id text NOT NULL,
+                turn_id text NOT NULL,
+                admission_event_key text NOT NULL,
+                request_sha256 char(64) NOT NULL,
+                request_json jsonb NOT NULL,
+                actor_user_id text NOT NULL,
+                repository text NOT NULL,
+                base_commit_sha text NOT NULL,
+                created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+                PRIMARY KEY (tenant_id, run_id),
+                UNIQUE (tenant_id, admission_event_key),
+                FOREIGN KEY (tenant_id, run_id)
+                    REFERENCES runs(tenant_id, run_id),
+                FOREIGN KEY (tenant_id, session_id, turn_id)
+                    REFERENCES turns(tenant_id, session_id, turn_id)
+            )
+            """,
+            """
+            CREATE INDEX managed_run_requests_by_session
+            ON managed_run_requests(tenant_id, session_id, created_at DESC, run_id)
+            """,
+            """
+            CREATE INDEX managed_run_requests_by_actor
+            ON managed_run_requests(tenant_id, actor_user_id, created_at DESC, run_id)
+            """,
+            """
+            ALTER TABLE managed_run_requests ENABLE ROW LEVEL SECURITY
+            """,
+            """
+            CREATE POLICY runtime_tenant_managed_run_requests ON managed_run_requests
+            USING (tenant_id = current_setting('app.tenant_id', true))
+            WITH CHECK (tenant_id = current_setting('app.tenant_id', true))
+            """,
+        ),
+    ),
 )
 
 

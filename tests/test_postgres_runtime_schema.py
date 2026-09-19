@@ -65,6 +65,7 @@ def _sql() -> str:
         "worker_registry",
         "artifacts",
         "artifact_refs",
+        "managed_run_requests",
     ],
 )
 def test_runtime_schema_contains_tenant_scoped_table(table: str):
@@ -79,6 +80,7 @@ def test_migrations_are_contiguous_named_and_content_addressed():
         2,
         3,
         4,
+        5,
     ]
     assert all(migration.name for migration in POSTGRES_RUNTIME_MIGRATIONS)
     assert all(re.fullmatch(r"[0-9a-f]{64}", migration.checksum) for migration in POSTGRES_RUNTIME_MIGRATIONS)
@@ -87,11 +89,22 @@ def test_migrations_are_contiguous_named_and_content_addressed():
     assert changed.checksum != POSTGRES_RUNTIME_MIGRATIONS[0].checksum
 
 
+def test_published_control_delivery_migration_is_immutable():
+    migration = POSTGRES_RUNTIME_MIGRATIONS[3]
+
+    assert migration.version == 4
+    assert migration.name == "canonical_control_delivery"
+    assert (
+        migration.checksum
+        == "7813df8bcd9f01897983eced2448b999d094e5460c692dca3d7bed382dc068e2"
+    )
+
+
 def test_migration_runner_accepts_dict_rows_and_is_idempotent():
     connection = _MigrationConnection()
 
     apply_postgres_runtime_migrations(connection)
-    assert [version for version, _ in connection.applied] == [1, 2, 3, 4]
+    assert [version for version, _ in connection.applied] == [1, 2, 3, 4, 5]
 
     first_execution_count = len(connection.executed)
     apply_postgres_runtime_migrations(connection)
@@ -175,6 +188,7 @@ def test_every_runtime_table_has_tenant_rls_read_and_write_policy():
         "worker_registry",
         "artifacts",
         "artifact_refs",
+        "managed_run_requests",
     )
     for table in tenant_tables:
         assert f"alter table {table} enable row level security" in sql
@@ -287,3 +301,51 @@ def test_workers_and_artifacts_are_tenant_owned():
         "foreign key (tenant_id, sha256) references artifacts(tenant_id, sha256)"
         in refs.group(1)
     )
+
+
+def test_managed_run_admission_is_a_durable_canonical_run_fact():
+    sql = _sql()
+    definition = re.search(r"create table managed_run_requests \((.*?)\);", sql)
+    assert definition is not None
+
+    for fragment in (
+        "tenant_id text not null",
+        "run_id text not null",
+        "session_id text not null",
+        "turn_id text not null",
+        "admission_event_key text not null",
+        "request_sha256 char(64) not null",
+        "request_json jsonb not null",
+        "actor_user_id text not null",
+        "repository text not null",
+        "base_commit_sha text not null",
+        "created_at timestamptz not null default clock_timestamp()",
+        "primary key (tenant_id, run_id)",
+        "unique (tenant_id, admission_event_key)",
+        "foreign key (tenant_id, run_id) references runs(tenant_id, run_id)",
+        "foreign key (tenant_id, session_id, turn_id) references turns(tenant_id, session_id, turn_id)",
+    ):
+        assert fragment in definition.group(1)
+
+    assert "expires_at" not in definition.group(1)
+    assert (
+        "create unique index turns_tenant_session_turn_uq "
+        "on turns(tenant_id, session_id, turn_id)"
+    ) in sql
+    assert "create index managed_run_requests_by_session" in sql
+    assert "create index managed_run_requests_by_actor" in sql
+
+
+def test_managed_admission_migration_does_not_redefine_authority_tables():
+    sql = _sql()
+    admission = POSTGRES_RUNTIME_MIGRATIONS[4]
+
+    assert admission.version == 5
+    assert admission.name == "managed_run_admission"
+    assert all("create table runs" not in statement.lower() for statement in admission.statements)
+    assert all(
+        "create table run_events" not in statement.lower()
+        for statement in admission.statements
+    )
+    assert sql.count("create table runs (") == 1
+    assert sql.count("create table run_events (") == 1
