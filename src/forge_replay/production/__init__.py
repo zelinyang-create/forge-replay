@@ -1,5 +1,13 @@
 """Production boundary adapters for ForgeReplay."""
 
+from forge_replay.production.active_index_read import (
+    ActiveRunFallbackReason,
+    ActiveRunIndexReadService,
+    ActiveRunReadProtocolError,
+    ActiveRunReadResult,
+    ActiveRunReadSource,
+    ActiveRunSqlPage,
+)
 from forge_replay.production.event_stream import (
     GapFillingRunEventStream,
     RunEventStreamItem,
@@ -35,6 +43,13 @@ from forge_replay.production.outbox_relay import (
 )
 from forge_replay.production.policy import PolicyBundle, SignedPolicyEvaluator
 from forge_replay.production.postgres_shadow import PostgresShadowProjectionSource
+from forge_replay.production.redis_active_index import (
+    ActiveRunIndexEntry,
+    ActiveRunIndexPage,
+    ActiveRunIndexProtocolError,
+    ActiveRunIndexUnavailableError,
+    RedisActiveRunIndex,
+)
 from forge_replay.production.redis_fanout import (
     RedisRunEventHintPublisher,
     RunEventHint,
@@ -67,6 +82,7 @@ from forge_replay.production.sandbox import (
 from forge_replay.production.shadow_config import (
     Phase2RedisFeatureFlags,
     Phase3RedisFeatureFlags,
+    RedisActiveIndexAdmissionEvidence,
     RedisFanoutAdmissionEvidence,
     RedisReadAdmissionEvidence,
     ShadowProjectionConfig,
@@ -91,6 +107,16 @@ from forge_replay.production.workspace_snapshot import (
 
 __all__ = [
     "RUN_PROJECTION_DESTINATION",
+    "ActiveRunFallbackReason",
+    "ActiveRunIndexEntry",
+    "ActiveRunIndexPage",
+    "ActiveRunIndexProtocolError",
+    "ActiveRunIndexReadService",
+    "ActiveRunIndexUnavailableError",
+    "ActiveRunReadProtocolError",
+    "ActiveRunReadResult",
+    "ActiveRunReadSource",
+    "ActiveRunSqlPage",
     "AgentRuntimeFactory",
     "AgentRuntimeSession",
     "AsyncRedisRunHintSubscriber",
@@ -117,6 +143,8 @@ __all__ = [
     "PostgresShadowProjectionSource",
     "ProjectionWriteResult",
     "ProjectionWriteStatus",
+    "RedisActiveIndexAdmissionEvidence",
+    "RedisActiveRunIndex",
     "RedisFanoutAdmissionEvidence",
     "RedisReadAdmissionEvidence",
     "RedisRunEventHintPublisher",

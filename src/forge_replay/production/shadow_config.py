@@ -144,8 +144,55 @@ class RedisFanoutAdmissionEvidence:
 
 
 @dataclass(frozen=True)
+class RedisActiveIndexAdmissionEvidence:
+    """Safety evidence required for the disposable active-run index.
+
+    Capacity and performance pressure is recorded separately in
+    :class:`RedisReadAdmissionEvidence`.  This evidence proves that the index
+    can be discarded, rebuilt, retried, and paged without becoming an
+    authority for run lifecycle state.
+    """
+
+    redis_flush_rebuild_tested: bool
+    out_of_order_tested: bool
+    duplicate_tested: bool
+    terminal_removal_tested: bool
+    redis_disconnect_fallback_tested: bool
+    pagination_fallback_tested: bool
+    canary_percent: float
+
+    def __post_init__(self) -> None:
+        for name in (
+            "redis_flush_rebuild_tested",
+            "out_of_order_tested",
+            "duplicate_tested",
+            "terminal_removal_tested",
+            "redis_disconnect_fallback_tested",
+            "pagination_fallback_tested",
+        ):
+            if not isinstance(getattr(self, name), bool):
+                raise TypeError(f"{name} must be a bool")
+        _finite_percent(self.canary_percent, field="canary_percent")
+        if self.canary_percent == 0:
+            raise ValueError("canary_percent must be greater than zero")
+
+    @property
+    def qualifies(self) -> bool:
+        """Whether every mandatory index failure-mode drill has passed."""
+
+        return (
+            self.redis_flush_rebuild_tested
+            and self.out_of_order_tested
+            and self.duplicate_tested
+            and self.terminal_removal_tested
+            and self.redis_disconnect_fallback_tested
+            and self.pagination_fallback_tested
+        )
+
+
+@dataclass(frozen=True)
 class Phase3RedisFeatureFlags:
-    """Phase 3 permits gated UI reads and independently gated fanout.
+    """Phase 3 permits independently gated UI, fanout, and active-index reads.
 
     Queue features remain forbidden. Both PostgreSQL read and queue fallbacks
     are mandatory so Redis never becomes authoritative.
@@ -154,18 +201,23 @@ class Phase3RedisFeatureFlags:
     redis_cache_write: bool = False
     redis_cache_read: bool = False
     redis_fanout: bool = False
+    redis_active_index_write: bool = False
+    redis_active_index_read: bool = False
     redis_queue_publish: bool = False
     redis_queue_consume: bool = False
     postgres_read_fallback: bool = True
     postgres_queue_fallback: bool = True
     read_admission_evidence: RedisReadAdmissionEvidence | None = None
     fanout_admission_evidence: RedisFanoutAdmissionEvidence | None = None
+    active_index_admission_evidence: RedisActiveIndexAdmissionEvidence | None = None
 
     def __post_init__(self) -> None:
         for name in (
             "redis_cache_write",
             "redis_cache_read",
             "redis_fanout",
+            "redis_active_index_write",
+            "redis_active_index_read",
             "redis_queue_publish",
             "redis_queue_consume",
             "postgres_read_fallback",
@@ -186,6 +238,10 @@ class Phase3RedisFeatureFlags:
             )
         if not self.postgres_read_fallback or not self.postgres_queue_fallback:
             raise ValueError("Phase 3 requires PostgreSQL read and queue fallbacks")
+        if self.redis_active_index_write and not self.redis_cache_write:
+            raise ValueError(
+                "Phase 3 active-index writes require shadow projection writes"
+            )
 
         if self.redis_fanout:
             if not self.redis_cache_write or not self.redis_cache_read:
@@ -229,6 +285,45 @@ class Phase3RedisFeatureFlags:
         ):
             raise TypeError("read_admission_evidence must be RedisReadAdmissionEvidence")
 
+        if self.redis_active_index_read:
+            if not self.redis_active_index_write:
+                raise ValueError("Phase 3 active-index reads require active-index writes")
+            read_evidence = self.read_admission_evidence
+            if read_evidence is None:
+                raise ValueError(
+                    "Phase 3 active-index reads require performance admission evidence"
+                )
+            if not isinstance(read_evidence, RedisReadAdmissionEvidence):
+                raise TypeError(
+                    "read_admission_evidence must be RedisReadAdmissionEvidence"
+                )
+            if not read_evidence.qualifies:
+                raise ValueError(
+                    "Phase 3 active-index read admission thresholds are not met"
+                )
+            index_evidence = self.active_index_admission_evidence
+            if index_evidence is None:
+                raise ValueError(
+                    "Phase 3 active-index reads require safety admission evidence"
+                )
+            if not isinstance(index_evidence, RedisActiveIndexAdmissionEvidence):
+                raise TypeError(
+                    "active_index_admission_evidence must be "
+                    "RedisActiveIndexAdmissionEvidence"
+                )
+            if not index_evidence.qualifies:
+                raise ValueError(
+                    "Phase 3 active-index safety drills are not complete"
+                )
+        elif self.active_index_admission_evidence is not None and not isinstance(
+            self.active_index_admission_evidence,
+            RedisActiveIndexAdmissionEvidence,
+        ):
+            raise TypeError(
+                "active_index_admission_evidence must be "
+                "RedisActiveIndexAdmissionEvidence"
+            )
+
     @classmethod
     def ui_status_reads(
         cls,
@@ -256,6 +351,31 @@ class Phase3RedisFeatureFlags:
             redis_fanout=True,
             read_admission_evidence=read_evidence,
             fanout_admission_evidence=fanout_evidence,
+        )
+
+    @classmethod
+    def active_run_index_reads(
+        cls,
+        read_evidence: RedisReadAdmissionEvidence,
+        index_evidence: RedisActiveIndexAdmissionEvidence,
+    ) -> Phase3RedisFeatureFlags:
+        """Enable only active-index reads after both admission gates pass."""
+
+        return cls(
+            redis_cache_write=True,
+            redis_active_index_write=True,
+            redis_active_index_read=True,
+            read_admission_evidence=read_evidence,
+            active_index_admission_evidence=index_evidence,
+        )
+
+    @classmethod
+    def active_run_index_shadow_writes(cls) -> Phase3RedisFeatureFlags:
+        """Warm the disposable index while every list read remains on SQL."""
+
+        return cls(
+            redis_cache_write=True,
+            redis_active_index_write=True,
         )
 
 
