@@ -112,11 +112,43 @@ class RedisReadAdmissionEvidence:
 
 
 @dataclass(frozen=True)
-class Phase3RedisFeatureFlags:
-    """Phase 3 permits only gated UI-status reads in addition to writes.
+class RedisFanoutAdmissionEvidence:
+    """Safety drills and canary scope required before Redis fanout is enabled."""
 
-    Fanout and queue features remain forbidden.  Both PostgreSQL read and
-    queue fallbacks are mandatory so Redis never becomes authoritative.
+    sql_gap_fill_tested: bool
+    redis_disconnect_tested: bool
+    duplicate_hint_tested: bool
+    canary_percent: float
+
+    def __post_init__(self) -> None:
+        for name in (
+            "sql_gap_fill_tested",
+            "redis_disconnect_tested",
+            "duplicate_hint_tested",
+        ):
+            if not isinstance(getattr(self, name), bool):
+                raise TypeError(f"{name} must be a bool")
+        _finite_percent(self.canary_percent, field="canary_percent")
+        if self.canary_percent == 0:
+            raise ValueError("canary_percent must be greater than zero")
+
+    @property
+    def qualifies(self) -> bool:
+        """Whether every mandatory failure-mode drill has passed."""
+
+        return (
+            self.sql_gap_fill_tested
+            and self.redis_disconnect_tested
+            and self.duplicate_hint_tested
+        )
+
+
+@dataclass(frozen=True)
+class Phase3RedisFeatureFlags:
+    """Phase 3 permits gated UI reads and independently gated fanout.
+
+    Queue features remain forbidden. Both PostgreSQL read and queue fallbacks
+    are mandatory so Redis never becomes authoritative.
     """
 
     redis_cache_write: bool = False
@@ -127,6 +159,7 @@ class Phase3RedisFeatureFlags:
     postgres_read_fallback: bool = True
     postgres_queue_fallback: bool = True
     read_admission_evidence: RedisReadAdmissionEvidence | None = None
+    fanout_admission_evidence: RedisFanoutAdmissionEvidence | None = None
 
     def __post_init__(self) -> None:
         for name in (
@@ -142,18 +175,42 @@ class Phase3RedisFeatureFlags:
                 raise TypeError(f"{name} must be a bool")
 
         forbidden = {
-            "redis_fanout": self.redis_fanout,
             "redis_queue_publish": self.redis_queue_publish,
             "redis_queue_consume": self.redis_queue_consume,
         }
         enabled = [name for name, value in forbidden.items() if value]
         if enabled:
             raise ValueError(
-                "Phase 3 UI status rollout forbids Redis fanout/queue features: "
+                "Phase 3 rollout forbids Redis queue features: "
                 + ", ".join(enabled)
             )
         if not self.postgres_read_fallback or not self.postgres_queue_fallback:
             raise ValueError("Phase 3 requires PostgreSQL read and queue fallbacks")
+
+        if self.redis_fanout:
+            if not self.redis_cache_write or not self.redis_cache_read:
+                raise ValueError(
+                    "Phase 3 Redis fanout requires shadow writes and gated reads"
+                )
+            evidence = self.fanout_admission_evidence
+            if evidence is None:
+                raise ValueError(
+                    "Phase 3 Redis fanout admission gate forbids enabling without evidence"
+                )
+            if not isinstance(evidence, RedisFanoutAdmissionEvidence):
+                raise TypeError(
+                    "fanout_admission_evidence must be RedisFanoutAdmissionEvidence"
+                )
+            if not evidence.qualifies:
+                raise ValueError("Phase 3 Redis fanout safety drills are not complete")
+        elif self.fanout_admission_evidence is not None and not isinstance(
+            self.fanout_admission_evidence,
+            RedisFanoutAdmissionEvidence,
+        ):
+            raise TypeError(
+                "fanout_admission_evidence must be RedisFanoutAdmissionEvidence"
+            )
+
         if self.redis_cache_read:
             if not self.redis_cache_write:
                 raise ValueError("Phase 3 Redis reads require shadow writes")
@@ -183,6 +240,22 @@ class Phase3RedisFeatureFlags:
             redis_cache_write=True,
             redis_cache_read=True,
             read_admission_evidence=evidence,
+        )
+
+    @classmethod
+    def ui_status_with_fanout(
+        cls,
+        read_evidence: RedisReadAdmissionEvidence,
+        fanout_evidence: RedisFanoutAdmissionEvidence,
+    ) -> Phase3RedisFeatureFlags:
+        """Enable UI reads and fanout after both admission gates validate."""
+
+        return cls(
+            redis_cache_write=True,
+            redis_cache_read=True,
+            redis_fanout=True,
+            read_admission_evidence=read_evidence,
+            fanout_admission_evidence=fanout_evidence,
         )
 
 

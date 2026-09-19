@@ -30,6 +30,14 @@ from forge_replay.production.outbox_relay import (
 )
 from forge_replay.production.policy import PolicyBundle, SignedPolicyEvaluator
 from forge_replay.production.postgres_shadow import PostgresShadowProjectionSource
+from forge_replay.production.redis_fanout import (
+    RedisRunEventHintPublisher,
+    RunEventHint,
+    RunFanoutProtocolError,
+    RunFanoutPublishResult,
+    RunFanoutUnavailableError,
+    fanout_channel,
+)
 from forge_replay.production.redis_shadow import (
     RedisShadowProjectionSink,
     ShadowProjectionProtocolError,
@@ -51,6 +59,7 @@ from forge_replay.production.sandbox import (
 from forge_replay.production.shadow_config import (
     Phase2RedisFeatureFlags,
     Phase3RedisFeatureFlags,
+    RedisFanoutAdmissionEvidence,
     RedisReadAdmissionEvidence,
     ShadowProjectionConfig,
     ShadowProjectionTtlConfig,
@@ -98,12 +107,18 @@ __all__ = [
     "PostgresShadowProjectionSource",
     "ProjectionWriteResult",
     "ProjectionWriteStatus",
+    "RedisFanoutAdmissionEvidence",
     "RedisReadAdmissionEvidence",
+    "RedisRunEventHintPublisher",
     "RedisShadowProjectionReader",
     "RedisShadowProjectionSink",
     "RegionalFailoverController",
     "ReleaseGate",
     "RetryableManagedRunError",
+    "RunEventHint",
+    "RunFanoutProtocolError",
+    "RunFanoutPublishResult",
+    "RunFanoutUnavailableError",
     "SandboxAttestation",
     "SandboxHandle",
     "SandboxProcessSupervisor",
@@ -131,4 +146,5 @@ __all__ = [
     "WorkspaceSnapshot",
     "WorkspaceSnapshotManager",
     "build_managed_control_plane",
+    "fanout_channel",
 ]
