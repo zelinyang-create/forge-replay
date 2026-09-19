@@ -20,6 +20,7 @@ from forge_replay.production.managed import (
     PermanentManagedRunError,
     PostgresAuthorityFactory,
     RetryableManagedRunError,
+    WorkspaceAgentExecutor,
     build_managed_control_plane,
 )
 from forge_replay.records import RunLease
@@ -181,6 +182,74 @@ class FakeExecutor:
             raise self.error
 
 
+class RecordingGuard:
+    def __init__(
+        self,
+        actions: list[str],
+        *,
+        fail_on: int | None = None,
+    ) -> None:
+        self.actions = actions
+        self.fail_on = fail_on
+        self.calls = 0
+
+    def raise_if_lost(self) -> None:
+        self.calls += 1
+        self.actions.append(f"guard:{self.calls}")
+        if self.calls == self.fail_on:
+            raise ManagedLeaseLostError("injected guard loss")
+
+
+class BorrowedRuntimeStore(FakeRuntimeStore):
+    def __init__(self, actions: list[str]) -> None:
+        super().__init__(actions)
+        self.acquire_calls = 0
+        self.release_calls = 0
+
+    def acquire_run_lease(self, **_kwargs: Any) -> None:
+        self.acquire_calls += 1
+        raise AssertionError("composed runtime must borrow the worker lease")
+
+    def release_run_lease(self, *_args: Any, **_kwargs: Any) -> None:
+        self.release_calls += 1
+        raise AssertionError("composed runtime must not release the worker lease")
+
+
+class RecordingRuntime:
+    def __init__(
+        self,
+        actions: list[str],
+        expected_context: ExecutionContext,
+        *,
+        error: Exception | None = None,
+    ) -> None:
+        self.actions = actions
+        self.expected_context = expected_context
+        self.error = error
+
+    def run(self, run_id: str, *, execution_context: ExecutionContext) -> str:
+        assert run_id == "run-1"
+        assert execution_context is self.expected_context
+        self.actions.append("runtime")
+        if self.error is not None:
+            raise self.error
+        return "completed"
+
+
+class RecordingRuntimeSession:
+    def __init__(self, actions: list[str], runtime: RecordingRuntime) -> None:
+        self.actions = actions
+        self.runtime = runtime
+
+    def __enter__(self) -> RecordingRuntime:
+        self.actions.append("session_enter")
+        return self.runtime
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        del exc_type, exc_value, traceback
+        self.actions.append("session_exit")
+
+
 def _worker(
     *,
     command: dict[str, Any] | None = None,
@@ -322,6 +391,239 @@ def test_successful_worker_order_is_fenced_and_ack_precedes_release():
     assert executor.calls[0]["execution_context"].lease_epoch == 7
     assert executor.calls[0]["execution_context"].stream_version == 2
     assert executor.calls[0]["recovery"] is False
+
+
+def test_workspace_agent_executor_reuses_one_context_in_strict_guarded_order():
+    actions: list[str] = []
+    runtime_store = BorrowedRuntimeStore(actions)
+    context = ExecutionContext(
+        run_id="run-1",
+        worker_id="worker-1",
+        lease_epoch=7,
+        lease_expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+        stream_version=2,
+    )
+    guard = RecordingGuard(actions)
+
+    class Controller:
+        def provision(self, run_id: str, **kwargs: Any) -> None:
+            assert run_id == "run-1"
+            assert kwargs == {
+                "dirty_mode": "head-only",
+                "execution_context": context,
+            }
+            actions.append("provision")
+
+    def workspace_factory(**kwargs: Any) -> Controller:
+        assert kwargs["runtime_store"] is runtime_store
+        assert kwargs["process_instance_id"] == "worker-1"
+        assert kwargs["command"] is command
+        assert kwargs["recovery"] is True
+        actions.append("workspace_factory")
+        return Controller()
+
+    def runtime_factory(**kwargs: Any) -> RecordingRuntimeSession:
+        assert kwargs["runtime_store"] is runtime_store
+        assert kwargs["process_instance_id"] == "worker-1"
+        assert kwargs["command"] is command
+        assert kwargs["recovery"] is True
+        actions.append("runtime_factory")
+        return RecordingRuntimeSession(
+            actions,
+            RecordingRuntime(actions, context),
+        )
+
+    command = _command()
+    executor = WorkspaceAgentExecutor(
+        workspace_factory,
+        runtime_factory,
+        dirty_mode="head-only",
+    )
+
+    outcome = executor.execute(
+        command=command,
+        runtime_store=runtime_store,  # type: ignore[arg-type]
+        execution_context=context,
+        lease_guard=guard,  # type: ignore[arg-type]
+        recovery=True,
+    )
+
+    assert outcome == "completed"
+    assert actions == [
+        "guard:1",
+        "workspace_factory",
+        "provision",
+        "guard:2",
+        "runtime_factory",
+        "session_enter",
+        "guard:3",
+        "runtime",
+        "guard:4",
+        "session_exit",
+        "guard:5",
+    ]
+    assert runtime_store.acquire_calls == 0
+    assert runtime_store.release_calls == 0
+
+
+@pytest.mark.parametrize("stage", ["provision", "runtime_factory", "runtime"])
+def test_composed_executor_failures_never_ack_and_worker_always_releases(
+    stage: str,
+):
+    actions: list[str] = []
+    control = FakeControlStore(actions, commands=[_command()])
+    runtime_store = BorrowedRuntimeStore(actions)
+    session_exits: list[str] = []
+
+    class Controller:
+        def provision(self, _run_id: str, **_kwargs: Any) -> None:
+            actions.append("provision")
+            if stage == "provision":
+                raise RuntimeError("provision failed")
+
+    def workspace_factory(**_kwargs: Any) -> Controller:
+        return Controller()
+
+    def runtime_factory(**_kwargs: Any):
+        actions.append("runtime_factory")
+        if stage == "runtime_factory":
+            raise RuntimeError("runtime construction failed")
+
+        class Session:
+            def __enter__(self):
+                actions.append("session_enter")
+
+                class Runtime:
+                    def run(self, _run_id: str, *, execution_context):
+                        del execution_context
+                        actions.append("runtime")
+                        if stage == "runtime":
+                            raise RuntimeError("runtime failed")
+                        return "completed"
+
+                return Runtime()
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                del exc_type, exc_value, traceback
+                actions.append("session_exit")
+                session_exits.append(stage)
+
+        return Session()
+
+    worker = ManagedWorker(
+        FakeFactory(control, runtime_store, actions),  # type: ignore[arg-type]
+        ManagedWorkerConfig(
+            tenant_id="tenant-a",
+            worker_id="worker-1",
+            command_visibility_timeout_seconds=5,
+            run_lease_ttl_seconds=5,
+            heartbeat_interval_seconds=1,
+        ),
+        WorkspaceAgentExecutor(workspace_factory, runtime_factory),
+    )
+
+    assert worker.run_once() is True
+    assert "ack" not in actions
+    assert actions[-2:] == ["fail", "release"]
+    assert session_exits == (["runtime"] if stage == "runtime" else [])
+    assert runtime_store.acquire_calls == 0
+    assert runtime_store.release_calls == 0
+
+
+def test_guard_failure_after_runtime_cleans_session_and_blocks_ack(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    actions: list[str] = []
+    control = FakeControlStore(actions, commands=[_command()])
+    runtime_store = BorrowedRuntimeStore(actions)
+
+    class Controller:
+        def provision(self, _run_id: str, **_kwargs: Any) -> None:
+            actions.append("provision")
+
+    def runtime_factory(**kwargs: Any) -> RecordingRuntimeSession:
+        context = active_context[0]
+        return RecordingRuntimeSession(
+            actions,
+            RecordingRuntime(actions, context),
+        )
+
+    active_context: list[ExecutionContext] = []
+
+    class LosingGuard(RecordingGuard):
+        def __init__(self, _control, _runtime, _config, _command_id, context):
+            active_context.append(context)
+            super().__init__(actions, fail_on=4)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            del exc_type, exc_value, traceback
+
+    monkeypatch.setattr(managed_module, "LeaseGuard", LosingGuard)
+    executor = WorkspaceAgentExecutor(
+        lambda **_kwargs: Controller(),
+        runtime_factory,
+    )
+    worker = ManagedWorker(
+        FakeFactory(control, runtime_store, actions),  # type: ignore[arg-type]
+        ManagedWorkerConfig(
+            tenant_id="tenant-a",
+            worker_id="worker-1",
+            command_visibility_timeout_seconds=5,
+            run_lease_ttl_seconds=5,
+            heartbeat_interval_seconds=1,
+        ),
+        executor,
+    )
+
+    assert worker.run_once() is True
+    assert "session_exit" in actions
+    assert "ack" not in actions
+    assert "fail" not in actions
+    assert actions[-1] == "release"
+
+
+def test_recovery_command_flows_through_marker_controller_before_ack():
+    actions: list[str] = []
+    control = FakeControlStore(
+        actions,
+        commands=[_command(expected_stream_version=2)],
+        actual_stream_version=5,
+    )
+    runtime_store = BorrowedRuntimeStore(actions)
+    contexts: list[ExecutionContext] = []
+
+    class RecoveryController:
+        def provision(self, _run_id: str, **kwargs: Any) -> None:
+            contexts.append(kwargs["execution_context"])
+            actions.append("recover_owned_marker")
+
+    def workspace_factory(**kwargs: Any) -> RecoveryController:
+        assert kwargs["recovery"] is True
+        return RecoveryController()
+
+    def runtime_factory(**kwargs: Any) -> RecordingRuntime:
+        assert kwargs["recovery"] is True
+        return RecordingRuntime(actions, contexts[0])
+
+    worker = ManagedWorker(
+        FakeFactory(control, runtime_store, actions),  # type: ignore[arg-type]
+        ManagedWorkerConfig(
+            tenant_id="tenant-a",
+            worker_id="worker-1",
+            command_visibility_timeout_seconds=5,
+            run_lease_ttl_seconds=5,
+            heartbeat_interval_seconds=1,
+        ),
+        WorkspaceAgentExecutor(workspace_factory, runtime_factory),
+    )
+
+    assert worker.run_once() is True
+    assert actions.index("recover_owned_marker") < actions.index("runtime")
+    assert actions.index("runtime") < actions.index("ack")
+    assert contexts[0].stream_version == 5
 
 
 @pytest.mark.parametrize(

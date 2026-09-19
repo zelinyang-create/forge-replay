@@ -2,6 +2,8 @@
 
 from forge_replay.production.ha import RegionalFailoverController
 from forge_replay.production.managed import (
+    AgentRuntimeFactory,
+    AgentRuntimeSession,
     LeaseGuard,
     ManagedAuthorityConfig,
     ManagedLeaseLostError,
@@ -11,6 +13,8 @@ from forge_replay.production.managed import (
     PermanentManagedRunError,
     PostgresAuthorityFactory,
     RetryableManagedRunError,
+    WorkspaceAgentExecutor,
+    WorkspaceControllerFactory,
     build_managed_control_plane,
 )
 from forge_replay.production.model_gateway import BudgetLedger, ModelGateway
@@ -35,6 +39,8 @@ from forge_replay.production.workspace_snapshot import (
 )
 
 __all__ = [
+    "AgentRuntimeFactory",
+    "AgentRuntimeSession",
     "AuditHashChain",
     "BudgetLedger",
     "ExecReceipt",
@@ -62,6 +68,8 @@ __all__ = [
     "SignedPolicyEvaluator",
     "SubprocessCommandTransport",
     "UnsafeHostExecutionProvider",
+    "WorkspaceAgentExecutor",
+    "WorkspaceControllerFactory",
     "WorkspaceSnapshot",
     "WorkspaceSnapshotManager",
     "build_managed_control_plane",

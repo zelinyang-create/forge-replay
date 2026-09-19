@@ -10,11 +10,11 @@ from __future__ import annotations
 import json
 import threading
 from collections.abc import Callable, Mapping
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime
 from types import TracebackType
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol, runtime_checkable
 
 import psycopg
 from fastapi import FastAPI
@@ -154,7 +154,130 @@ class ManagedRunExecutor(Protocol):
         execution_context: ExecutionContext,
         lease_guard: LeaseGuard,
         recovery: bool,
-    ) -> None: ...
+    ) -> Any: ...
+
+
+class _WorkspaceController(Protocol):
+    def provision(
+        self,
+        run_id: str,
+        *,
+        dirty_mode: Literal["refuse", "head-only"],
+        execution_context: ExecutionContext,
+    ) -> Any: ...
+
+
+class _AgentRuntime(Protocol):
+    def run(
+        self,
+        run_id: str,
+        *,
+        execution_context: ExecutionContext,
+    ) -> Any: ...
+
+
+class WorkspaceControllerFactory(Protocol):
+    """Build the workspace boundary around the tenant runtime store."""
+
+    def __call__(
+        self,
+        *,
+        runtime_store: PostgresRuntimeStore,
+        process_instance_id: str,
+        command: Mapping[str, Any],
+        recovery: bool,
+    ) -> _WorkspaceController: ...
+
+
+@runtime_checkable
+class AgentRuntimeSession(Protocol):
+    """Optional cleanup boundary returned by an agent runtime factory."""
+
+    def __enter__(self) -> _AgentRuntime: ...
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> bool | None: ...
+
+
+class AgentRuntimeFactory(Protocol):
+    """Build an agent runtime, optionally wrapped in a cleanup session."""
+
+    def __call__(
+        self,
+        *,
+        runtime_store: PostgresRuntimeStore,
+        process_instance_id: str,
+        command: Mapping[str, Any],
+        recovery: bool,
+    ) -> _AgentRuntime | AgentRuntimeSession: ...
+
+
+class WorkspaceAgentExecutor:
+    """Provision a workspace and run the durable agent under one borrowed lease."""
+
+    def __init__(
+        self,
+        workspace_controller_factory: WorkspaceControllerFactory,
+        agent_runtime_factory: AgentRuntimeFactory,
+        *,
+        dirty_mode: Literal["refuse", "head-only"] = "refuse",
+    ) -> None:
+        if dirty_mode not in {"refuse", "head-only"}:
+            raise ValueError("managed workspace dirty mode is invalid")
+        self.workspace_controller_factory = workspace_controller_factory
+        self.agent_runtime_factory = agent_runtime_factory
+        self.dirty_mode = dirty_mode
+
+    def execute(
+        self,
+        *,
+        command: Mapping[str, Any],
+        runtime_store: PostgresRuntimeStore,
+        execution_context: ExecutionContext,
+        lease_guard: LeaseGuard,
+        recovery: bool,
+    ) -> Any:
+        run_id = _required_text(command, "run_id")
+        if run_id != execution_context.run_id:
+            raise PermanentManagedRunError(
+                "managed executor command targets another run"
+            )
+
+        lease_guard.raise_if_lost()
+        controller = self.workspace_controller_factory(
+            runtime_store=runtime_store,
+            process_instance_id=execution_context.worker_id,
+            command=command,
+            recovery=recovery,
+        )
+        controller.provision(
+            run_id,
+            dirty_mode=self.dirty_mode,
+            execution_context=execution_context,
+        )
+        lease_guard.raise_if_lost()
+
+        runtime_or_session = self.agent_runtime_factory(
+            runtime_store=runtime_store,
+            process_instance_id=execution_context.worker_id,
+            command=command,
+            recovery=recovery,
+        )
+        session = (
+            runtime_or_session
+            if isinstance(runtime_or_session, AgentRuntimeSession)
+            else nullcontext(runtime_or_session)
+        )
+        with session as runtime:
+            lease_guard.raise_if_lost()
+            outcome = runtime.run(run_id, execution_context=execution_context)
+            lease_guard.raise_if_lost()
+        lease_guard.raise_if_lost()
+        return outcome
 
 
 class LeaseGuard(AbstractContextManager["LeaseGuard"]):
@@ -451,6 +574,8 @@ def _aware_datetime(value: Any) -> datetime:
 
 
 __all__ = [
+    "AgentRuntimeFactory",
+    "AgentRuntimeSession",
     "LeaseGuard",
     "ManagedAuthorityConfig",
     "ManagedLeaseLostError",
@@ -460,5 +585,7 @@ __all__ = [
     "PermanentManagedRunError",
     "PostgresAuthorityFactory",
     "RetryableManagedRunError",
+    "WorkspaceAgentExecutor",
+    "WorkspaceControllerFactory",
     "build_managed_control_plane",
 ]
