@@ -609,7 +609,7 @@ class PostgresControlPlaneStore:
                 "UPDATE run_outbox SET published_at = clock_timestamp(), claimed_by = NULL, "
                 "claimed_at = NULL, claim_expires_at = NULL "
                 "WHERE tenant_id = %s AND outbox_id = %s AND published_at IS NULL "
-                "AND ((%s IS NULL AND claimed_by IS NULL) OR claimed_by = %s) "
+                "AND ((%s::text IS NULL AND claimed_by IS NULL) OR claimed_by = %s) "
                 "RETURNING outbox_id",
                 (tenant_id, outbox_id, publisher_id, publisher_id),
             ).fetchone()

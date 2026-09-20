@@ -528,6 +528,12 @@ Redis failover、flush、eviction、网络分区，以及 PostgreSQL failover、
 command、乱序 outbox 均为真实环境门禁。Phase 4.2 产物未生成前最多允许 SHADOW、缓存
 写预热或 wake publish-only，不得签发 1% 生产读、ENFORCE 或 consume 授权。
 
+Phase 4.2 的实现入口为 `forge_replay.eval.hot_layer_capacity`、`production.fault_drill` 和
+`production.evidence_signing`，操作边界见 `docs/runbooks/redis-evidence-signing.md`。仓库内的
+Toxiproxy 演练只覆盖可在单节点安全复现的故障子集；缺少集群 failover、备份恢复、PITR、
+TLS/ACL 轮换或完整 kill-window 时，`FaultDrillReport.qualifies` 必须失败关闭。容量 runner
+即使完成真实服务对账，只要吞吐或任一 P95 硬线失败，也只能输出诊断 artifact，不能签发。
+
 ## 11. Redis 准入门槛
 
 下列数值是本项目的初始工程门槛，不是通用行业标准，需按生产基线调整：

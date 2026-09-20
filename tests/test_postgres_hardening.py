@@ -352,6 +352,7 @@ def test_outbox_claim_is_durable_and_publish_ack_is_owner_scoped():
     assert claim_params == ("tenant-a", 100, "relay-1", 60)
     ack_sql, ack_params = connect.statement_containing("set published_at")
     assert "claimed_by = %s" in ack_sql
+    assert "%s::text is null" in ack_sql
     assert ack_params == ("tenant-a", "outbox-1", "relay-1", "relay-1")
 
 
