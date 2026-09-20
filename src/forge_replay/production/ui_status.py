@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
+from forge_replay.production.canary_release import RedisTenantPolicy
 from forge_replay.production.shadow_config import ShadowProjectionConfig
 from forge_replay.production.shadow_projection import (
     ShadowProjectionSink,
@@ -33,11 +34,13 @@ class TenantRoutedUiStatusReader:
         cache_reader: ShadowProjectionCacheReader,
         sink: ShadowProjectionSink,
         projection_config: ShadowProjectionConfig,
+        tenant_policy: RedisTenantPolicy | None = None,
     ) -> None:
         self._source_factory = source_factory
         self._cache_reader = cache_reader
         self._sink = sink
         self._projection_config = projection_config
+        self._tenant_policy = tenant_policy
 
     def read_ui_status(
         self,
@@ -54,6 +57,7 @@ class TenantRoutedUiStatusReader:
             cache_reader=self._cache_reader,
             sink=self._sink,
             projection_config=self._projection_config,
+            tenant_policy=self._tenant_policy,
         )
         return service.read_ui_status(
             tenant_id=tenant_id,

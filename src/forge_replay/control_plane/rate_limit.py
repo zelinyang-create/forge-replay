@@ -8,22 +8,24 @@ identities to observers.
 
 from __future__ import annotations
 
-import hashlib
-import hmac
 import math
 import secrets
 from collections.abc import Mapping
 from dataclasses import dataclass
-from decimal import ROUND_FLOOR, Decimal
 from enum import Enum
 from types import MappingProxyType
 from typing import Protocol
 
+from forge_replay.canary_cohort import (
+    DEFAULT_COHORT_VERSION,
+    RedisCapability,
+    RedisTenantPolicy,
+    tenant_in_canary_percent,
+)
+
 _MAX_IDENTITY_LENGTH = 512
 _MAX_WINDOW_SECONDS = 3_600
 _MAX_REQUESTS_PER_WINDOW = 10_000_000
-_ROLLOUT_DOMAIN = b"forge-replay-api-rate-limit-canary-v1\0"
-_ROLLOUT_SPACE = 1 << 64
 
 
 class RouteGroup(str, Enum):
@@ -408,6 +410,7 @@ class ApiRateLimitService:
         features: ApiRateLimitFeatureConfig,
         rollout_hmac_secret: bytes | None = None,
         observer: ApiRateLimitObserver | None = None,
+        tenant_policy: RedisTenantPolicy | None = None,
     ) -> None:
         if not isinstance(policies, ApiRateLimitPolicies):
             raise TypeError("policies must be ApiRateLimitPolicies")
@@ -417,13 +420,14 @@ class ApiRateLimitService:
             raise ValueError("enabled API rate limiting requires a backend")
         if rollout_hmac_secret is not None:
             _validate_rollout_secret(rollout_hmac_secret)
-        if features.mode is RateLimitMode.ENFORCE and rollout_hmac_secret is None:
-            raise ValueError("ENFORCE mode requires a rollout HMAC secret")
+        if features.mode is RateLimitMode.ENFORCE and tenant_policy is None:
+            raise ValueError("ENFORCE mode requires a manifest tenant policy")
         self._backend = backend
         self._policies = policies
         self._features = features
         self._rollout_hmac_secret = rollout_hmac_secret
         self._observer = observer
+        self._tenant_policy = tenant_policy
 
     def evaluate(
         self,
@@ -441,11 +445,7 @@ class ApiRateLimitService:
             self._observe(ApiRateLimitOutcome.DISABLED, route_group)
             return ApiRateLimitResult(ApiRateLimitDisposition.ALLOWED, enforced=False)
 
-        enforce = mode is RateLimitMode.ENFORCE and tenant_in_rate_limit_canary(
-            tenant_id=tenant_id,
-            percent=self._features.rollout_percent,
-            secret=self._rollout_hmac_secret,  # type: ignore[arg-type]
-        )
+        enforce = mode is RateLimitMode.ENFORCE and self._tenant_can_enforce(tenant_id)
         check = ApiRateLimitCheck(
             tenant_id=tenant_id,
             user_id=user_id,
@@ -510,6 +510,18 @@ class ApiRateLimitService:
         except Exception:  # noqa: BLE001 - telemetry cannot affect admission
             return
 
+    def _tenant_can_enforce(self, tenant_id: str) -> bool:
+        policy = self._tenant_policy
+        if policy is None:
+            return False
+        try:
+            return (
+                policy.allows(RedisCapability.API_RATE_LIMIT_ENFORCE, tenant_id)
+                is True
+            )
+        except Exception:  # noqa: BLE001 - policy failure must disable enforcement
+            return False
+
 
 def redis_failure_policy(route_group: RouteGroup) -> RedisFailurePolicy:
     """Return the non-configurable safety policy for a route group."""
@@ -534,25 +546,12 @@ def tenant_in_rate_limit_canary(
 ) -> bool:
     """Select a stable tenant cohort using a keyed, process-stable digest."""
 
-    _validate_identity(tenant_id, field="tenant_id")
-    _finite_percent(percent, field="percent")
-    _validate_rollout_secret(secret)
-    if percent == 0:
-        return False
-    if percent == 100:
-        return True
-    digest = hmac.new(
-        secret,
-        _ROLLOUT_DOMAIN + tenant_id.encode("utf-8"),
-        hashlib.sha256,
-    ).digest()
-    bucket = int.from_bytes(digest[:8], "big")
-    threshold = int(
-        (Decimal(str(percent)) * Decimal(_ROLLOUT_SPACE) / Decimal(100)).to_integral_value(
-            rounding=ROUND_FLOOR
-        )
+    return tenant_in_canary_percent(
+        tenant_id=tenant_id,
+        percent=percent,
+        secret=secret,
+        cohort_version=DEFAULT_COHORT_VERSION,
     )
-    return bucket < threshold
 
 
 def _allowed_result(

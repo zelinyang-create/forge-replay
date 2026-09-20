@@ -20,6 +20,7 @@ from forge_replay.events import (
     new_event,
 )
 from forge_replay.persistence import SQLiteEventStore
+from forge_replay.production.canary_release import RedisCapability
 from forge_replay.production.prompt_working_set_read import (
     AuthoritativePromptWorkingSetSource,
     PromptWorkingSetCacheAsideReader,
@@ -42,6 +43,11 @@ from forge_replay.runtime.prompt_working_set import (
     build_authoritative_prompt_working_set,
     render_agent_prompt,
 )
+
+
+class AllowPromptPolicy:
+    def allows(self, capability: RedisCapability, tenant_id: str) -> bool:
+        return capability is RedisCapability.PROMPT_CACHE_READ and bool(tenant_id)
 
 
 @dataclass
@@ -408,6 +414,7 @@ def test_two_reader_rounds_reuse_stale_authenticated_prompt_content() -> None:
                 )
             ),
         ),
+        tenant_policy=AllowPromptPolicy(),
     )
 
     first = reader.load_working_set(run_id="run-1", expected_through_seq=1)

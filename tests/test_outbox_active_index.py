@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import pytest
 
 from forge_replay.domain import ExecutionStatus
+from forge_replay.production.canary_release import RedisCapability, RedisTenantPolicy
 from forge_replay.production.outbox_relay import (
     RUN_PROJECTION_DESTINATION,
     ShadowProjectionRebuilder,
@@ -232,6 +233,16 @@ class FakeFanout:
         return RunFanoutPublishResult(0)
 
 
+class AllowFanoutPolicy:
+    def allows(self, capability: RedisCapability, tenant_id: str) -> bool:
+        assert capability is RedisCapability.FANOUT
+        assert tenant_id == "tenant-a"
+        return True
+
+
+ALLOW_FANOUT: RedisTenantPolicy = AllowFanoutPolicy()
+
+
 def relay(
     *,
     value: ShadowProjectionSnapshot,
@@ -257,6 +268,7 @@ def relay(
                 publisher_id="relay-1",
             ),
             fanout_publisher=fanout,
+            tenant_policy=ALLOW_FANOUT if fanout is not None else None,
         ),
         store,
     )

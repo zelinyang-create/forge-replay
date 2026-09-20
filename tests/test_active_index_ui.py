@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from typing import Any
 
 import pytest
 
@@ -13,6 +14,7 @@ from forge_replay.production.active_index_read import (
     ActiveRunSqlPage,
 )
 from forge_replay.production.active_index_ui import TenantRoutedActiveRunReader
+from forge_replay.production.canary_release import RedisCapability
 from forge_replay.production.managed import (
     ManagedAuthorityConfig,
     PostgresAuthorityFactory,
@@ -77,6 +79,11 @@ class IndexMustNotBeRead:
         raise AssertionError("disabled active index must not be read")
 
 
+class TenantPolicy:
+    def allows(self, capability: RedisCapability, tenant_id: str) -> bool:
+        return capability is RedisCapability.ACTIVE_INDEX_READ and tenant_id == "tenant-a"
+
+
 def test_tenant_router_builds_a_fresh_rls_source_for_every_request(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -86,6 +93,7 @@ def test_tenant_router_builds_a_fresh_rls_source_for_every_request(
     read_calls: list[dict[str, object]] = []
     index_reader = object()
     config = phase2_config()
+    tenant_policy = TenantPolicy()
     sentinel = object()
 
     def source_factory(tenant_id: str) -> FakeSource:
@@ -111,6 +119,7 @@ def test_tenant_router_builds_a_fresh_rls_source_for_every_request(
         source_factory=source_factory,
         index_reader=index_reader,  # type: ignore[arg-type]
         projection_config=config,
+        tenant_policy=tenant_policy,
     )
 
     first = reader.list_active_runs(
@@ -128,6 +137,7 @@ def test_tenant_router_builds_a_fresh_rls_source_for_every_request(
     assert [item["source"] for item in constructed] == sources
     assert all(item["index_reader"] is index_reader for item in constructed)
     assert all(item["projection_config"] is config for item in constructed)
+    assert all(item["tenant_policy"] is tenant_policy for item in constructed)
     assert read_calls == [
         {
             "tenant_id": "tenant-a",
@@ -254,7 +264,7 @@ def test_managed_builder_passes_optional_active_reader_without_changing_defaults
     monkeypatch.setattr(managed_module, "PostgresAuthorityFactory", Factory)
     monkeypatch.setattr(managed_module, "create_control_plane_app", create_app)
 
-    kwargs: dict[str, object] = {}
+    kwargs: dict[str, Any] = {}
     if reader is not None:
         kwargs["ui_active_run_reader"] = reader
     result = build_managed_control_plane(

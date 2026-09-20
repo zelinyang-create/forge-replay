@@ -8,18 +8,20 @@ wake message therefore changes latency only.
 
 from __future__ import annotations
 
-import hashlib
-import hmac
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from decimal import ROUND_FLOOR, Decimal
 from typing import Protocol, runtime_checkable
+
+from forge_replay.canary_cohort import (
+    DEFAULT_COHORT_VERSION,
+    RedisCapability,
+    RedisTenantPolicy,
+    tenant_in_canary_percent,
+)
 
 _HINT_FIELDS = frozenset({"schema_version", "outbox_id", "command_id"})
 _MAX_IDENTIFIER_BYTES = 512
-_ROLLOUT_DOMAIN = b"forge-replay:worker-wake:v1\x00"
-_ROLLOUT_SPACE = 1 << 64
 
 
 class WorkerWakeUnavailableError(RuntimeError):
@@ -267,34 +269,16 @@ def tenant_pool_in_worker_wake_canary(
     percent: float,
     secret: bytes,
 ) -> bool:
-    """Select a stable, keyed tenant+pool cohort without exposing identities."""
+    """Select the shared tenant cohort; pool names cannot widen exposure."""
 
     _validate_identifier(tenant_id, field="tenant_id")
     _validate_identifier(worker_pool, field="worker_pool")
-    _finite_percent(percent, field="percent")
-    if not isinstance(secret, bytes) or len(secret) < 32:
-        raise ValueError("rollout HMAC secret must contain at least 32 bytes")
-    if percent == 0:
-        return False
-    if percent == 100:
-        return True
-    tenant_bytes = tenant_id.encode("utf-8")
-    pool_bytes = worker_pool.encode("utf-8")
-    material = (
-        _ROLLOUT_DOMAIN
-        + len(tenant_bytes).to_bytes(2, "big")
-        + tenant_bytes
-        + len(pool_bytes).to_bytes(2, "big")
-        + pool_bytes
+    return tenant_in_canary_percent(
+        tenant_id=tenant_id,
+        percent=percent,
+        secret=secret,
+        cohort_version=DEFAULT_COHORT_VERSION,
     )
-    digest = hmac.new(secret, material, hashlib.sha256).digest()
-    bucket = int.from_bytes(digest[:8], "big")
-    threshold = int(
-        (
-            Decimal(str(percent)) * Decimal(_ROLLOUT_SPACE) / Decimal(100)
-        ).to_integral_value(rounding=ROUND_FLOOR)
-    )
-    return bucket < threshold
 
 
 class ManagedWorkerLoop:
@@ -309,6 +293,7 @@ class ManagedWorkerLoop:
         worker_pool: str,
         wake_source: WorkerWakeSource | None = None,
         rollout_hmac_secret: bytes | None = None,
+        tenant_policy: RedisTenantPolicy | None = None,
     ) -> None:
         if not isinstance(config, WorkerWakeConfig):
             raise TypeError("config must be a WorkerWakeConfig")
@@ -319,14 +304,20 @@ class ManagedWorkerLoop:
         self.wake_source = wake_source
         self._consume = False
         if config.redis_queue_consume:
-            if rollout_hmac_secret is None:
-                raise ValueError("Redis queue consumption requires a rollout HMAC secret")
-            self._consume = tenant_pool_in_worker_wake_canary(
-                tenant_id=tenant_id,
-                worker_pool=worker_pool,
-                percent=config.consume_rollout_percent,
-                secret=rollout_hmac_secret,
-            )
+            if tenant_policy is None:
+                raise ValueError(
+                    "Redis queue consumption requires a manifest tenant policy"
+                )
+            try:
+                self._consume = (
+                    tenant_policy.allows(
+                        RedisCapability.WORKER_WAKE_CONSUME,
+                        tenant_id,
+                    )
+                    is True
+                )
+            except Exception:  # noqa: BLE001 - policy failure disables Redis consume
+                self._consume = False
             if self._consume and wake_source is None:
                 raise ValueError("canary worker wake consumption requires a wake source")
 

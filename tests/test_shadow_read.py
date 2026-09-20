@@ -6,6 +6,7 @@ from typing import Any
 import pytest
 
 from forge_replay.domain import ExecutionStatus
+from forge_replay.production.canary_release import RedisCapability, RedisTenantPolicy
 from forge_replay.production.redis_shadow import (
     ShadowProjectionProtocolError,
     ShadowProjectionUnavailableError,
@@ -109,16 +110,32 @@ class FakeSink:
         self.error: Exception | None = None
 
     def write_projection(
-        self, value: ShadowProjectionSnapshot, *, ttl_seconds: int
+        self, snapshot: ShadowProjectionSnapshot, *, ttl_seconds: int
     ) -> ProjectionWriteResult:
-        self.calls.append((value, ttl_seconds))
+        self.calls.append((snapshot, ttl_seconds))
         if self.error is not None:
             raise self.error
         return ProjectionWriteResult(
             status=ProjectionWriteStatus.APPLIED,
-            incoming_version=value.stream_version,
-            stored_version=value.stream_version,
+            incoming_version=snapshot.stream_version,
+            stored_version=snapshot.stream_version,
         )
+
+
+class FixedTenantPolicy:
+    def __init__(self, allowed: bool, *, error: Exception | None = None) -> None:
+        self.allowed = allowed
+        self.error = error
+        self.calls: list[tuple[RedisCapability, str]] = []
+
+    def allows(self, capability: RedisCapability, tenant_id: str) -> bool:
+        self.calls.append((capability, tenant_id))
+        if self.error is not None:
+            raise self.error
+        return self.allowed
+
+
+ALLOW_ALL = FixedTenantPolicy(True)
 
 
 def service(
@@ -127,13 +144,58 @@ def service(
     cache: FakeCacheReader,
     sink: FakeSink,
     read: bool = True,
+    tenant_policy: RedisTenantPolicy | None = ALLOW_ALL,
 ) -> ShadowProjectionReadService:
     return ShadowProjectionReadService(
         source=source,
         cache_reader=cache,
         sink=sink,
         projection_config=config(read=read),
+        tenant_policy=tenant_policy,
     )
+
+
+@pytest.mark.parametrize(
+    "tenant_policy",
+    [None, FixedTenantPolicy(False), FixedTenantPolicy(False, error=RuntimeError("down"))],
+)
+def test_missing_denied_or_failed_policy_never_accesses_redis(
+    tenant_policy: RedisTenantPolicy | None,
+) -> None:
+    sql_value = snapshot(version=12)
+    source = FakeSource(sql_value)
+    cache = FakeCacheReader(snapshot(version=99))
+    sink = FakeSink()
+
+    result = service(
+        source=source,
+        cache=cache,
+        sink=sink,
+        tenant_policy=tenant_policy,
+    ).read_ui_status(tenant_id="tenant-a", run_id="run-1")
+
+    assert result.source is ShadowProjectionReadSource.POSTGRES
+    assert result.fallback_reason is ShadowProjectionFallbackReason.OUTSIDE_CANARY
+    assert result.snapshot == sql_value
+    assert cache.calls == []
+    assert sink.calls == []
+
+
+def test_authorized_tenant_uses_redis_read_path() -> None:
+    cached = snapshot(version=10)
+    policy = FixedTenantPolicy(True)
+    cache = FakeCacheReader(cached)
+
+    result = service(
+        source=FakeSource(snapshot(version=11)),
+        cache=cache,
+        sink=FakeSink(),
+        tenant_policy=policy,
+    ).read_ui_status(tenant_id="tenant-a", run_id="run-1")
+
+    assert result.source is ShadowProjectionReadSource.REDIS
+    assert cache.calls == [("tenant-a", "run-1")]
+    assert policy.calls == [(RedisCapability.UI_STATUS_READ, "tenant-a")]
 
 
 def test_read_flag_off_bypasses_redis_and_reads_postgres_without_backfill():
@@ -383,7 +445,7 @@ def test_read_admission_accepts_exact_inclusive_boundaries_with_pressure_signal(
     ],
 )
 def test_phase3_read_rollout_still_forbids_fanout_and_queue(
-    forbidden: dict[str, bool],
+    forbidden: dict[str, Any],
 ):
     with pytest.raises(ValueError, match="forbids"):
         Phase3RedisFeatureFlags(

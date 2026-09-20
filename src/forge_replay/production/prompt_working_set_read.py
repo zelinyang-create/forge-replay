@@ -7,7 +7,6 @@ Store; authoritative failures are never hidden by an older cached prompt.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import re
 from collections.abc import Mapping
@@ -19,6 +18,7 @@ from uuid import UUID
 
 from forge_replay.events import EventType
 from forge_replay.persistence import RunStateConflictError
+from forge_replay.production.canary_release import RedisCapability, RedisTenantPolicy
 from forge_replay.production.redis_prompt_working_set import (
     PromptWorkingSetCache,
     PromptWorkingSetCacheEntry,
@@ -74,6 +74,7 @@ class PromptWorkingSetCacheOutcome(str, Enum):
     SHADOW_MATCH = "shadow_match"
     SHADOW_MISMATCH = "shadow_mismatch"
     CONFLICT_DELETE = "conflict_delete"
+    OUTSIDE_CANARY = "outside_canary"
 
 
 class PromptWorkingSetReadObserver(Protocol):
@@ -93,6 +94,7 @@ class PromptWorkingSetCounterSnapshot:
     shadow_match: int
     shadow_mismatch: int
     conflict_delete: int
+    outside_canary: int
 
 
 class PromptWorkingSetReadCounters:
@@ -121,6 +123,7 @@ class PromptWorkingSetReadCounters:
             shadow_match=values[PromptWorkingSetCacheOutcome.SHADOW_MATCH],
             shadow_mismatch=values[PromptWorkingSetCacheOutcome.SHADOW_MISMATCH],
             conflict_delete=values[PromptWorkingSetCacheOutcome.CONFLICT_DELETE],
+            outside_canary=values[PromptWorkingSetCacheOutcome.OUTSIDE_CANARY],
         )
 
 
@@ -227,6 +230,7 @@ class PromptWorkingSetCacheAsideReader:
         projection_config: ShadowProjectionConfig,
         contract_version: str = PROMPT_WORKING_SET_CONTRACT_VERSION,
         observer: PromptWorkingSetReadObserver | None = None,
+        tenant_policy: RedisTenantPolicy | None = None,
     ) -> None:
         if not isinstance(projection_config, ShadowProjectionConfig):
             raise TypeError("projection_config must be ShadowProjectionConfig")
@@ -247,6 +251,7 @@ class PromptWorkingSetCacheAsideReader:
         self._config = projection_config
         self._contract_version = contract_version
         self._observer = observer
+        self._tenant_policy = tenant_policy
 
     def load_working_set(
         self,
@@ -256,18 +261,19 @@ class PromptWorkingSetCacheAsideReader:
     ) -> PromptWorkingSet:
         _validate_request(run_id, expected_through_seq)
         features = self._config.features
-        read_enabled = getattr(features, "redis_prompt_cache_read", False) and (
-            _is_in_rollout(
-                tenant_id=self._source.tenant_id,
-                run_id=run_id,
-                percent=getattr(features, "prompt_cache_rollout_percent", 0.0),
-            )
-        )
-        compare_enabled = getattr(
+        read_requested = getattr(features, "redis_prompt_cache_read", False)
+        read_enabled = read_requested and self._tenant_can_read()
+        if read_requested and not read_enabled:
+            self._observe(PromptWorkingSetCacheOutcome.OUTSIDE_CANARY)
+        compare_requested = getattr(
             features,
             "redis_prompt_cache_shadow_compare",
             False,
         )
+        # Pure SHADOW mode may compare every tenant. Once serving reads are
+        # requested, a tenant outside the manifest cohort must not touch Redis
+        # at all; writes can still warm the disposable copy after SQL succeeds.
+        compare_enabled = compare_requested and (not read_requested or read_enabled)
         cached: _CachedPromptCandidate | None = None
         if read_enabled or compare_enabled:
             cached = self._read_cache(run_id, expected_through_seq)
@@ -326,6 +332,22 @@ class PromptWorkingSetCacheAsideReader:
         if getattr(features, "redis_prompt_cache_write", False):
             self._write_cache(authoritative, expected_through_seq)
         return authoritative
+
+    def _tenant_can_read(self) -> bool:
+        """Fail closed when the versioned rollout manifest is absent or invalid."""
+
+        if self._tenant_policy is None:
+            return False
+        try:
+            return (
+                self._tenant_policy.allows(
+                    RedisCapability.PROMPT_CACHE_READ,
+                    self._source.tenant_id,
+                )
+                is True
+            )
+        except Exception:  # noqa: BLE001 - a policy failure must fail closed to SQL
+            return False
 
     def _read_cache(
         self,
@@ -686,20 +708,6 @@ def _validate_identity(value: object, *, field: str) -> None:
 def _validate_maximum_bytes(value: int) -> None:
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise ValueError("maximum_bytes must be a positive integer")
-
-
-def _is_in_rollout(*, tenant_id: str, run_id: str, percent: float) -> bool:
-    """Select a stable tenant/run cohort without exposing either identity."""
-
-    if percent >= 100:
-        return True
-    if percent <= 0:
-        return False
-    digest = hashlib.sha256(
-        tenant_id.encode("utf-8") + b"\0" + run_id.encode("utf-8")
-    ).digest()
-    bucket = int.from_bytes(digest[:8], "big") / 2**64 * 100
-    return bucket < percent
 
 
 def _strict_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:

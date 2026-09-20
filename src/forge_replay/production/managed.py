@@ -32,6 +32,7 @@ from forge_replay.domain import ExecutionContext
 from forge_replay.persistence.object_store import BlobObjectUnavailableError
 from forge_replay.persistence.postgres_store import PostgresRuntimeStore
 from forge_replay.ports import BlobObjectStorePort
+from forge_replay.production.canary_release import RedisTenantPolicy
 from forge_replay.production.postgres_active_index import PostgresActiveRunSource
 from forge_replay.production.postgres_shadow import PostgresShadowProjectionSource
 from forge_replay.production.prompt_working_set_read import (
@@ -152,6 +153,7 @@ def build_managed_prompt_working_set_reader(
     cache: PromptWorkingSetCache | None,
     projection_config: ShadowProjectionConfig,
     observer: PromptWorkingSetReadObserver | None = None,
+    tenant_policy: RedisTenantPolicy | None = None,
 ) -> PromptWorkingSetCacheAsideReader:
     """Compose one tenant-bound cache-aside reader from managed authority."""
 
@@ -177,6 +179,7 @@ def build_managed_prompt_working_set_reader(
         cache=cache,
         projection_config=projection_config,
         observer=observer,
+        tenant_policy=tenant_policy,
     )
 
 

@@ -3,21 +3,25 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field, replace
 from types import SimpleNamespace
+from typing import Any
 from uuid import UUID
 
 import pytest
 
 from forge_replay.events import EventType, ModelCallStartedPayload, new_event
 from forge_replay.persistence import RunStateConflictError
+from forge_replay.production.canary_release import RedisCapability
 from forge_replay.production.prompt_working_set_read import (
     PROMPT_WORKING_SET_CONTRACT_VERSION,
     AuthoritativePromptWorkingSetSource,
-    PromptWorkingSetCacheAsideReader,
     PromptWorkingSetCacheOutcome,
     PromptWorkingSetCodecError,
     PromptWorkingSetReadCounters,
     decode_prompt_working_set,
     encode_prompt_working_set,
+)
+from forge_replay.production.prompt_working_set_read import (
+    PromptWorkingSetCacheAsideReader as _PromptWorkingSetCacheAsideReader,
 )
 from forge_replay.production.redis_prompt_working_set import (
     PromptWorkingSetCacheEntry,
@@ -33,6 +37,25 @@ from forge_replay.runtime.prompt_working_set import (
     PromptWorkingSet,
     PromptWorkingSetEntry,
 )
+
+
+class _AllowPromptPolicy:
+    def allows(self, capability: RedisCapability, tenant_id: str) -> bool:
+        return capability is RedisCapability.PROMPT_CACHE_READ and bool(tenant_id)
+
+
+class _RaisingPromptPolicy:
+    def allows(self, capability: RedisCapability, tenant_id: str) -> bool:
+        del capability, tenant_id
+        raise RuntimeError("policy provider unavailable")
+
+
+class PromptWorkingSetCacheAsideReader(_PromptWorkingSetCacheAsideReader):
+    """Test convenience wrapper; production defaults remain fail closed."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        kwargs.setdefault("tenant_policy", _AllowPromptPolicy())
+        super().__init__(*args, **kwargs)
 
 
 def working_set(*, text: str = "cached answer") -> PromptWorkingSet:
@@ -261,11 +284,49 @@ def test_exact_cache_hit_skips_sql_and_blob_authority() -> None:
     assert cache.writes == []
 
 
-def test_read_rollout_keeps_non_canary_run_on_authoritative_shadow_path() -> None:
+def test_missing_manifest_policy_fails_closed_to_authoritative_source() -> None:
+    source = FakeSource(result=working_set(text="authority"))
+    cache = FakeCache(read_result=entry(working_set(text="cached")))
+    counters = PromptWorkingSetReadCounters()
+    reader = _PromptWorkingSetCacheAsideReader(
+        source=source,
+        cache=cache,
+        projection_config=config(read=True),
+        observer=counters,
+    )
+
+    result = reader.load_working_set(run_id="run-1", expected_through_seq=10)
+
+    assert result.entries[0].text == "authority"
+    assert source.calls == [("run-1", 10)]
+    assert cache.reads == []
+    assert counters.snapshot().outside_canary == 1
+
+
+def test_prompt_policy_error_fails_closed_without_touching_redis() -> None:
+    source = FakeSource(result=working_set(text="authority"))
+    cache = FakeCache(read_result=entry(working_set(text="cached")))
+    reader = _PromptWorkingSetCacheAsideReader(
+        source=source,
+        cache=cache,
+        projection_config=config(read=True),
+        tenant_policy=_RaisingPromptPolicy(),
+    )
+
+    assert (
+        reader.load_working_set(run_id="run-1", expected_through_seq=10)
+        .entries[0]
+        .text
+        == "authority"
+    )
+    assert cache.reads == []
+
+
+def test_manifest_denial_keeps_tenant_on_authoritative_shadow_path() -> None:
     source = FakeSource(result=working_set(text="authority"))
     cache = FakeCache(read_result=entry(working_set(text="cached")))
     proof = replace(admission(), canary_percent=1)
-    reader = PromptWorkingSetCacheAsideReader(
+    reader = _PromptWorkingSetCacheAsideReader(
         source=source,
         cache=cache,
         projection_config=ShadowProjectionConfig(
@@ -279,6 +340,7 @@ def test_read_rollout_keeps_non_canary_run_on_authoritative_shadow_path() -> Non
     assert result.entries[0].text == "authority"
     assert source.calls == [("run-1", 10)]
     assert source.candidates == [None]
+    assert cache.reads == []
 
 
 def test_outcome_counters_record_only_a_bounded_hit_label() -> None:

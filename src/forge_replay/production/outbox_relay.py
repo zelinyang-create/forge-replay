@@ -13,6 +13,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Protocol
 
+from forge_replay.production.canary_release import RedisCapability, RedisTenantPolicy
 from forge_replay.production.redis_active_index import (
     ActiveRunIndexProtocolError,
     ActiveRunIndexUnavailableError,
@@ -143,6 +144,7 @@ class ShadowRelayResult:
     active_index_conflicts: int = 0
     active_index_errors: int = 0
     fanout_published: int = 0
+    fanout_outside_canary: int = 0
     fanout_errors: int = 0
     fanout_subscriber_deliveries: int = 0
     mark_lost: int = 0
@@ -195,6 +197,7 @@ class _RelayCounters:
     active_index_conflicts: int = 0
     active_index_errors: int = 0
     fanout_published: int = 0
+    fanout_outside_canary: int = 0
     fanout_errors: int = 0
     fanout_subscriber_deliveries: int = 0
     mark_lost: int = 0
@@ -221,6 +224,7 @@ class _RelayCounters:
             active_index_conflicts=self.active_index_conflicts,
             active_index_errors=self.active_index_errors,
             fanout_published=self.fanout_published,
+            fanout_outside_canary=self.fanout_outside_canary,
             fanout_errors=self.fanout_errors,
             fanout_subscriber_deliveries=self.fanout_subscriber_deliveries,
             mark_lost=self.mark_lost,
@@ -307,6 +311,7 @@ class ShadowProjectionRelay:
         relay_config: ShadowRelayConfig,
         fanout_publisher: RunEventHintPublisher | None = None,
         active_index_sink: ActiveRunIndexSink | None = None,
+        tenant_policy: RedisTenantPolicy | None = None,
     ) -> None:
         if projection_config.features.redis_fanout and fanout_publisher is None:
             raise ValueError(
@@ -330,6 +335,7 @@ class ShadowProjectionRelay:
         self._relay_config = relay_config
         self._fanout_publisher = fanout_publisher
         self._active_index_sink = active_index_sink
+        self._tenant_policy = tenant_policy
 
     def run_once(self) -> ShadowRelayResult:
         """Claim and process at most one batch, isolating failures per row."""
@@ -579,7 +585,45 @@ class ShadowProjectionRelay:
                     )
                     continue
 
+            fanout_allowed = False
             if self._projection_config.features.redis_fanout:
+                policy = self._tenant_policy
+                if policy is None:
+                    counters.fanout_outside_canary += 1
+                else:
+                    try:
+                        fanout_allowed = policy.allows(
+                            RedisCapability.FANOUT,
+                            tenant_id,
+                        )
+                        if not isinstance(fanout_allowed, bool):
+                            raise _RelayProtocolError(
+                                "tenant policy did not return a bool"
+                            )
+                    except Exception as exc:  # noqa: BLE001 - fail closed per row
+                        # Fanout is disposable and SQL gap fill remains the
+                        # recovery path.  A policy failure must deny exposure,
+                        # but must not strand the authoritative projection
+                        # outbox or stop active-index shadow writes.
+                        fanout_allowed = False
+                        counters.fanout_outside_canary += 1
+                        counters.fanout_errors += 1
+                        if isinstance(exc, _RelayProtocolError):
+                            counters.protocol_errors += 1
+                        counters.errors.append(
+                            _error(
+                                stage="fanout_policy",
+                                exc=exc,
+                                tenant_id=tenant_id,
+                                run_id=run_id,
+                                outbox_id=outbox_id,
+                            )
+                        )
+                    else:
+                        if not fanout_allowed:
+                            counters.fanout_outside_canary += 1
+
+            if fanout_allowed:
                 # The publisher is guaranteed by the constructor when fanout
                 # is enabled.  Keeping this guard explicit makes a corrupted
                 # runtime configuration fail retryably rather than acknowledging

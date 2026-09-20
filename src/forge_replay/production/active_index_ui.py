@@ -10,6 +10,7 @@ from forge_replay.production.active_index_read import (
     ActiveRunReadResult,
     ActiveRunSqlSource,
 )
+from forge_replay.production.canary_release import RedisTenantPolicy
 from forge_replay.production.shadow_config import ShadowProjectionConfig
 
 
@@ -22,10 +23,12 @@ class TenantRoutedActiveRunReader:
         source_factory: Callable[[str], ActiveRunSqlSource],
         index_reader: ActiveRunIndexReader,
         projection_config: ShadowProjectionConfig,
+        tenant_policy: RedisTenantPolicy | None = None,
     ) -> None:
         self._source_factory = source_factory
         self._index_reader = index_reader
         self._projection_config = projection_config
+        self._tenant_policy = tenant_policy
 
     def list_active_runs(
         self,
@@ -41,6 +44,7 @@ class TenantRoutedActiveRunReader:
             source=self._source_factory(tenant_id),
             index_reader=self._index_reader,
             projection_config=self._projection_config,
+            tenant_policy=self._tenant_policy,
         )
         return service.list_active_runs(
             tenant_id=tenant_id,

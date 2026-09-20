@@ -15,6 +15,7 @@ from enum import Enum
 from typing import Any, Protocol
 
 from forge_replay.domain import TERMINAL_EXECUTION_STATUSES, ExecutionStatus
+from forge_replay.production.canary_release import RedisCapability, RedisTenantPolicy
 from forge_replay.production.redis_active_index import (
     ACTIVE_RUN_INDEX_MAX_PAGE_SIZE,
     ActiveRunIndexProtocolError,
@@ -96,6 +97,7 @@ class ActiveRunFallbackReason(str, Enum):
     INDEX_UNAVAILABLE = "index_unavailable"
     INDEX_INVALID = "index_invalid"
     INDEX_STALE = "index_stale"
+    OUTSIDE_CANARY = "outside_canary"
 
 
 @dataclass(frozen=True)
@@ -144,10 +146,12 @@ class ActiveRunIndexReadService:
         source: ActiveRunSqlSource,
         index_reader: ActiveRunIndexReader,
         projection_config: ShadowProjectionConfig,
+        tenant_policy: RedisTenantPolicy | None = None,
     ) -> None:
         self._source = source
         self._index_reader = index_reader
         self._projection_config = projection_config
+        self._tenant_policy = tenant_policy
 
     def list_active_runs(
         self,
@@ -191,6 +195,13 @@ class ActiveRunIndexReadService:
                 after_member=after_member,
                 limit=limit,
                 reason=ActiveRunFallbackReason.INDEX_DISABLED,
+            )
+        if not self._tenant_can_read(tenant_id):
+            return self._read_sql_page(
+                tenant_id=tenant_id,
+                after_member=after_member,
+                limit=limit,
+                reason=ActiveRunFallbackReason.OUTSIDE_CANARY,
             )
 
         try:
@@ -287,6 +298,18 @@ class ActiveRunIndexReadService:
             items=items,
             next_after_member=next_after_member,
         )
+
+    def _tenant_can_read(self, tenant_id: str) -> bool:
+        policy = self._tenant_policy
+        if policy is None:
+            return False
+        try:
+            return (
+                policy.allows(RedisCapability.ACTIVE_INDEX_READ, tenant_id=tenant_id)
+                is True
+            )
+        except Exception:  # noqa: BLE001 - policy failure must deny Redis access
+            return False
 
     def _read_sql_page(
         self,

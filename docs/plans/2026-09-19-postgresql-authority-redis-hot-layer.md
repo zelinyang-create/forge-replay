@@ -509,10 +509,24 @@ publish-only 预热，不允许消费路径进入生产流量。
 
 ### Phase 4：容量与生产门禁
 
-- 1% → 5% → 25% → 100% Canary；
-- 对 Redis failover、flush、eviction、网络分区做故障注入；
-- 对 PostgreSQL failover、stale epoch、重复 command、乱序 outbox 做压力测试；
-- 完成备份恢复、PITR 和 Redis 全量重建演练。
+Phase 4 分三段交付，不能把单元测试里的布尔值直接当成生产证据：
+
+1. **Phase 4.1 — 证据信任链与统一门禁**：统一 tenant HMAC cohort，固定
+   `OFF → SHADOW → 1% → 5% → 25% → 100%` 阶梯；升级只能相邻，降级可立即执行。
+   证据必须绑定 environment、region、release SHA、配置摘要、cohort version、原始报告
+   SHA-256、观察窗口、过期时间和签名 key ID。容量与通用 release/GA gate 对 NaN、Inf、
+   负数、bool 冒充整数全部失败关闭。
+2. **Phase 4.2 — 真实容量与故障产物**：在隔离的 PostgreSQL schema 和 Redis keyspace
+   执行两倍峰值、1,000 queued / 20 active、SQL-only、Redis wake、Redis disconnect fallback、
+   crash-window、failover、TLS/ACL、备份恢复、PITR 和 Redis 全量重建。报告必须记录实际
+   触发点；`pytest skip`、fake client 和手填 `True` 不得生成生产授权。
+3. **Phase 4.3 — 逐级 Canary**：容量报告只允许开始 1%；5%/25%/100% 各自需要同一
+   release/config/cohort 的前一级生产观察报告、足够样本与前一报告摘要。任意安全违规立即
+   回滚；软 SLO 连续超窗后能力级回滚并进入冷却期。
+
+Redis failover、flush、eviction、网络分区，以及 PostgreSQL failover、stale epoch、重复
+command、乱序 outbox 均为真实环境门禁。Phase 4.2 产物未生成前最多允许 SHADOW、缓存
+写预热或 wake publish-only，不得签发 1% 生产读、ENFORCE 或 consume 授权。
 
 ## 11. Redis 准入门槛
 
@@ -588,7 +602,8 @@ SQLite 与 PostgreSQL 必须共同通过：
 - command 创建与 wake outbox 必须同事务 commit/rollback；消息严格无 tenant/run/payload；
 - consumer 启动先 SQL drain，timeout、Redis error、flush/trim、`NOGROUP` 后均在固定上限
   内恢复 SQL polling；SQL claim 异常不确认提示；
-- crash 窗口覆盖 read 前、read 后 SQL claim 前、claim commit 后 ACK 前、ACK 后执行前；
+- crash 窗口覆盖 read 前、read 后 SQL poll 前、SQL command claim commit 后执行前，以及
+  command 完成后 Stream `XACK` 前；当前实现不存在“ACK 后执行前”的顺序；
   验收时 SQL visibility timeout 必须能恢复已领取命令，且提示重复不产生重复逻辑效果；
 - worker pool 隔离同时由 SQL 谓词和 Redis key 验证，伪造提示不能改变 tenant/pool；
 - versioned cache CAS；

@@ -6,6 +6,7 @@ from typing import Any
 
 import pytest
 
+from forge_replay.canary_cohort import RedisCapability
 from forge_replay.control_plane.rate_limit import (
     ApiRateLimitAdmissionEvidence,
     ApiRateLimitBackendDecision,
@@ -24,6 +25,18 @@ from forge_replay.control_plane.rate_limit import (
 )
 
 SECRET = b"stable-api-rate-limit-rollout-secret"
+
+
+class StaticTenantPolicy:
+    def __init__(self, allowed: bool) -> None:
+        self.allowed = allowed
+
+    def allows(self, capability: RedisCapability, tenant_id: str) -> bool:
+        return (
+            self.allowed
+            and capability is RedisCapability.API_RATE_LIMIT_ENFORCE
+            and bool(tenant_id)
+        )
 
 
 def policy(
@@ -125,6 +138,7 @@ def service(
     features: ApiRateLimitFeatureConfig,
     observer: ObserverStub | None = None,
     secret: bytes | None = SECRET,
+    tenant_allowed: bool = True,
 ) -> tuple[ApiRateLimitService, BackendStub]:
     backend = BackendStub(response)
     return (
@@ -134,6 +148,7 @@ def service(
             features=features,
             rollout_hmac_secret=secret,
             observer=observer,
+            tenant_policy=StaticTenantPolicy(tenant_allowed),
         ),
         backend,
     )
@@ -494,20 +509,19 @@ def test_enforced_backend_failure_uses_fixed_route_policy() -> None:
     ]
 
 
-def test_non_canary_tenant_is_shadow_only_even_in_enforce_mode(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(
-        "forge_replay.control_plane.rate_limit.tenant_in_rate_limit_canary",
-        lambda **_kwargs: False,
-    )
+def test_non_canary_tenant_is_shadow_only_even_in_enforce_mode() -> None:
     features = ApiRateLimitFeatureConfig(
         mode=RateLimitMode.ENFORCE,
         rollout_percent=1,
         admission_evidence=evidence(canary_percent=1),
     )
     observer = ObserverStub()
-    limiter, backend = service(denied_decision(), features=features, observer=observer)
+    limiter, backend = service(
+        denied_decision(),
+        features=features,
+        observer=observer,
+        tenant_allowed=False,
+    )
 
     result = limiter.evaluate(
         tenant_id="tenant-outside-canary",
@@ -599,7 +613,7 @@ def test_service_constructor_requires_backend_and_secret_only_when_needed() -> N
         rollout_percent=100,
         admission_evidence=evidence(),
     )
-    with pytest.raises(ValueError, match="HMAC secret"):
+    with pytest.raises(ValueError, match="manifest tenant policy"):
         ApiRateLimitService(
             backend=BackendStub(allowed_decision()),
             policies=policies(),
@@ -611,6 +625,7 @@ def test_service_constructor_requires_backend_and_secret_only_when_needed() -> N
             policies=policies(),
             features=features,
             rollout_hmac_secret=b"short",
+            tenant_policy=StaticTenantPolicy(True),
         )
 
 

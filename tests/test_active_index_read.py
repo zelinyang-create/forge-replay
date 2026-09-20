@@ -16,6 +16,7 @@ from forge_replay.production.active_index_read import (
     ActiveRunReadSource,
     ActiveRunSqlPage,
 )
+from forge_replay.production.canary_release import RedisCapability, RedisTenantPolicy
 from forge_replay.production.redis_active_index import ActiveRunIndexEntry
 from forge_replay.production.shadow_config import (
     Phase2RedisFeatureFlags,
@@ -157,17 +158,75 @@ class FakeSource:
         return self.full_page if candidate_run_ids is None else self.candidate_page
 
 
+class FixedTenantPolicy:
+    def __init__(self, allowed: bool, *, error: Exception | None = None) -> None:
+        self.allowed = allowed
+        self.error = error
+        self.calls: list[tuple[RedisCapability, str]] = []
+
+    def allows(self, capability: RedisCapability, tenant_id: str) -> bool:
+        self.calls.append((capability, tenant_id))
+        if self.error is not None:
+            raise self.error
+        return self.allowed
+
+
+ALLOW_ALL = FixedTenantPolicy(True)
+
+
 def service(
     source: FakeSource,
     index: FakeIndex,
     *,
     enabled: bool = True,
+    tenant_policy: RedisTenantPolicy | None = ALLOW_ALL,
 ) -> ActiveRunIndexReadService:
     return ActiveRunIndexReadService(
         source=source,
         index_reader=index,
         projection_config=config(enabled=enabled),
+        tenant_policy=tenant_policy,
     )
+
+
+@pytest.mark.parametrize(
+    "tenant_policy",
+    [None, FixedTenantPolicy(False), FixedTenantPolicy(False, error=RuntimeError("down"))],
+)
+def test_missing_denied_or_failed_policy_never_reads_active_index(
+    tenant_policy: RedisTenantPolicy | None,
+) -> None:
+    source = FakeSource()
+    source.full_page = ActiveRunSqlPage((snapshot("run-sql"),), None)
+    index = FakeIndex(CandidatePage((candidate(snapshot("run-redis")),)))
+
+    result = service(
+        source,
+        index,
+        tenant_policy=tenant_policy,
+    ).list_active_runs(tenant_id="tenant-a")
+
+    assert result.source is ActiveRunReadSource.POSTGRES
+    assert result.fallback_reason is ActiveRunFallbackReason.OUTSIDE_CANARY
+    assert tuple(item.run_id for item in result.items) == ("run-sql",)
+    assert index.calls == []
+    assert source.calls == [("tenant-a", None, 100, None)]
+
+
+def test_authorized_tenant_uses_active_index_candidates() -> None:
+    value = snapshot("run-active")
+    source = FakeSource()
+    source.candidate_page = ActiveRunSqlPage((value,), None)
+    index = FakeIndex(CandidatePage((candidate(value),)))
+    policy = FixedTenantPolicy(True)
+
+    result = service(source, index, tenant_policy=policy).list_active_runs(
+        tenant_id="tenant-a"
+    )
+
+    assert result.source is ActiveRunReadSource.REDIS_CANDIDATES
+    assert index.calls == [("tenant-a", None, 100)]
+    assert policy.calls == [(RedisCapability.ACTIVE_INDEX_READ, "tenant-a")]
 
 
 def test_active_index_flags_default_off_and_support_write_only_warmup() -> None:

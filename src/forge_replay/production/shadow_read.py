@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Protocol
 
+from forge_replay.production.canary_release import RedisCapability, RedisTenantPolicy
 from forge_replay.production.redis_shadow import (
     ShadowProjectionProtocolError,
     ShadowProjectionUnavailableError,
@@ -51,6 +52,7 @@ class ShadowProjectionFallbackReason(str, Enum):
     CACHE_STALE = "cache_stale"
     CACHE_UNAVAILABLE = "cache_unavailable"
     CACHE_INVALID = "cache_invalid"
+    OUTSIDE_CANARY = "outside_canary"
 
 
 @dataclass(frozen=True)
@@ -99,11 +101,13 @@ class ShadowProjectionReadService:
         cache_reader: ShadowProjectionCacheReader,
         sink: ShadowProjectionSink,
         projection_config: ShadowProjectionConfig,
+        tenant_policy: RedisTenantPolicy | None = None,
     ) -> None:
         self._source = source
         self._cache_reader = cache_reader
         self._sink = sink
         self._projection_config = projection_config
+        self._tenant_policy = tenant_policy
 
     def read_ui_status(
         self,
@@ -154,7 +158,8 @@ class ShadowProjectionReadService:
                 raise ShadowProjectionReadProtocolError(
                     "authoritative source returned a different projection identity"
                 )
-            self._best_effort_backfill(snapshot)
+            if fallback_reason is not ShadowProjectionFallbackReason.OUTSIDE_CANARY:
+                self._best_effort_backfill(snapshot)
 
         return ShadowProjectionReadResult(
             source=ShadowProjectionReadSource.POSTGRES,
@@ -174,6 +179,8 @@ class ShadowProjectionReadService:
             return ShadowProjectionFallbackReason.FORCE_SQL
         if not self._projection_config.features.redis_cache_read:
             return ShadowProjectionFallbackReason.CACHE_DISABLED
+        if not self._tenant_can_read(tenant_id):
+            return ShadowProjectionFallbackReason.OUTSIDE_CANARY
 
         try:
             snapshot = self._cache_reader.read_projection(
@@ -195,6 +202,18 @@ class ShadowProjectionReadService:
         if minimum_version is not None and snapshot.stream_version < minimum_version:
             return ShadowProjectionFallbackReason.CACHE_STALE
         return snapshot
+
+    def _tenant_can_read(self, tenant_id: str) -> bool:
+        policy = self._tenant_policy
+        if policy is None:
+            return False
+        try:
+            return (
+                policy.allows(RedisCapability.UI_STATUS_READ, tenant_id=tenant_id)
+                is True
+            )
+        except Exception:  # noqa: BLE001 - policy failure must deny Redis access
+            return False
 
     def _best_effort_backfill(self, snapshot: ShadowProjectionSnapshot) -> None:
         if not self._projection_config.features.redis_cache_write:

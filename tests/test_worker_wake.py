@@ -6,6 +6,7 @@ from typing import Any
 
 import pytest
 
+from forge_replay.canary_cohort import RedisCapability
 from forge_replay.production.worker_wake import (
     CommandWakeHint,
     ManagedWorkerLoop,
@@ -17,6 +18,18 @@ from forge_replay.production.worker_wake import (
 )
 
 SECRET = b"stable-worker-wake-canary-secret"
+
+
+class StaticTenantPolicy:
+    def __init__(self, allowed: bool) -> None:
+        self.allowed = allowed
+
+    def allows(self, capability: RedisCapability, tenant_id: str) -> bool:
+        return (
+            self.allowed
+            and capability is RedisCapability.WORKER_WAKE_CONSUME
+            and bool(tenant_id)
+        )
 
 
 def evidence(**overrides: object) -> WorkerWakeAdmissionEvidence:
@@ -123,6 +136,7 @@ def loop(
         worker_pool="default",
         wake_source=source,
         rollout_hmac_secret=SECRET,
+        tenant_policy=StaticTenantPolicy(True),
     )
 
 
@@ -374,14 +388,15 @@ def test_non_canary_worker_does_not_need_source_or_wait() -> None:
         tenant_id=selected_tenant,
         worker_pool="default",
         rollout_hmac_secret=SECRET,
+        tenant_policy=StaticTenantPolicy(False),
     )
     assert not runner.consumes_wake_hints
     assert runner.run_once() is False
     assert worker.calls == 1
 
 
-def test_canary_worker_requires_source_and_secret() -> None:
-    with pytest.raises(ValueError, match="HMAC secret"):
+def test_canary_worker_requires_source_and_manifest_policy() -> None:
+    with pytest.raises(ValueError, match="manifest tenant policy"):
         ManagedWorkerLoop(
             WorkerStub([False]),
             config=enabled_config(),
@@ -395,6 +410,7 @@ def test_canary_worker_requires_source_and_secret() -> None:
             tenant_id="tenant-a",
             worker_pool="default",
             rollout_hmac_secret=SECRET,
+            tenant_policy=StaticTenantPolicy(True),
         )
 
 

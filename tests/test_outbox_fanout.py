@@ -3,10 +3,12 @@ from __future__ import annotations
 from collections import deque
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
+from typing import cast
 
 import pytest
 
 from forge_replay.domain import ExecutionStatus
+from forge_replay.production.canary_release import RedisCapability, RedisTenantPolicy
 from forge_replay.production.outbox_relay import (
     RUN_PROJECTION_DESTINATION,
     ShadowProjectionRebuilder,
@@ -134,24 +136,24 @@ class FakeSink:
         self.operation_log = operation_log
 
     def write_projection(
-        self, value: ShadowProjectionSnapshot, *, ttl_seconds: int
+        self, snapshot: ShadowProjectionSnapshot, *, ttl_seconds: int
     ) -> ProjectionWriteResult:
         assert ttl_seconds > 0
         if self.operation_log is not None:
             self.operation_log.append("sink")
-        self.calls.append(value)
+        self.calls.append(snapshot)
         status = (
             self.sequential_statuses.popleft()
             if self.sequential_statuses
-            else self.statuses.get(value.run_id, ProjectionWriteStatus.APPLIED)
+            else self.statuses.get(snapshot.run_id, ProjectionWriteStatus.APPLIED)
         )
         return ProjectionWriteResult(
             status=status,
-            incoming_version=value.stream_version,
+            incoming_version=snapshot.stream_version,
             stored_version=(
-                value.stream_version + 1
+                snapshot.stream_version + 1
                 if status is ProjectionWriteStatus.STALE
-                else value.stream_version
+                else snapshot.stream_version
             ),
         )
 
@@ -163,18 +165,45 @@ class FakeFanoutPublisher:
         self.by_run: dict[str, object | Exception] = {}
         self.operation_log = operation_log
 
-    def publish(self, value: ShadowProjectionSnapshot) -> object:
+    def publish(
+        self,
+        snapshot: ShadowProjectionSnapshot,
+    ) -> RunFanoutPublishResult:
         if self.operation_log is not None:
             self.operation_log.append("publish")
-        self.calls.append(value)
+        self.calls.append(snapshot)
         behavior = (
             self.behaviors.popleft()
             if self.behaviors
-            else self.by_run.get(value.run_id, RunFanoutPublishResult(0))
+            else self.by_run.get(snapshot.run_id, RunFanoutPublishResult(0))
         )
         if isinstance(behavior, Exception):
             raise behavior
-        return behavior
+        return cast(RunFanoutPublishResult, behavior)
+
+
+class FakeTenantPolicy:
+    def __init__(self, allowed: bool) -> None:
+        self.allowed = allowed
+        self.calls: list[tuple[RedisCapability, str]] = []
+
+    def allows(self, capability: RedisCapability, tenant_id: str) -> bool:
+        self.calls.append((capability, tenant_id))
+        return self.allowed
+
+
+class InvalidTenantPolicy:
+    def __init__(self, response: object) -> None:
+        self.response = response
+
+    def allows(self, capability: RedisCapability, tenant_id: str) -> bool:
+        del capability, tenant_id
+        if isinstance(self.response, Exception):
+            raise self.response
+        return self.response  # type: ignore[return-value]
+
+
+ALLOW_FANOUT: RedisTenantPolicy = FakeTenantPolicy(True)
 
 
 def relay(
@@ -185,6 +214,7 @@ def relay(
     publisher: FakeFanoutPublisher | None,
     fanout: bool,
     outbox: FakeOutboxStore | None = None,
+    tenant_policy: RedisTenantPolicy | None = ALLOW_FANOUT,
 ) -> tuple[ShadowProjectionRelay, FakeOutboxStore]:
     store = outbox or FakeOutboxStore(rows)
     return (
@@ -197,6 +227,7 @@ def relay(
                 tenant_id="tenant-a", publisher_id="relay-1"
             ),
             fanout_publisher=publisher,
+            tenant_policy=tenant_policy,
         ),
         store,
     )
@@ -229,6 +260,97 @@ def test_fanout_enabled_without_publisher_fails_at_composition_time():
             publisher=None,
             fanout=True,
         )
+
+
+def test_fanout_defaults_to_deny_without_tenant_policy_but_marks_projection():
+    value = snapshot("run-default-deny")
+    sink = FakeSink()
+    publisher = FakeFanoutPublisher()
+    worker, outbox = relay(
+        rows=[claim(value.run_id)],
+        values=[value],
+        sink=sink,
+        publisher=publisher,
+        fanout=True,
+        tenant_policy=None,
+    )
+
+    result = worker.run_once()
+
+    assert result.fanout_outside_canary == 1
+    assert result.fanout_published == result.fanout_errors == 0
+    assert publisher.calls == []
+    assert sink.calls == [value]
+    assert outbox.mark_calls == [f"outbox-{value.run_id}"]
+
+
+def test_fanout_explicit_tenant_denial_skips_publish_and_marks_projection():
+    value = snapshot("run-denied")
+    policy = FakeTenantPolicy(False)
+    publisher = FakeFanoutPublisher()
+    worker, outbox = relay(
+        rows=[claim(value.run_id)],
+        values=[value],
+        sink=FakeSink(),
+        publisher=publisher,
+        fanout=True,
+        tenant_policy=policy,
+    )
+
+    result = worker.run_once()
+
+    assert policy.calls == [(RedisCapability.FANOUT, "tenant-a")]
+    assert result.fanout_outside_canary == 1
+    assert result.fanout_published == result.fanout_errors == 0
+    assert publisher.calls == []
+    assert outbox.mark_calls == [f"outbox-{value.run_id}"]
+
+
+@pytest.mark.parametrize("response", [RuntimeError("policy down"), "yes"])
+def test_fanout_invalid_policy_fails_closed_but_marks_projection(
+    response: object,
+) -> None:
+    value = snapshot("run-policy-error")
+    publisher = FakeFanoutPublisher()
+    worker, outbox = relay(
+        rows=[claim(value.run_id)],
+        values=[value],
+        sink=FakeSink(),
+        publisher=publisher,
+        fanout=True,
+        tenant_policy=InvalidTenantPolicy(response),
+    )
+
+    result = worker.run_once()
+
+    assert result.fanout_outside_canary == 1
+    assert result.fanout_errors == 1
+    assert publisher.calls == []
+    assert outbox.mark_calls == [f"outbox-{value.run_id}"]
+
+
+def test_fanout_explicit_tenant_allow_publishes_before_mark():
+    value = snapshot("run-allowed")
+    policy = FakeTenantPolicy(True)
+    operations: list[str] = []
+    publisher = FakeFanoutPublisher(operations)
+    outbox = FakeOutboxStore([claim(value.run_id)], operations)
+    worker, _ = relay(
+        rows=outbox.rows,
+        values=[value],
+        sink=FakeSink(operations),
+        publisher=publisher,
+        fanout=True,
+        outbox=outbox,
+        tenant_policy=policy,
+    )
+
+    result = worker.run_once()
+
+    assert policy.calls == [(RedisCapability.FANOUT, "tenant-a")]
+    assert result.fanout_outside_canary == 0
+    assert result.fanout_published == result.marked_published == 1
+    assert operations == ["sink", "publish", "mark"]
 
 
 @pytest.mark.parametrize(

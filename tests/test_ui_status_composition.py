@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from typing import Any
 
 import pytest
 
 from forge_replay.domain import ExecutionStatus
 from forge_replay.production import managed as managed_module
 from forge_replay.production import ui_status as ui_status_module
+from forge_replay.production.canary_release import RedisCapability
 from forge_replay.production.managed import (
     ManagedAuthorityConfig,
     PostgresAuthorityFactory,
@@ -74,16 +76,21 @@ class FakeSink:
 
     def write_projection(
         self,
-        value: ShadowProjectionSnapshot,
+        snapshot: ShadowProjectionSnapshot,
         *,
         ttl_seconds: int,
     ) -> ProjectionWriteResult:
-        self.calls.append((value, ttl_seconds))
+        self.calls.append((snapshot, ttl_seconds))
         return ProjectionWriteResult(
             status=ProjectionWriteStatus.APPLIED,
-            incoming_version=value.stream_version,
-            stored_version=value.stream_version,
+            incoming_version=snapshot.stream_version,
+            stored_version=snapshot.stream_version,
         )
+
+
+class TenantPolicy:
+    def allows(self, capability: RedisCapability, tenant_id: str) -> bool:
+        return capability is RedisCapability.UI_STATUS_READ and tenant_id == "tenant-a"
 
 
 def phase2_config() -> ShadowProjectionConfig:
@@ -103,6 +110,7 @@ def test_tenant_routed_reader_builds_a_fresh_source_per_authenticated_request(
     cache = FakeCacheReader()
     sink = FakeSink()
     config = phase2_config()
+    tenant_policy = TenantPolicy()
     sentinel = object()
 
     def source_factory(tenant_id: str) -> FakeSource:
@@ -125,6 +133,7 @@ def test_tenant_routed_reader_builds_a_fresh_source_per_authenticated_request(
         cache_reader=cache,
         sink=sink,
         projection_config=config,
+        tenant_policy=tenant_policy,
     )
 
     first = reader.read_ui_status(
@@ -143,6 +152,7 @@ def test_tenant_routed_reader_builds_a_fresh_source_per_authenticated_request(
     assert all(item["cache_reader"] is cache for item in constructed)
     assert all(item["sink"] is sink for item in constructed)
     assert all(item["projection_config"] is config for item in constructed)
+    assert all(item["tenant_policy"] is tenant_policy for item in constructed)
     assert read_calls == [
         {
             "tenant_id": "tenant-a",
@@ -255,7 +265,7 @@ def test_managed_control_plane_passes_optional_ui_reader_without_changing_defaul
     monkeypatch.setattr(managed_module, "PostgresAuthorityFactory", Factory)
     monkeypatch.setattr(managed_module, "create_control_plane_app", create_app)
 
-    kwargs: dict[str, object] = {}
+    kwargs: dict[str, Any] = {}
     if reader is not None:
         kwargs["ui_status_reader"] = reader
     result = build_managed_control_plane(

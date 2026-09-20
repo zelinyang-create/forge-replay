@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import math
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from typing import Any
@@ -114,6 +115,9 @@ class OperationalSnapshot:
     audit_chain_verified: bool
     supply_chain_verified: bool
 
+    def __post_init__(self) -> None:
+        _validate_operational_snapshot(self)
+
 
 @dataclass(frozen=True)
 class ReadinessDecision:
@@ -123,6 +127,11 @@ class ReadinessDecision:
 
 class GaReadinessGate:
     def evaluate(self, snapshot: OperationalSnapshot) -> ReadinessDecision:
+        if not isinstance(snapshot, OperationalSnapshot):
+            raise TypeError("snapshot must be OperationalSnapshot")
+        # Keep the final production decision fail-closed even if a caller
+        # reconstructed or tampered with a frozen snapshot unsafely.
+        _validate_operational_snapshot(snapshot)
         reasons: list[str] = []
         if snapshot.consecutive_slo_days < 28:
             reasons.append("insufficient_slo_observation_window")
@@ -143,6 +152,59 @@ class GaReadinessGate:
         if not snapshot.supply_chain_verified:
             reasons.append("supply_chain_unverified")
         return ReadinessDecision(not reasons, tuple(reasons))
+
+
+def _validate_operational_snapshot(snapshot: OperationalSnapshot) -> None:
+    _non_negative_int(snapshot.consecutive_slo_days, field="consecutive_slo_days")
+    _rate(snapshot.availability, field="availability")
+    _rate(
+        snapshot.terminal_run_success_rate,
+        field="terminal_run_success_rate",
+    )
+    _non_negative_int(snapshot.orphan_sandboxes, field="orphan_sandboxes")
+    _non_negative_int(snapshot.orphan_workspaces, field="orphan_workspaces")
+    _non_negative_int(
+        snapshot.suspended_reservations,
+        field="suspended_reservations",
+    )
+    _non_negative_number(snapshot.unattributed_cost_usd, field="unattributed_cost_usd")
+    alerts = snapshot.critical_alerts_without_runbook
+    if not isinstance(alerts, tuple):
+        raise TypeError("critical_alerts_without_runbook must be a tuple")
+    for alert in alerts:
+        if not isinstance(alert, str):
+            raise TypeError("critical_alerts_without_runbook entries must be strings")
+        if not alert.strip():
+            raise ValueError(
+                "critical_alerts_without_runbook entries must not be empty"
+            )
+    for field_name in (
+        "backup_restore_verified",
+        "audit_chain_verified",
+        "supply_chain_verified",
+    ):
+        if not isinstance(getattr(snapshot, field_name), bool):
+            raise TypeError(f"{field_name} must be a bool")
+
+
+def _non_negative_int(value: Any, *, field: str) -> None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{field} must be an integer")
+    if value < 0:
+        raise ValueError(f"{field} must be non-negative")
+
+
+def _non_negative_number(value: Any, *, field: str) -> None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"{field} must be a number")
+    if not math.isfinite(value) or value < 0:
+        raise ValueError(f"{field} must be finite and non-negative")
+
+
+def _rate(value: Any, *, field: str) -> None:
+    _non_negative_number(value, field=field)
+    if value > 1:
+        raise ValueError(f"{field} must be between 0 and 1")
 
 
 @dataclass(frozen=True)
