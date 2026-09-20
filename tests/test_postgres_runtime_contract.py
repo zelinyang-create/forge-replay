@@ -126,7 +126,7 @@ def test_postgres_runtime_store_is_not_a_sqlite_dynamic_forwarder_or_stub():
     assert "apply_postgres_runtime_migrations" in class_source
 
 
-def test_run_event_outbox_has_one_canonical_producer_after_projection():
+def test_run_projection_outbox_has_one_canonical_producer_after_projection():
     module = inspect.getmodule(PostgresRuntimeStore)
     assert module is not None
     source = inspect.getsource(module)
@@ -154,7 +154,11 @@ def test_run_event_outbox_has_one_canonical_producer_after_projection():
         )
     )
     assert "INSERT INTO run_events(" not in control_plane_source
-    assert "INSERT INTO run_outbox(" not in control_plane_source
+    # The control plane owns the distinct transactional command-wakeup outbox,
+    # but it must never become a second producer of run projection messages.
+    assert control_plane_source.count("INSERT INTO run_outbox(") == 1
+    assert '"command-wakeup-v1:' in control_plane_source
+    assert "'run-projection-v1'" not in control_plane_source
 
 
 def test_runtime_schema_makes_tenant_and_run_identity_part_of_the_stream():

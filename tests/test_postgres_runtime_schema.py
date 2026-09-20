@@ -85,6 +85,7 @@ def test_migrations_are_contiguous_named_and_content_addressed():
         6,
         7,
         8,
+        9,
     ]
     assert all(migration.name for migration in POSTGRES_RUNTIME_MIGRATIONS)
     assert all(re.fullmatch(r"[0-9a-f]{64}", migration.checksum) for migration in POSTGRES_RUNTIME_MIGRATIONS)
@@ -119,9 +120,21 @@ def test_all_published_migrations_are_immutable():
             "run_projection_outbox_source",
             "50d92dfde144371769ec3cbb7601b8ed1d2b1813b02c5c159606e5edebb7d425",
         ),
+        7: (
+            "external_blob_accounting",
+            "2ea9e68b4fd93c9bb45589417bfaf76a62e4adb539979fcb354409bb7adac23a",
+        ),
+        8: (
+            "active_run_keyset_index",
+            "e97998c02b39b158bf5e05ea8a17ba4210defbe5ead282fe134201a184ca8186",
+        ),
+        9: (
+            "worker_pool_command_authority",
+            "04f88da9ed330f15a61bd3467de208af16460f3648b61268e1ce5ae4c5da041e",
+        ),
     }
 
-    for migration in POSTGRES_RUNTIME_MIGRATIONS[:6]:
+    for migration in POSTGRES_RUNTIME_MIGRATIONS:
         assert (migration.name, migration.checksum) == published[migration.version]
 
 
@@ -129,7 +142,17 @@ def test_migration_runner_accepts_dict_rows_and_is_idempotent():
     connection = _MigrationConnection()
 
     apply_postgres_runtime_migrations(connection)
-    assert [version for version, _ in connection.applied] == [1, 2, 3, 4, 5, 6, 7, 8]
+    assert [version for version, _ in connection.applied] == [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+    ]
 
     first_execution_count = len(connection.executed)
     apply_postgres_runtime_migrations(connection)
@@ -258,16 +281,37 @@ def test_command_queue_supports_idempotent_claim_and_reclaim():
     assert "where idempotency_key is not null" in sql
     assert re.search(
         r"create index run_commands_ready "
-        r"on run_commands\(tenant_id, available_at, command_id\) "
+        r"on run_commands\(tenant_id, worker_pool, available_at, command_id\) "
         r"where status = 'queued'",
         sql,
     )
     assert re.search(
         r"create index run_commands_expired_claims "
-        r"on run_commands\(tenant_id, claim_expires_at, command_id\) "
+        r"on run_commands\(tenant_id, worker_pool, claim_expires_at, command_id\) "
         r"where status = 'claimed'",
         sql,
     )
+
+
+def test_worker_pool_command_authority_migration_is_additive_and_pool_indexed():
+    migration = POSTGRES_RUNTIME_MIGRATIONS[8]
+    sql = " ".join(" ".join(migration.statements).lower().split())
+
+    assert migration.version == 9
+    assert migration.name == "worker_pool_command_authority"
+    assert (
+        "alter table run_commands add column worker_pool text not null default 'default'"
+        in sql
+    )
+    assert "check (length(btrim(worker_pool)) between 1 and 64)" in sql
+    assert (
+        "on run_commands(tenant_id, worker_pool, available_at, command_id) "
+        "where status = 'queued'"
+    ) in sql
+    assert (
+        "on run_commands(tenant_id, worker_pool, claim_expires_at, command_id) "
+        "where status = 'claimed'"
+    ) in sql
 
 
 def test_outbox_supports_at_least_once_claim_and_publish():

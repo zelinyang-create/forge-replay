@@ -148,14 +148,16 @@ Redis 只能保存能够从 PostgreSQL 或对象存储重建的数据：
 
 ## 5. Redis Key 与消息设计
 
-Key 必须带环境和 schema version；Redis Cluster 中需要同 Run 同 slot：
+Key 必须带环境和 schema version；Redis Cluster 中需要同 Run 同 slot。Worker wake v1
+固定单 shard，并把 tenant 与 pool 分别做用途隔离的 HMAC；consumer name 同样使用 HMAC，
+Redis key、pending 列表、日志和监控不得暴露原始 tenant、pool 或 worker ID：
 
 ```text
 fr:<env>:v1:{t:<tenant>:r:<run>}:projection
 fr:<env>:v1:{t:<tenant>:r:<run>}:recent
 fr:<env>:v1:active:<tenant>:<shard>
-fr:<env>:v1:{q:<worker-pool>:<shard>}:commands
-fr:<env>:v1:worker:<worker-id>:heartbeat
+fr:<env>:v1:{qw:<tenant-hmac>:<pool-hmac>:00}:commands
+fr:<env>:v1:worker:<worker-id-hmac>:heartbeat
 fr:<env>:v1:{rl:<tenant-hmac>}:rate:<route-class>:p:<policy-hmac>:tenant
 fr:<env>:v1:{rl:<tenant-hmac>}:rate:<route-class>:p:<policy-hmac>:user:<user-hmac>
 fr:<env>:v1:outbox-dedup:<outbox-id>
@@ -193,23 +195,20 @@ Projection 最少字段：
 - recent events：与 projection 同 TTL，`MAXLEN ~ 128` 或 `256`；
 - worker heartbeat：30 秒；
 - outbox dedup：7 天，仅作优化，不代替 SQL 唯一约束；
-- command stream：不设置简单 TTL，只在 SQL command 已完成且消费组安全越过后 trim。
+- command stream：不设置简单 TTL；可用 `MAXLEN ~ N` 近似裁剪。提示被裁剪只增加延迟，
+  固定 PostgreSQL polling 必须保证最终领取。
 
 Command Stream 字段：
 
 ```text
-command_id
+schema_version
 outbox_id
-tenant_id
-run_id
-command_type
-expected_stream_version
-worker_pool
-available_at
+command_id
 ```
 
 Redis message ID 不作为业务身份；稳定业务身份始终是 SQL 中的 `command_id`、
-`outbox_id` 和 `event_id`。
+`outbox_id` 和 `event_id`。tenant 与 worker pool 只来自进程启动配置；Run、command 类型、
+版本、`available_at`、业务 payload、审批和预算必须重新读取 PostgreSQL。
 
 ## 6. 写入协议与一致性
 
@@ -254,14 +253,36 @@ expected_stream_version
 
 ### 6.4 Worker 消费
 
-1. `XREADGROUP` 获取消息。
-2. 回 PostgreSQL 加载 command；已完成或过期消息直接安全确认。
-3. 获取 SQL lease；acquire/takeover 才递增 epoch，renew 不递增。
-4. 执行前再次验证 Run 状态、审批、预算和 stream version。
-5. 执行外部动作。
-6. 在 fenced SQL 事务中提交结果及后续 command/outbox。
-7. SQL commit 后 `XACK`。
-8. Worker 崩溃时使用 `XAUTOCLAIM` 接管 pending message，并重新从 SQL 判断真相。
+本项目采用 **wake-only**，不把 Redis Stream 变成第二套任务队列：
+
+1. Worker 启动和每轮循环都先从 PostgreSQL 按 `(tenant_id, worker_pool)` 执行一次
+   `SKIP LOCKED` claim；有积压时持续 drain SQL，不先读 Redis。
+2. SQL 暂无可领取命令时，才用 `XREADGROUP` 有界阻塞等待提示；阻塞时间不得超过
+   `sql_fallback_poll_interval`，超时或 Redis 错误后立即回到 SQL polling。
+3. Stream 提示严格只含 `schema_version/outbox_id/command_id`。租户和 worker pool 来自
+   受信启动配置，提示里的任何业务状态、payload、审批、预算或版本一律不采信。
+4. 收到提示后仍执行普通 PostgreSQL claim。当前实现仅在一次权威 `ManagedWorker.run_once()`
+   明确返回后 `XACK`，包括返回 0 行的 stale/duplicate/过早提示；SQL claim/处理向上抛出
+   异常则不 `XACK`。长任务期间提示可能留在 pending 或被重复领取，但另一个 Worker 的
+   SQL claim 会返回 0 行；Worker 崩溃后的执行恢复仍由 SQL visibility timeout 和固定
+   polling 保证，不能由 pending hint 直接恢复业务执行。
+5. 真正领取到 command 后，获取 SQL lease；acquire/takeover 才递增 epoch，renew 不递增。
+   执行前再次验证 Run 状态、审批、预算和 stream version，结果仍在 fenced SQL 事务提交。
+6. `XAUTOCLAIM` 只回收 read 到 SQL 决议之间遗留的 pending 提示，不承担业务正确性。
+   malformed 提示作为 poison hint 记录低基数指标并确认；重复、丢失、trim、flush、
+   `NOGROUP`、断连最多增加唤醒延迟，不得造成 command 丢失或越权执行。
+
+首版每次 SQL poll 强制 `claim_limit=1`。当前 `LeaseGuard` 只续租正在执行的一条命令；
+允许批量预取会使本地等待命令的 claim 过期并被其他 Worker 接管。未来只有实现整批续租，
+或在每条命令执行前增加 owner CAS 后，才可重新开放批量 claim。
+
+`run_commands.worker_pool` 是 SQL 权威路由字段，首版默认 `default`。Redis key 使用
+HMAC 后的 tenant/pool 和固定单 shard，消息不暴露原始 tenant、pool、run 或 worker ID。
+初始 command 与 pool 路由的 `command-wakeup-v1:<worker_pool>` outbox 在同一 SQL 事务
+创建；不同 pool 的 Relay 只领取自己的 destination，不能互相吞掉提示。retryable command 的
+延迟重排队首版不提前发布提示，到期后由有界 PostgreSQL fallback poll 领取，避免将未来
+任务过早 `XADD` 后确认丢弃。后续若要优化延迟，应给 outbox 增加权威 `available_at`，由
+Relay 到期后发布，不能靠 Redis 消息里的时间字段决定执行。
 
 ## 7. 读取协议
 
@@ -477,6 +498,11 @@ SHA-256、长度、media type、tenant 和引用关系。
 5. 共享 rate limit/circuit breaker；
 6. Redis Streams worker wake-up。
 
+第 6 项交付为默认关闭的 wake-only 基础设施：独立 transactional outbox relay、
+tenant/pool 隔离 Stream、consumer group、`XAUTOCLAIM`、有界 SQL fallback loop 和独立
+准入证据。它不会解除准入门槛；未提供真实 Redis 故障演练证据时只允许 `OFF` 或
+publish-only 预热，不允许消费路径进入生产流量。
+
 每项使用独立 feature flag，支持立即回退 PostgreSQL。
 共享 API rate limit 与 provider circuit breaker 必须是两个独立能力、开关和状态空间；
 本阶段只定义 API rate limit，不能用它推断 provider 健康。
@@ -559,6 +585,12 @@ SQLite 与 PostgreSQL 必须共同通过：
 - visibility timeout/reclaim；
 - 重复、乱序 outbox；
 - `XREADGROUP`、`XACK`、`XAUTOCLAIM`；
+- command 创建与 wake outbox 必须同事务 commit/rollback；消息严格无 tenant/run/payload；
+- consumer 启动先 SQL drain，timeout、Redis error、flush/trim、`NOGROUP` 后均在固定上限
+  内恢复 SQL polling；SQL claim 异常不确认提示；
+- crash 窗口覆盖 read 前、read 后 SQL claim 前、claim commit 后 ACK 前、ACK 后执行前；
+  验收时 SQL visibility timeout 必须能恢复已领取命令，且提示重复不产生重复逻辑效果；
+- worker pool 隔离同时由 SQL 谓词和 Redis key 验证，伪造提示不能改变 tenant/pool；
 - versioned cache CAS；
 - Redis miss、timeout、flush、eviction、network partition；
 - PostgreSQL fallback。

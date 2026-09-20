@@ -743,6 +743,37 @@ POSTGRES_RUNTIME_MIGRATIONS = (
             """,
         ),
     ),
+    PostgresMigration(
+        version=9,
+        name="worker_pool_command_authority",
+        statements=(
+            """
+            ALTER TABLE run_commands
+            ADD COLUMN worker_pool text NOT NULL DEFAULT 'default'
+            """,
+            """
+            ALTER TABLE run_commands
+            ADD CONSTRAINT run_commands_worker_pool_valid
+            CHECK (length(btrim(worker_pool)) BETWEEN 1 AND 64)
+            """,
+            """
+            DROP INDEX run_commands_ready
+            """,
+            """
+            CREATE INDEX run_commands_ready
+            ON run_commands(tenant_id, worker_pool, available_at, command_id)
+            WHERE status = 'queued'
+            """,
+            """
+            DROP INDEX run_commands_expired_claims
+            """,
+            """
+            CREATE INDEX run_commands_expired_claims
+            ON run_commands(tenant_id, worker_pool, claim_expires_at, command_id)
+            WHERE status = 'claimed'
+            """,
+        ),
+    ),
 )
 
 

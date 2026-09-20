@@ -291,6 +291,34 @@ def test_managed_authority_dsn_is_required_and_fails_closed(dsn: object):
         ManagedAuthorityConfig(dsn)  # type: ignore[arg-type]
 
 
+def test_managed_worker_rejects_unrenewed_batch_prefetch():
+    with pytest.raises(ValueError, match="claim_limit must equal 1"):
+        ManagedWorkerConfig(
+            tenant_id="tenant-a",
+            worker_id="worker-1",
+            claim_limit=2,
+        )
+
+
+def test_managed_worker_requires_bounded_worker_pool():
+    with pytest.raises(ValueError, match="worker_pool"):
+        ManagedWorkerConfig(
+            tenant_id="tenant-a",
+            worker_id="worker-1",
+            worker_pool=" ",
+        )
+
+
+def test_worker_fails_closed_on_command_from_another_pool():
+    worker, control, _, executor, _ = _worker(
+        command=_command() | {"worker_pool": "gpu"}
+    )
+
+    assert worker.run_once() is True
+    assert executor.calls == []
+    assert control.failures[-1]["retryable"] is False
+
+
 def test_authority_factory_builds_only_postgres_stores_with_explicit_tenant():
     connect = object()
     object_store = object()

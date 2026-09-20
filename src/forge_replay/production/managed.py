@@ -215,6 +215,7 @@ def build_managed_control_plane(
 class ManagedWorkerConfig:
     tenant_id: str
     worker_id: str
+    worker_pool: str = "default"
     claim_limit: int = 1
     command_visibility_timeout_seconds: int = 30
     run_lease_ttl_seconds: int = 30
@@ -227,8 +228,19 @@ class ManagedWorkerConfig:
             raise ValueError("managed worker tenant_id must not be empty")
         if not isinstance(self.worker_id, str) or not self.worker_id.strip():
             raise ValueError("managed worker worker_id must not be empty")
-        if isinstance(self.claim_limit, bool) or not 1 <= self.claim_limit <= 100:
-            raise ValueError("managed worker claim_limit must be between 1 and 100")
+        if (
+            not isinstance(self.worker_pool, str)
+            or not self.worker_pool.strip()
+            or len(self.worker_pool) > 64
+        ):
+            raise ValueError("managed worker worker_pool must be 1-64 characters")
+        # Only the command currently executing is renewed by LeaseGuard.  A
+        # larger prefetch would leave later local claims unrenewed and could
+        # allow another worker to reclaim them before this process executes
+        # them.  Keep one authoritative SQL claim per poll until batch-wide
+        # claim renewal (or an execution-time owner CAS) exists.
+        if isinstance(self.claim_limit, bool) or self.claim_limit != 1:
+            raise ValueError("managed worker claim_limit must equal 1")
         if (
             isinstance(self.command_visibility_timeout_seconds, bool)
             or not 5 <= self.command_visibility_timeout_seconds <= 3600
@@ -505,7 +517,7 @@ class ManagedWorker:
         self._stopped = threading.Event()
 
     def run_once(self) -> bool:
-        """Poll and handle one command batch; return whether any command was claimed."""
+        """Claim and handle at most one command; return whether one was claimed."""
 
         if self._stopped.is_set():
             return False
@@ -519,6 +531,7 @@ class ManagedWorker:
         commands = control.claim_commands(
             tenant_id=self.config.tenant_id,
             worker_id=self.config.worker_id,
+            worker_pool=self.config.worker_pool,
             limit=self.config.claim_limit,
             visibility_timeout_seconds=(
                 self.config.command_visibility_timeout_seconds
@@ -614,6 +627,12 @@ class ManagedWorker:
             raise PermanentManagedRunError("claimed command is not an object")
         if command.get("tenant_id") != self.config.tenant_id:
             raise PermanentManagedRunError("claimed command belongs to another tenant")
+        # PostgreSQL already filters on the authoritative pool.  Rechecking at
+        # the execution boundary fails closed if an adapter, fixture, or
+        # corrupted row ever violates that contract.  Rows from the additive
+        # migration default to the original single pool.
+        if command.get("worker_pool", "default") != self.config.worker_pool:
+            raise PermanentManagedRunError("claimed command belongs to another worker pool")
         if command.get("command_type") != "start":
             raise PermanentManagedRunError("managed worker only accepts start commands")
         command_id = _required_text(command, "command_id")

@@ -97,8 +97,43 @@ def test_command_claim_atomically_includes_expired_claims_and_sets_deadline():
     assert "make_interval(secs => %s)" in sql
     assert "c.expected_stream_version" in sql
     assert "c.payload_json" in sql
+    assert "worker_pool = %s" in sql
+    assert "c.worker_pool" in sql
     assert "updated_at = clock_timestamp()" in sql
-    assert params == ("tenant-a", 7, "worker-2", 45)
+    assert params == ("tenant-a", "default", 7, "worker-2", 45)
+
+
+def test_command_claim_is_strictly_scoped_to_explicit_worker_pool():
+    connect = ScriptedConnect([])
+
+    assert make_store(connect).claim_commands(
+        tenant_id="tenant-a",
+        worker_id="worker-2",
+        worker_pool="sandbox-linux",
+        limit=7,
+        visibility_timeout_seconds=45,
+    ) == ()
+
+    sql, params = connect.statement_containing("with ready as")
+    assert "tenant_id = %s and worker_pool = %s" in sql
+    assert params == ("tenant-a", "sandbox-linux", 7, "worker-2", 45)
+
+
+@pytest.mark.parametrize("worker_pool", ["", "   ", "x" * 65, 7])
+def test_command_claim_rejects_invalid_worker_pool_before_database_access(
+    worker_pool: object,
+):
+    connect = ScriptedConnect()
+
+    with pytest.raises(ValueError, match="worker_pool is invalid"):
+        make_store(connect).claim_commands(
+            tenant_id="tenant-a",
+            worker_id="worker-2",
+            worker_pool=worker_pool,  # type: ignore[arg-type]
+            limit=1,
+        )
+
+    assert connect.statements == []
 
 
 def test_explicit_command_reclaim_releases_only_expired_claims():
@@ -192,6 +227,7 @@ def test_retryable_command_failure_requeues_with_delay_and_clears_claim():
     assert "command-1" in params
     assert "worker-1" in params
     assert any("TemporaryError" in str(value) for value in params)
+    assert not any("insert into run_outbox" in sql for sql, _ in connect.statements)
 
 
 def test_permanent_command_failure_is_terminal_and_owner_fenced():

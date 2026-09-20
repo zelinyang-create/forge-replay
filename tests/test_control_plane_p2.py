@@ -15,7 +15,10 @@ from forge_replay.control_plane.api import (
 )
 from forge_replay.control_plane.artifacts import LocalTenantCasStore
 from forge_replay.control_plane.postgres import PostgresControlPlaneStore
-from forge_replay.persistence.postgres_schema import postgres_runtime_schema_sql
+from forge_replay.persistence.postgres_schema import (
+    POSTGRES_RUNTIME_MIGRATIONS,
+    postgres_runtime_schema_sql,
+)
 
 
 def test_canonical_postgres_schema_declares_each_authority_table_once():
@@ -38,7 +41,22 @@ def test_canonical_postgres_schema_declares_each_authority_table_once():
         assert len(declarations) == 1, f"{table} must have one canonical declaration"
 
     assert "primary key (tenant_id, event_id)" in normalized
-    assert "alter table run_commands add column" not in normalized
+    worker_pool_migration = next(
+        migration
+        for migration in POSTGRES_RUNTIME_MIGRATIONS
+        if migration.name == "worker_pool_command_authority"
+    )
+    worker_pool_sql = " ".join(" ".join(worker_pool_migration.statements).split()).lower()
+    assert "alter table run_commands add column worker_pool" in worker_pool_sql
+    canonical_control = next(
+        migration
+        for migration in POSTGRES_RUNTIME_MIGRATIONS
+        if migration.name == "canonical_control_delivery"
+    )
+    canonical_control_sql = " ".join(
+        " ".join(canonical_control.statements).split()
+    ).lower()
+    assert "alter table run_commands add column" not in canonical_control_sql
     assert "alter table run_outbox add column claimed_by" not in normalized
     assert normalized.count("alter table run_outbox add column source_event_id text") == 1
 
@@ -189,15 +207,30 @@ def test_postgres_migration_and_idempotent_create_integration():
         command_id=commands[0]["command_id"],
         worker_id=f"worker-{suffix}",
     )
-    assert len(outbox) == 2
-    assert {item["stream_version"] for item in outbox} == {1, 2}
-    assert {item["dedupe_key"] for item in outbox} == {
+    assert len(outbox) == 3
+    projection_outbox = [
+        item for item in outbox if item["destination"] == "run-projection-v1"
+    ]
+    assert {item["stream_version"] for item in projection_outbox} == {1, 2}
+    assert {item["dedupe_key"] for item in projection_outbox} == {
         f"run-projection-v1:{run_id}:1",
         f"run-projection-v1:{run_id}:2",
     }
-    for item in outbox:
+    for item in projection_outbox:
         assert item["outbox_id"] == f"run-projection-v1:{item['source_event_id']}"
         assert item["payload_json"]["source_event_id"] == item["source_event_id"]
+        assert "task" not in item["payload_json"]
+    wakeup = next(
+        item for item in outbox if item["destination"] == "command-wakeup-v1:default"
+    )
+    assert wakeup["source_event_id"] is None
+    assert wakeup["payload_json"] == {
+        "schema_version": 1,
+        "outbox_id": f"command-wakeup-v1:command-{suffix}",
+        "command_id": f"command-{suffix}",
+        "worker_pool": "default",
+    }
+    for item in outbox:
         assert "task" not in item["payload_json"]
         assert recovered.mark_outbox_published(
             tenant_id=tenant_id,

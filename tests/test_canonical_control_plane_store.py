@@ -297,8 +297,15 @@ def test_create_run_commits_canonical_events_projection_command_and_outbox_toget
     assert positions == sorted(positions)
 
     _, command_params = _statement(connection, "insert into run_commands")
-    assert command_params[:5] == ("tenant-a", "command-1", "run-1", "request-1", 2)
-    assert json.loads(command_params[5]) == {
+    assert command_params[:6] == (
+        "tenant-a",
+        "default",
+        "command-1",
+        "run-1",
+        "request-1",
+        2,
+    )
+    assert json.loads(command_params[6]) == {
         "actor_user_id": "user-1",
         "run_id": "run-1",
         "session_id": "session-run-1",
@@ -310,13 +317,18 @@ def test_create_run_commits_canonical_events_projection_command_and_outbox_toget
         for sql, params in connection.statements
         if "insert into run_outbox" in sql
     ]
-    assert len(outbox_statements) == 2
-    assert [params[4] for _, params in outbox_statements] == [1, 2]
-    assert [params[3] for _, params in outbox_statements] == [
+    assert len(outbox_statements) == 3
+    projection_outbox = [
+        (sql, params)
+        for sql, params in outbox_statements
+        if "'run-projection-v1'" in sql
+    ]
+    assert [params[4] for _, params in projection_outbox] == [1, 2]
+    assert [params[3] for _, params in projection_outbox] == [
         "run-projection-v1:run-1:1",
         "run-projection-v1:run-1:2",
     ]
-    for sql, params in outbox_statements:
+    for sql, params in projection_outbox:
         assert params[1] == f"run-projection-v1:{params[5]}"
         assert "'run-projection-v1'" in sql
         payload = json.loads(params[6])
@@ -324,7 +336,83 @@ def test_create_run_commits_canonical_events_projection_command_and_outbox_toget
         assert "task" not in payload
         assert "actor_user_id" not in payload
         assert "payload" not in payload
+    wakeup_sql, wakeup_params = next(
+        item
+        for item in outbox_statements
+        if item[1][3] == "command-wakeup-v1:default"
+    )
+    assert "source_event_id" not in wakeup_sql
+    assert wakeup_params[:6] == (
+        "tenant-a",
+        "command-wakeup-v1:command-1",
+        "run-1",
+        "command-wakeup-v1:default",
+        "command-wakeup-v1:command-1",
+        2,
+    )
+    assert json.loads(wakeup_params[6]) == {
+        "schema_version": 1,
+        "outbox_id": "command-wakeup-v1:command-1",
+        "command_id": "command-1",
+        "worker_pool": "default",
+    }
     assert all("create-run:" not in str(params) for _, params in outbox_statements)
+
+
+def test_create_run_persists_explicit_worker_pool_in_command_and_wakeup(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    FakeRuntimeStore.instances.clear()
+    monkeypatch.setattr(postgres_module, "PostgresRuntimeStore", FakeRuntimeStore)
+    connection = RecordingConnection()
+    store, _ = _make_store(connection)
+
+    store.create_run(
+        tenant_id="tenant-a",
+        run_id="run-1",
+        idempotency_key="request-1",
+        request=_request(),
+        command_id="command-1",
+        event_id="admission-1",
+        worker_pool="sandbox-linux",
+    )
+
+    _, command_params = _statement(connection, "insert into run_commands")
+    assert command_params[1] == "sandbox-linux"
+    wakeup_sql, wakeup_params = next(
+        item
+        for item in connection.statements
+        if "insert into run_outbox" in item[0]
+        and item[1][3] == "command-wakeup-v1:sandbox-linux"
+    )
+    assert "tenant_id" in wakeup_sql
+    assert json.loads(wakeup_params[6]) == {
+        "schema_version": 1,
+        "outbox_id": "command-wakeup-v1:command-1",
+        "command_id": "command-1",
+        "worker_pool": "sandbox-linux",
+    }
+
+
+@pytest.mark.parametrize("worker_pool", ["", "   ", "x" * 65, 7])
+def test_create_run_rejects_invalid_worker_pool_before_connecting(
+    worker_pool: object,
+):
+    connection = RecordingConnection()
+    store, connect = _make_store(connection)
+
+    with pytest.raises(ValueError, match="worker_pool is invalid"):
+        store.create_run(
+            tenant_id="tenant-a",
+            run_id="run-1",
+            idempotency_key="request-1",
+            request=_request(),
+            command_id="command-1",
+            event_id="admission-1",
+            worker_pool=worker_pool,  # type: ignore[arg-type]
+        )
+
+    assert connect.calls == []
 
 
 def test_create_run_replays_saved_response_without_rewriting_authority():
@@ -396,6 +484,48 @@ def test_create_run_rejects_idempotency_key_reuse_with_a_different_request():
 
     assert not any("insert into" in sql for sql, _ in connection.statements)
     assert connection.exit_args[0][0] is IdempotencyConflictError
+
+
+def test_create_run_rejects_idempotency_replay_to_a_different_worker_pool():
+    request = _request()
+    default_request_sha = hashlib.sha256(
+        json.dumps(
+            request,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+    ).hexdigest()
+
+    def respond(sql: str, _params: tuple[Any, ...]) -> list[dict[str, Any]]:
+        if "from api_idempotency_keys" in sql:
+            return [
+                {
+                    "request_sha256": default_request_sha,
+                    "resource_id": "run-original",
+                    "response_json": {
+                        "status": "queued",
+                        "stream_version": 2,
+                    },
+                }
+            ]
+        return []
+
+    connection = RecordingConnection(respond)
+    store, _ = _make_store(connection)
+
+    with pytest.raises(IdempotencyConflictError, match="different request"):
+        store.create_run(
+            tenant_id="tenant-a",
+            run_id="run-ignored",
+            idempotency_key="request-1",
+            request=request,
+            command_id="command-ignored",
+            event_id="event-ignored",
+            worker_pool="gpu",
+        )
+
+    assert not any("insert into" in sql for sql, _ in connection.statements)
 
 
 def test_canonical_get_run_preserves_compatibility_aliases():

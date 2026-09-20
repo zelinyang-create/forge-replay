@@ -108,6 +108,13 @@ from forge_replay.production.redis_shadow import (
     ShadowProjectionUnavailableError,
 )
 from forge_replay.production.redis_shadow_reader import RedisShadowProjectionReader
+from forge_replay.production.redis_worker_wake import (
+    WORKER_WAKE_GROUP,
+    RedisWorkerWakeConsumer,
+    RedisWorkerWakePublisher,
+    worker_wake_consumer_name,
+    worker_wake_stream_key,
+)
 from forge_replay.production.release_gate import ReleaseGate
 from forge_replay.production.sandbox import (
     ExecReceipt,
@@ -143,17 +150,35 @@ from forge_replay.production.shadow_read import (
     ShadowProjectionReadSource,
 )
 from forge_replay.production.ui_status import TenantRoutedUiStatusReader
+from forge_replay.production.worker_wake import (
+    CommandWakeHint,
+    ManagedWorkerLoop,
+    WorkerWakeAdmissionEvidence,
+    WorkerWakeConfig,
+    WorkerWakeDelivery,
+    WorkerWakeUnavailableError,
+    tenant_pool_in_worker_wake_canary,
+)
+from forge_replay.production.worker_wake_relay import (
+    COMMAND_WAKEUP_DESTINATION,
+    CommandWakeRelay,
+    CommandWakeRelayConfig,
+    CommandWakeRelayResult,
+    command_wakeup_destination,
+)
 from forge_replay.production.workspace_snapshot import (
     WorkspaceSnapshot,
     WorkspaceSnapshotManager,
 )
 
 __all__ = [
+    "COMMAND_WAKEUP_DESTINATION",
     "PROMPT_WORKING_SET_CONTRACT_VERSION",
     "PROMPT_WORKING_SET_MAX_BYTES",
     "PROMPT_WORKING_SET_TTL_SECONDS",
     "REDIS_HIERARCHICAL_TOKEN_BUCKET_LUA",
     "RUN_PROJECTION_DESTINATION",
+    "WORKER_WAKE_GROUP",
     "ActiveRunFallbackReason",
     "ActiveRunIndexEntry",
     "ActiveRunIndexPage",
@@ -171,6 +196,10 @@ __all__ = [
     "AuditHashChain",
     "AuthoritativePromptWorkingSetSource",
     "BudgetLedger",
+    "CommandWakeHint",
+    "CommandWakeRelay",
+    "CommandWakeRelayConfig",
+    "CommandWakeRelayResult",
     "ExecReceipt",
     "ExecRequest",
     "GaReadinessGate",
@@ -181,6 +210,7 @@ __all__ = [
     "ManagedRunExecutor",
     "ManagedWorker",
     "ManagedWorkerConfig",
+    "ManagedWorkerLoop",
     "ModelGateway",
     "MultiWorkerTakeoverCoordinator",
     "OciGvisorExecutionProvider",
@@ -222,6 +252,8 @@ __all__ = [
     "RedisRunEventHintPublisher",
     "RedisShadowProjectionReader",
     "RedisShadowProjectionSink",
+    "RedisWorkerWakeConsumer",
+    "RedisWorkerWakePublisher",
     "RegionalFailoverController",
     "ReleaseGate",
     "RetryableManagedRunError",
@@ -256,6 +288,10 @@ __all__ = [
     "TenantRoutedActiveRunReader",
     "TenantRoutedUiStatusReader",
     "UnsafeHostExecutionProvider",
+    "WorkerWakeAdmissionEvidence",
+    "WorkerWakeConfig",
+    "WorkerWakeDelivery",
+    "WorkerWakeUnavailableError",
     "WorkspaceAgentExecutor",
     "WorkspaceControllerFactory",
     "WorkspaceSnapshot",
@@ -263,8 +299,12 @@ __all__ = [
     "active_run_cursor",
     "build_managed_control_plane",
     "build_managed_prompt_working_set_reader",
+    "command_wakeup_destination",
     "decode_prompt_working_set",
     "encode_prompt_working_set",
     "fanout_channel",
     "prompt_working_set_cache_key",
+    "tenant_pool_in_worker_wake_canary",
+    "worker_wake_consumer_name",
+    "worker_wake_stream_key",
 ]

@@ -80,15 +80,25 @@ class PostgresControlPlaneStore:
     def create_run(
         self, *, tenant_id: str, run_id: str, idempotency_key: str,
         request: dict[str, Any], command_id: str, event_id: str,
+        worker_pool: str = "default",
     ) -> CreatedRun:
+        self._validate_worker_pool(worker_pool)
         request_json = _canonical_json(request)
         semantic_request = {
             key: value
             for key, value in request.items()
             if key != "correlation_request_id"
         }
+        # Preserve the historical default-pool digest while making a non-default
+        # routing decision part of idempotency semantics.
+        semantic_hash_input: dict[str, Any] = semantic_request
+        if worker_pool != "default":
+            semantic_hash_input = {
+                "request": semantic_request,
+                "worker_pool": worker_pool,
+            }
         request_sha = hashlib.sha256(
-            _canonical_json(semantic_request).encode()
+            _canonical_json(semantic_hash_input).encode()
         ).hexdigest()
         task = _required_request_text(request, "task")
         repository = _required_request_text(request, "repository")
@@ -253,16 +263,39 @@ class PostgresControlPlaneStore:
                 ),
             )
             connection.execute(
-                "INSERT INTO run_commands(tenant_id, command_id, run_id, command_type, "
+                "INSERT INTO run_commands(tenant_id, worker_pool, command_id, run_id, command_type, "
                 "idempotency_key, expected_stream_version, payload_json, available_at) "
-                "VALUES (%s, %s, %s, 'start', %s, %s, %s::jsonb, clock_timestamp())",
+                "VALUES (%s, %s, %s, %s, 'start', %s, %s, %s::jsonb, clock_timestamp())",
                 (
                     tenant_id,
+                    worker_pool,
                     command_id,
                     run_id,
                     idempotency_key,
                     stream_version,
                     _canonical_json(command_payload),
+                ),
+            )
+            wakeup_outbox_id = f"command-wakeup-v1:{command_id}"
+            wakeup_destination = f"command-wakeup-v1:{worker_pool}"
+            wakeup_payload = {
+                "schema_version": 1,
+                "outbox_id": wakeup_outbox_id,
+                "command_id": command_id,
+                "worker_pool": worker_pool,
+            }
+            connection.execute(
+                "INSERT INTO run_outbox(tenant_id, outbox_id, run_id, destination, "
+                "dedupe_key, stream_version, payload_json) VALUES "
+                "(%s, %s, %s, %s, %s, %s, %s::jsonb)",
+                (
+                    tenant_id,
+                    wakeup_outbox_id,
+                    run_id,
+                    wakeup_destination,
+                    wakeup_outbox_id,
+                    stream_version,
+                    _canonical_json(wakeup_payload),
                 ),
             )
             connection.execute(
@@ -324,16 +357,18 @@ class PostgresControlPlaneStore:
 
     def claim_commands(
         self, *, tenant_id: str, worker_id: str, limit: int,
+        worker_pool: str = "default",
         visibility_timeout_seconds: int = 30,
     ) -> tuple[dict[str, Any], ...]:
         if limit < 1 or limit > 100:
             raise ValueError("claim limit must be between 1 and 100")
+        self._validate_worker_pool(worker_pool)
         self._validate_visibility_timeout(visibility_timeout_seconds)
         with self.connect() as connection:
             self._tenant(connection, tenant_id)
             rows = connection.execute(
                 "WITH ready AS (SELECT tenant_id, command_id FROM run_commands "
-                "WHERE tenant_id = %s AND (status = 'queued' OR "
+                "WHERE tenant_id = %s AND worker_pool = %s AND (status = 'queued' OR "
                 "(status = 'claimed' AND (claim_expires_at IS NULL "
                 "OR claim_expires_at <= clock_timestamp()))) "
                 "AND available_at <= clock_timestamp() ORDER BY available_at "
@@ -344,10 +379,10 @@ class PostgresControlPlaneStore:
                 "jsonb_build_object('reason', 'visibility_timeout') ELSE c.last_error_json END, "
                 "attempt_count = attempt_count + 1, updated_at = clock_timestamp() "
                 "FROM ready r WHERE c.tenant_id = r.tenant_id AND c.command_id = r.command_id "
-                "RETURNING c.tenant_id, c.command_id, c.run_id, c.command_type, "
+                "RETURNING c.tenant_id, c.worker_pool, c.command_id, c.run_id, c.command_type, "
                 "c.idempotency_key, c.expected_stream_version, c.payload_json, c.available_at, "
                 "c.claimed_by, c.claimed_at, c.claim_expires_at, c.attempt_count",
-                (tenant_id, limit, worker_id, visibility_timeout_seconds),
+                (tenant_id, worker_pool, limit, worker_id, visibility_timeout_seconds),
             ).fetchall()
             return tuple(dict(row) for row in rows)
 
@@ -440,6 +475,9 @@ class PostgresControlPlaneStore:
         with self.connect() as connection:
             self._tenant(connection, tenant_id)
             if retryable:
+                # Delayed retries deliberately do not emit an immediate Redis wake-up.
+                # PostgreSQL polling remains the authoritative bounded fallback and
+                # observes the command only after ``available_at`` becomes eligible.
                 row = connection.execute(
                     "UPDATE run_commands SET status = 'queued', available_at = "
                     "clock_timestamp() + make_interval(secs => %s), claimed_by = NULL, "
@@ -728,6 +766,15 @@ class PostgresControlPlaneStore:
     def _validate_worker_id(worker_id: str) -> None:
         if not worker_id or len(worker_id) > 128:
             raise ValueError("worker_id is invalid")
+
+    @staticmethod
+    def _validate_worker_pool(worker_pool: str) -> None:
+        if (
+            not isinstance(worker_pool, str)
+            or not worker_pool.strip()
+            or len(worker_pool) > 64
+        ):
+            raise ValueError("worker_pool is invalid")
 
 
 def _canonical_json(value: Any) -> str:
