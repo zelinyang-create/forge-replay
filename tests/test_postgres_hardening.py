@@ -325,6 +325,52 @@ def test_command_acknowledgement_requires_a_live_owned_claim_and_sets_timestamps
     assert params == ("tenant-a", "command-1", "worker-1")
 
 
+def test_command_batch_ack_returns_only_live_owner_fenced_successes():
+    connect = ScriptedConnect(
+        [{"command_id": "command-2"}, {"command_id": "command-1"}]
+    )
+
+    acknowledged = make_store(connect).acknowledge_commands_batch(
+        tenant_id="tenant-a",
+        command_ids=("command-1", "command-2", "command-stale"),
+        worker_id="worker-1",
+    )
+
+    assert acknowledged == ("command-1", "command-2")
+    sql, params = connect.statement_containing("command_id = any")
+    assert "command_id = any(%s::text[])" in sql
+    assert "status = 'claimed'" in sql
+    assert "claimed_by = %s" in sql
+    assert "claim_expires_at > clock_timestamp()" in sql
+    assert params == (
+        "tenant-a",
+        ["command-1", "command-2", "command-stale"],
+        "worker-1",
+    )
+
+
+@pytest.mark.parametrize(
+    ("command_ids", "error"),
+    [
+        ("command-1", TypeError),
+        (("",), ValueError),
+        (("command-1", "command-1"), ValueError),
+        (tuple(f"command-{index}" for index in range(101)), ValueError),
+    ],
+)
+def test_command_batch_ack_rejects_ambiguous_success_sets(
+    command_ids: object, error: type[Exception]
+):
+    connect = ScriptedConnect()
+    with pytest.raises(error):
+        make_store(connect).acknowledge_commands_batch(
+            tenant_id="tenant-a",
+            command_ids=command_ids,  # type: ignore[arg-type]
+            worker_id="worker-1",
+        )
+    assert connect.statements == []
+
+
 def test_outbox_claim_is_durable_and_publish_ack_is_owner_scoped():
     outbox = {"outbox_id": "outbox-1", "claimed_by": "relay-1"}
     connect = ScriptedConnect([outbox], [{"outbox_id": "outbox-1"}])
@@ -365,6 +411,51 @@ def test_outbox_reclaim_clears_abandoned_claim_for_redelivery():
     assert "claim_expires_at <= clock_timestamp()" in sql
     assert "claimed_at = null" in sql
     assert "visibility_timeout" in sql
+
+
+def test_outbox_batch_publish_ack_is_one_owner_fenced_statement():
+    connect = ScriptedConnect(
+        [{"outbox_id": "outbox-2"}, {"outbox_id": "outbox-1"}]
+    )
+
+    acknowledged = make_store(connect).mark_outbox_published_batch(
+        tenant_id="tenant-a",
+        outbox_ids=("outbox-1", "outbox-2", "outbox-lost"),
+        publisher_id="relay-1",
+    )
+
+    assert acknowledged == ("outbox-1", "outbox-2")
+    sql, params = connect.statement_containing("outbox_id = any")
+    assert "outbox_id = any(%s::text[])" in sql
+    assert "published_at is null" in sql
+    assert "claimed_by = %s" in sql
+    assert params == (
+        "tenant-a",
+        ["outbox-1", "outbox-2", "outbox-lost"],
+        "relay-1",
+    )
+
+
+@pytest.mark.parametrize(
+    ("outbox_ids", "error"),
+    [
+        ("outbox-1", TypeError),
+        (("",), ValueError),
+        (("outbox-1", "outbox-1"), ValueError),
+        (tuple(f"outbox-{index}" for index in range(101)), ValueError),
+    ],
+)
+def test_outbox_batch_publish_rejects_ambiguous_batches(
+    outbox_ids: object, error: type[Exception]
+):
+    connect = ScriptedConnect()
+    with pytest.raises(error):
+        make_store(connect).mark_outbox_published_batch(
+            tenant_id="tenant-a",
+            outbox_ids=outbox_ids,  # type: ignore[arg-type]
+            publisher_id="relay-1",
+        )
+    assert connect.statements == []
 
 
 def test_acquire_by_live_owner_preserves_epoch_and_renew_never_changes_it():

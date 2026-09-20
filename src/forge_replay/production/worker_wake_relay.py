@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 from forge_replay.production.worker_wake import (
     CommandWakeHint,
@@ -45,9 +45,23 @@ class CommandWakeOutboxStore(Protocol):
         publisher_id: str,
     ) -> bool: ...
 
+    def mark_outbox_published_batch(
+        self,
+        *,
+        tenant_id: str,
+        outbox_ids: Sequence[str],
+        publisher_id: str,
+    ) -> Sequence[str]: ...
+
 
 class CommandWakePublisher(Protocol):
     def publish(self, hint: CommandWakeHint) -> str: ...
+
+
+class CommandWakeBatchPublisher(Protocol):
+    def publish_many(
+        self, hints: Sequence[CommandWakeHint]
+    ) -> Sequence[str | WorkerWakeUnavailableError]: ...
 
 
 @dataclass(frozen=True)
@@ -57,6 +71,7 @@ class CommandWakeRelayConfig:
     publisher_id: str
     enabled: bool = False
     limit: int = 100
+    publish_batch_size: int = 25
     visibility_timeout_seconds: int = 30
 
     def __post_init__(self) -> None:
@@ -67,6 +82,11 @@ class CommandWakeRelayConfig:
             raise TypeError("enabled must be a bool")
         if isinstance(self.limit, bool) or not 1 <= self.limit <= 100:
             raise ValueError("limit must be between 1 and 100")
+        if (
+            isinstance(self.publish_batch_size, bool)
+            or not 1 <= self.publish_batch_size <= 100
+        ):
+            raise ValueError("publish_batch_size must be between 1 and 100")
         if (
             isinstance(self.visibility_timeout_seconds, bool)
             or not 5 <= self.visibility_timeout_seconds <= 3_600
@@ -108,30 +128,35 @@ class CommandWakeRelay:
             limit=self.config.limit,
             visibility_timeout_seconds=self.config.visibility_timeout_seconds,
         )
-        published = marked = malformed = publish_errors = mark_lost = 0
+        malformed = 0
+        valid: list[tuple[str, CommandWakeHint]] = []
         for row in rows:
             try:
                 outbox_id, hint = self._decode(row)
             except (TypeError, ValueError, json.JSONDecodeError):
                 malformed += 1
                 continue
-            try:
-                self.publisher.publish(hint)
-            except WorkerWakeUnavailableError:
-                publish_errors += 1
-                continue
-            published += 1
-            if self.outbox.mark_outbox_published(
+            valid.append((outbox_id, hint))
+
+        published_outbox_ids, publish_errors = self._publish(valid)
+        published = len(published_outbox_ids)
+
+        acknowledged = set(
+            self.outbox.mark_outbox_published_batch(
                 tenant_id=self.config.tenant_id,
-                outbox_id=outbox_id,
+                outbox_ids=published_outbox_ids,
                 publisher_id=self.config.publisher_id,
-            ):
-                marked += 1
-            else:
-                # XADD may already have succeeded.  Losing SQL ownership merely
-                # causes a duplicate hint on retry; PostgreSQL claim CAS removes
-                # any duplicate logical effect.
-                mark_lost += 1
+            )
+            if published_outbox_ids
+            else ()
+        )
+        marked = len(acknowledged)
+        # XADD may already have succeeded.  Losing SQL ownership merely causes
+        # a duplicate hint on retry; PostgreSQL claim CAS removes any duplicate
+        # logical effect.
+        mark_lost = sum(
+            outbox_id not in acknowledged for outbox_id in published_outbox_ids
+        )
         return CommandWakeRelayResult(
             claimed=len(rows),
             published=published,
@@ -140,6 +165,49 @@ class CommandWakeRelay:
             publish_errors=publish_errors,
             mark_lost=mark_lost,
         )
+
+    def _publish(
+        self, values: Sequence[tuple[str, CommandWakeHint]]
+    ) -> tuple[list[str], int]:
+        if not values:
+            return [], 0
+        publish_many = getattr(self.publisher, "publish_many", None)
+        if callable(publish_many):
+            batch_publisher = cast(CommandWakeBatchPublisher, self.publisher)
+            published: list[str] = []
+            errors = 0
+            for offset in range(0, len(values), self.config.publish_batch_size):
+                current = values[offset : offset + self.config.publish_batch_size]
+                outcomes = tuple(
+                    batch_publisher.publish_many([hint for _, hint in current])
+                )
+                if len(outcomes) != len(current):
+                    raise RuntimeError(
+                        "batch wake publisher must return one outcome per hint"
+                    )
+                for (outbox_id, _), outcome in zip(
+                    current, outcomes, strict=True
+                ):
+                    if isinstance(outcome, WorkerWakeUnavailableError):
+                        errors += 1
+                    elif isinstance(outcome, str) and outcome:
+                        published.append(outbox_id)
+                    else:
+                        raise RuntimeError(
+                            "batch wake publisher returned an invalid outcome"
+                        )
+            return published, errors
+
+        published = []
+        errors = 0
+        for outbox_id, hint in values:
+            try:
+                self.publisher.publish(hint)
+            except WorkerWakeUnavailableError:
+                errors += 1
+                continue
+            published.append(outbox_id)
+        return published, errors
 
     def _decode(self, row: Mapping[str, object]) -> tuple[str, CommandWakeHint]:
         if row.get("tenant_id") != self.config.tenant_id:
@@ -185,6 +253,7 @@ def _text(value: object, field: str) -> str:
 
 __all__ = [
     "COMMAND_WAKEUP_DESTINATION",
+    "CommandWakeBatchPublisher",
     "CommandWakeOutboxStore",
     "CommandWakePublisher",
     "CommandWakeRelay",

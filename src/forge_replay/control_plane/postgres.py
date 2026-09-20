@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -453,6 +453,42 @@ class PostgresControlPlaneStore:
             ).fetchone()
             return row is not None
 
+    def acknowledge_commands_batch(
+        self,
+        *,
+        tenant_id: str,
+        command_ids: Sequence[str],
+        worker_id: str,
+    ) -> tuple[str, ...]:
+        """Acknowledge only explicitly successful commands still owned by this worker."""
+
+        if isinstance(command_ids, (str, bytes)):
+            raise TypeError("command_ids must be a sequence of strings")
+        normalized = tuple(command_ids)
+        if not normalized:
+            return ()
+        if len(normalized) > 100:
+            raise ValueError("command_ids cannot contain more than 100 items")
+        if any(not isinstance(value, str) or not value.strip() for value in normalized):
+            raise ValueError("command_ids must contain non-empty strings")
+        if len(set(normalized)) != len(normalized):
+            raise ValueError("command_ids must not contain duplicates")
+        self._validate_worker_id(worker_id)
+
+        with self.connect() as connection:
+            self._tenant(connection, tenant_id)
+            rows = connection.execute(
+                "UPDATE run_commands SET status = 'done', claimed_by = NULL, "
+                "claimed_at = NULL, claim_expires_at = NULL, "
+                "completed_at = clock_timestamp(), updated_at = clock_timestamp() "
+                "WHERE tenant_id = %s AND command_id = ANY(%s::text[]) "
+                "AND status = 'claimed' AND claimed_by = %s "
+                "AND claim_expires_at > clock_timestamp() RETURNING command_id",
+                (tenant_id, list(normalized), worker_id),
+            ).fetchall()
+        acknowledged = {str(row["command_id"]) for row in rows}
+        return tuple(value for value in normalized if value in acknowledged)
+
     def fail_command(
         self,
         *,
@@ -614,6 +650,70 @@ class PostgresControlPlaneStore:
                 (tenant_id, outbox_id, publisher_id, publisher_id),
             ).fetchone()
             return row is not None
+
+    def mark_outbox_published_batch(
+        self,
+        *,
+        tenant_id: str,
+        outbox_ids: Sequence[str],
+        publisher_id: str,
+    ) -> tuple[str, ...]:
+        """Owner-fenced acknowledgement for one relay claim batch.
+
+        Each hint remains an independent logical Redis XADD with its own result.
+        The durable acknowledgements share one short SQL transaction so a relay
+        batch does not pay one PostgreSQL connection round trip per hint.
+        Rows whose claim ownership changed are deliberately omitted and remain
+        eligible for at-least-once redelivery.
+        """
+
+        normalized = self._validate_outbox_ack_batch(outbox_ids, publisher_id)
+        if not normalized:
+            return ()
+
+        with self.connect() as connection:
+            return self._mark_outbox_published_batch_on_connection(
+                connection,
+                tenant_id=tenant_id,
+                outbox_ids=normalized,
+                publisher_id=publisher_id,
+            )
+
+    def _mark_outbox_published_batch_on_connection(
+        self,
+        connection: Any,
+        *,
+        tenant_id: str,
+        outbox_ids: Sequence[str],
+        publisher_id: str,
+    ) -> tuple[str, ...]:
+        self._tenant(connection, tenant_id)
+        rows = connection.execute(
+            "UPDATE run_outbox SET published_at = clock_timestamp(), claimed_by = NULL, "
+            "claimed_at = NULL, claim_expires_at = NULL "
+            "WHERE tenant_id = %s AND outbox_id = ANY(%s::text[]) "
+            "AND published_at IS NULL AND claimed_by = %s RETURNING outbox_id",
+            (tenant_id, list(outbox_ids), publisher_id),
+        ).fetchall()
+        acknowledged = {str(row["outbox_id"]) for row in rows}
+        return tuple(value for value in outbox_ids if value in acknowledged)
+
+    @staticmethod
+    def _validate_outbox_ack_batch(
+        outbox_ids: Sequence[str], publisher_id: str
+    ) -> tuple[str, ...]:
+        if isinstance(outbox_ids, (str, bytes)):
+            raise TypeError("outbox_ids must be a sequence of strings")
+        normalized = tuple(outbox_ids)
+        if len(normalized) > 100:
+            raise ValueError("outbox_ids cannot contain more than 100 items")
+        if any(not isinstance(value, str) or not value.strip() for value in normalized):
+            raise ValueError("outbox_ids must contain non-empty strings")
+        if len(set(normalized)) != len(normalized):
+            raise ValueError("outbox_ids must not contain duplicates")
+        if not isinstance(publisher_id, str) or not publisher_id.strip():
+            raise ValueError("publisher_id must be a non-empty string")
+        return normalized
 
     def register_artifact(
         self, *, tenant_id: str, run_id: str, sha256: str, size_bytes: int,

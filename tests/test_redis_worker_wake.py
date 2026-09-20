@@ -31,7 +31,11 @@ class FakeRedis:
         self.read_responses: deque[object] = deque([[]])
         self.ack_response: object = 1
         self.errors: dict[str, RedisError] = {}
-        self.xadd_calls: list[tuple[object, ...]] = []
+        self.xadd_calls: list[
+            tuple[str, dict[str, str], str, int | None, bool]
+        ] = []
+        self.pipeline_calls: list[bool] = []
+        self.pipeline_results: list[object] = []
         self.group_calls: list[tuple[object, ...]] = []
         self.autoclaim_calls: list[tuple[object, ...]] = []
         self.read_calls: list[tuple[object, ...]] = []
@@ -53,6 +57,10 @@ class FakeRedis:
         self.xadd_calls.append((name, dict(fields), id, maxlen, approximate))
         self._raise("xadd")
         return self.xadd_response
+
+    def pipeline(self, *, transaction: bool = True) -> FakePipeline:
+        self.pipeline_calls.append(transaction)
+        return FakePipeline(self)
 
     def xgroup_create(
         self,
@@ -122,6 +130,30 @@ class FakeRedis:
         self.close_calls += 1
         self._raise("close")
         return None
+
+
+class FakePipeline:
+    def __init__(self, client: FakeRedis) -> None:
+        self.client = client
+        self.queued = 0
+
+    def xadd(
+        self,
+        name: str,
+        fields: Mapping[str, str],
+        id: str = "*",
+        maxlen: int | None = None,
+        approximate: bool = True,
+    ) -> FakePipeline:
+        self.client.xadd_calls.append((name, dict(fields), id, maxlen, approximate))
+        self.queued += 1
+        return self
+
+    def execute(self, *, raise_on_error: bool = True) -> list[object]:
+        self.client._raise("pipeline_execute")
+        if self.client.pipeline_results:
+            return list(self.client.pipeline_results)
+        return [f"1726761600000-{index}".encode() for index in range(self.queued)]
 
 
 def hint() -> CommandWakeHint:
@@ -218,6 +250,62 @@ def test_publisher_xadds_only_the_minimal_schema_with_approximate_maxlen():
         "available_at",
     }.intersection(fields)
     assert (entry_id, maxlen, approximate) == ("*", 4321, True)
+
+
+def test_publisher_pipelines_many_independent_xadds_with_aligned_results():
+    client = FakeRedis()
+    second = CommandWakeHint(
+        schema_version=1,
+        outbox_id="command-wakeup-v1:cmd-456:0",
+        command_id="8ada4043-788b-4a45-b1a5-0f3dd11acde0",
+    )
+
+    outcomes = publisher(client).publish_many((hint(), second))
+
+    assert outcomes == ("1726761600000-0", "1726761600000-1")
+    assert client.pipeline_calls == [False]
+    assert [call[1]["outbox_id"] for call in client.xadd_calls] == [
+        hint().outbox_id,
+        second.outbox_id,
+    ]
+    assert all(call[2:] == ("*", 4321, True) for call in client.xadd_calls)
+
+
+def test_publisher_batch_keeps_per_item_failure_without_false_success():
+    client = FakeRedis()
+    client.pipeline_results = [b"1726761600000-0", ResponseError("OOM")]
+
+    outcomes = publisher(client).publish_many((hint(), hint()))
+
+    assert outcomes[0] == "1726761600000-0"
+    assert isinstance(outcomes[1], WorkerWakeUnavailableError)
+
+
+def test_publisher_batch_connection_failure_marks_every_item_failed():
+    client = FakeRedis()
+    client.errors["pipeline_execute"] = RedisError("connection lost")
+
+    outcomes = publisher(client).publish_many((hint(), hint()))
+
+    assert len(outcomes) == 2
+    assert all(isinstance(value, WorkerWakeUnavailableError) for value in outcomes)
+
+
+def test_publisher_batch_incomplete_response_marks_every_item_failed():
+    client = FakeRedis()
+    client.pipeline_results = [b"1726761600000-0"]
+
+    outcomes = publisher(client).publish_many((hint(), hint()))
+
+    assert len(outcomes) == 2
+    assert all(isinstance(value, WorkerWakeUnavailableError) for value in outcomes)
+
+
+def test_publisher_empty_batch_does_not_open_pipeline():
+    client = FakeRedis()
+
+    assert publisher(client).publish_many(()) == ()
+    assert client.pipeline_calls == []
 
 
 @pytest.mark.parametrize("response", [None, True, "1-01", "not-an-id", 17])
@@ -420,6 +508,47 @@ def test_ack_is_exact_and_zero_is_a_safe_already_absent_result():
 
     client.ack_response = 0
     assert subject.ack("1726761600000-1") is False
+
+
+def test_ack_many_uses_one_bounded_redis_round_trip() -> None:
+    client = FakeRedis()
+    client.ack_response = 2
+    subject = consumer(client)
+
+    assert subject.ack_many(("1726761600000-1", "1726761600000-2")) == 2
+    assert client.ack_calls == [
+        (
+            subject.stream_key,
+            WORKER_WAKE_GROUP,
+            "1726761600000-1",
+            "1726761600000-2",
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    "message_ids",
+    [
+        "1726761600000-1",
+        ("",),
+        ("1726761600000-1", "1726761600000-1"),
+        tuple(f"1726761600000-{index}" for index in range(101)),
+    ],
+)
+def test_ack_many_rejects_ambiguous_or_unbounded_batches(message_ids: object) -> None:
+    client = FakeRedis()
+
+    with pytest.raises((TypeError, ValueError)):
+        consumer(client).ack_many(message_ids)  # type: ignore[arg-type]
+    assert client.ack_calls == []
+
+
+def test_ack_many_rejects_impossible_redis_count() -> None:
+    client = FakeRedis()
+    client.ack_response = 3
+
+    with pytest.raises(WorkerWakeUnavailableError, match="invalid count"):
+        consumer(client).ack_many(("1726761600000-1", "1726761600000-2"))
 
 
 @pytest.mark.parametrize("block_ms", [0, -1, 60_001, True, 1.5])

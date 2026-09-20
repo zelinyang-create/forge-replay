@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import math
 import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -10,6 +12,7 @@ from forge_replay.eval.hot_layer_capacity import (
     LiveCapacityArtifact,
     LiveCapacityConfig,
     _p95,
+    _PublishedAt,
     main,
     run_live_capacity,
 )
@@ -18,6 +21,10 @@ from forge_replay.production.capacity_gate import (
     CapacityMeasurement,
     ServiceEvidenceKind,
     ServiceProvenance,
+)
+from forge_replay.production.worker_wake import (
+    CommandWakeHint,
+    WorkerWakeUnavailableError,
 )
 
 
@@ -103,6 +110,63 @@ def test_runner_revalidates_a_corrupted_frozen_config() -> None:
 def test_p95_uses_nearest_rank_and_empty_is_zero() -> None:
     assert _p95(()) == 0
     assert _p95(tuple(float(value) for value in range(1, 101))) == 95
+
+
+def test_wake_latency_starts_before_pipeline_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    current = CommandWakeHint(outbox_id="outbox-1", command_id="command-1")
+
+    class BlockingPublisher:
+        def publish_many(
+            self, hints: tuple[CommandWakeHint, ...]
+        ) -> tuple[str, ...]:
+            assert hints == (current,)
+            entered.set()
+            assert release.wait(timeout=2)
+            return ("1-0",)
+
+    monkeypatch.setattr(
+        "forge_replay.eval.hot_layer_capacity.time.perf_counter",
+        lambda: 10.0,
+    )
+    timed = _PublishedAt(BlockingPublisher())  # type: ignore[arg-type]
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(timed.publish_many, [current])
+        assert entered.wait(timeout=2)
+        assert not future.done()
+        # Redis delivered while the producer is still awaiting the pipeline
+        # response.  The sample retains time since the publish call began.
+        assert timed.latency_ms("outbox-1", observed_at=10.125) == 125
+        release.set()
+        assert future.result() == ("1-0",)
+
+
+def test_failed_batch_item_has_no_wake_timing_sample(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = CommandWakeHint(outbox_id="outbox-1", command_id="command-1")
+    second = CommandWakeHint(outbox_id="outbox-2", command_id="command-2")
+
+    class PartialPublisher:
+        def publish_many(
+            self, hints: tuple[CommandWakeHint, ...]
+        ) -> tuple[str | WorkerWakeUnavailableError, ...]:
+            assert hints == (first, second)
+            return ("1-0", WorkerWakeUnavailableError("XADD failed"))
+
+    monkeypatch.setattr(
+        "forge_replay.eval.hot_layer_capacity.time.perf_counter",
+        lambda: 20.0,
+    )
+    timed = _PublishedAt(PartialPublisher())  # type: ignore[arg-type]
+
+    timed.publish_many([first, second])
+
+    assert timed.latency_ms("outbox-1", observed_at=20.050) == pytest.approx(50)
+    assert timed.latency_ms("outbox-2", observed_at=20.050) is None
 
 
 def test_artifact_binds_report_and_canonical_raw_results() -> None:

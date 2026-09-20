@@ -27,6 +27,26 @@ versioned manifest 取得 tenant policy；旧配置中的浮点百分比不再�
 5. 真实 failover、网络黑洞、TLS/ACL、OS 进程强杀、PITR 等未实际执行时，对应字段必须保持
    未通过；跳过的测试不是成功证据。
 
+## Phase 4.3 控制面约束
+
+- `SHADOW → 1%` 只能调用 `CanaryLifecycleCoordinator.advance` 并传入完整
+  `Phase42AdmissionBundle`；禁止直接把裸 `SignedEvidenceEnvelope` 交给旧的单窗门禁。
+- 每次 serving 升级都要传入由 inventory key 签名的 `GenerationConvergence`。快照必须匹配
+  当前 manifest 摘要/generation、权威 inventory revision 和精确实例全集，并且不超过 5 分钟。
+  调用方读取的 `current_inventory_revision` 必须与 `expected_state_revision` 在同一事务/CAS 中确认；
+  任一 revision 变化都要重新读取状态、实例全集和证据。
+- 调用方必须检查 decision 的 `must_persist`：即使第一次软 SLO 窗口返回 `allowed=false`，也要
+  用 `expected_state_revision` 持久化窗口账本和证据摘要。CAS 失败时不得覆盖并发窗口或回滚。
+- serving 有效期来自已验证的 signed evidence。运行时统一使用 `LifecycleTenantPolicy`；状态
+  缺失、context 不符、`OFF`/`SHADOW`、有效期缺失或到期均拒绝 Redis read/consume/enforce。
+- 5% / 25% / 100% 升级以及运行中健康窗口都必须携带 coverage-complete、与 signed evidence
+  artifact digest 绑定的 `CanarySafetySnapshot`。安全探针缺失时回到 `SHADOW`；committed fact
+  loss 或既有 hard-safety 计数非零时立即回到 `OFF`。
+- 连续软违规由持久状态按相邻、不重叠且摘要相链的签名窗口计算，忽略报告中的自报 streak。
+  replay、乱序、重叠或缺口均立即回到 `SHADOW`，第二个连续违规窗口也回到 `SHADOW`。
+- 任意回滚或显式降级后至少冷却 30 分钟，并记录回滚时间与最后 admission 摘要；重新进入 1%
+  必须使用严格晚于回滚的新 Phase 4.2 package，禁止复用旧准入证据。
+
 ## 硬回滚
 
 以下任一计数大于 0，立即将相关 Redis 能力降为 `OFF`；若涉及跨租户、权威数据或系统性

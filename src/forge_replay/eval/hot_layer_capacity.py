@@ -46,7 +46,10 @@ from forge_replay.production.redis_worker_wake import (
     RedisWorkerWakePublisher,
     SyncRedisWorkerWakeClient,
 )
-from forge_replay.production.worker_wake import CommandWakeHint
+from forge_replay.production.worker_wake import (
+    CommandWakeHint,
+    WorkerWakeUnavailableError,
+)
 from forge_replay.production.worker_wake_relay import (
     CommandWakeRelay,
     CommandWakeRelayConfig,
@@ -208,12 +211,48 @@ class _PublishedAt:
                 self._values.pop(hint.outbox_id, None)
             raise
 
-    def latency_ms(self, outbox_id: str) -> float | None:
+    def publish_many(
+        self, hints: list[CommandWakeHint]
+    ) -> tuple[str | WorkerWakeUnavailableError, ...]:
+        """Preserve per-hint timing while allowing the production pipeline path."""
+
+        values = tuple(hints)
+        started = time.perf_counter()
+        with self._lock:
+            for hint in values:
+                self._values[hint.outbox_id] = started
+        try:
+            outcomes = tuple(self._publisher.publish_many(values))
+        except BaseException:
+            with self._lock:
+                for hint in values:
+                    self._values.pop(hint.outbox_id, None)
+            raise
+        if len(outcomes) != len(values):
+            with self._lock:
+                for hint in values:
+                    self._values.pop(hint.outbox_id, None)
+            raise RuntimeError("batch publisher returned an incomplete timing result")
+        with self._lock:
+            for hint, outcome in zip(values, outcomes, strict=True):
+                if isinstance(outcome, WorkerWakeUnavailableError):
+                    self._values.pop(hint.outbox_id, None)
+        return outcomes
+
+    def latency_ms(
+        self, outbox_id: str, *, observed_at: float | None = None
+    ) -> float | None:
         with self._lock:
             published = self._values.get(outbox_id)
         if published is None:
             return None
-        return (time.perf_counter() - published) * 1_000
+        received = time.perf_counter() if observed_at is None else observed_at
+        latency_ms = (received - published) * 1_000
+        if latency_ms < 0:
+            raise LiveCapacityEnvironmentError(
+                "worker wake observation predates its publish call"
+            )
+        return latency_ms
 
 
 class _CompletionCounter:
@@ -318,12 +357,23 @@ def run_live_capacity(
             publisher=timed_publisher,
             config=config,
         )
+        if (
+            len(steady.claim_samples_ms) != config.queued_commands
+            or len(steady.wake_samples_ms) != config.queued_commands
+        ):
+            raise LiveCapacityEnvironmentError(
+                "steady capacity run did not collect one claim and wake sample per command"
+            )
         fallback = _run_fallback_scenario(
             store,
             tenant_id=tenant_id,
             worker_pool=fallback_pool,
             config=config,
         )
+        if len(fallback.claim_samples_ms) != config.queued_commands:
+            raise LiveCapacityEnvironmentError(
+                "fallback capacity run did not collect one claim sample per command"
+            )
         outbox_lags = _outbox_lag_samples(
             scoped_dsn,
             tenant_id=tenant_id,
@@ -583,6 +633,7 @@ def _run_steady_scenario(
     config: LiveCapacityConfig,
 ) -> _ScenarioResult:
     completed = _CompletionCounter()
+    workers_ready = threading.Barrier(config.active_workers + 1)
     deadline = time.monotonic() + config.maximum_runtime_seconds
     started = time.perf_counter()
 
@@ -604,38 +655,75 @@ def _run_steady_scenario(
         claim_samples: list[float] = []
         wake_samples: list[float] = []
         try:
+            # The workload promises ``active_workers`` rather than cold worker
+            # process startup.  Establish the Redis connection/group and finish
+            # the first pending scan before the relay begins publishing.
+            if consumer.read(block_ms=1, count=100):
+                raise LiveCapacityEnvironmentError(
+                    "isolated worker wake stream was not empty before the workload"
+                )
+            try:
+                workers_ready.wait(timeout=30)
+            except threading.BrokenBarrierError as exc:
+                raise LiveCapacityEnvironmentError(
+                    "active workers did not become ready before the workload"
+                ) from exc
             while (
                 completed.value < config.queued_commands and time.monotonic() < deadline
             ):
-                deliveries = consumer.read(block_ms=config.redis_block_ms, count=10)
+                deliveries = consumer.read(block_ms=config.redis_block_ms, count=100)
                 if not deliveries:
                     continue
+                # Wake latency ends when Redis delivers the batch.  SQL claim and
+                # command execution are measured separately below; charging their
+                # queue time to later items in the same XREADGROUP batch would mix
+                # two independent SLOs.
+                received_at = time.perf_counter()
+                ready: list[tuple[Any, float | None]] = []
                 for delivery in deliveries:
                     if delivery.hint is None:
                         consumer.ack(delivery.message_id)
                         continue
-                    wake_ms = publisher.latency_ms(delivery.hint.outbox_id)
-                    claim_started = time.perf_counter()
-                    commands = store.claim_commands(
-                        tenant_id=tenant_id,
-                        worker_id=f"capacity-steady-{index}",
-                        worker_pool=worker_pool,
-                        limit=1,
+                    wake_ms = publisher.latency_ms(
+                        delivery.hint.outbox_id,
+                        observed_at=received_at,
                     )
-                    claim_ms = (time.perf_counter() - claim_started) * 1_000
-                    if commands:
-                        command = commands[0]
-                        _record_effect(store.dsn, command_id=str(command["command_id"]))
-                        if store.acknowledge_command(
-                            tenant_id=tenant_id,
-                            command_id=str(command["command_id"]),
-                            worker_id=f"capacity-steady-{index}",
-                        ):
-                            claim_samples.append(claim_ms)
-                            if wake_ms is not None:
-                                wake_samples.append(wake_ms)
-                            completed.increment()
-                    consumer.ack(delivery.message_id)
+                    ready.append((delivery, wake_ms))
+                if not ready:
+                    continue
+
+                worker_id = f"capacity-steady-{index}"
+                claim_started = time.perf_counter()
+                commands = store.claim_commands(
+                    tenant_id=tenant_id,
+                    worker_id=worker_id,
+                    worker_pool=worker_pool,
+                    limit=len(ready),
+                )
+                claim_ms = (time.perf_counter() - claim_started) * 1_000
+                successful_ids = tuple(
+                    str(command["command_id"]) for command in commands
+                )
+                _record_effects(store.dsn, command_ids=successful_ids)
+                acknowledged = set(
+                    store.acknowledge_commands_batch(
+                        tenant_id=tenant_id,
+                        command_ids=successful_ids,
+                        worker_id=worker_id,
+                    )
+                    if successful_ids
+                    else ()
+                )
+                for command, (_, wake_ms) in zip(commands, ready, strict=False):
+                    if str(command["command_id"]) not in acknowledged:
+                        continue
+                    claim_samples.append(claim_ms)
+                    if wake_ms is not None:
+                        wake_samples.append(wake_ms)
+                    completed.increment()
+                consumer.ack_many(
+                    tuple(delivery.message_id for delivery, _ in ready)
+                )
             return claim_samples, wake_samples
         finally:
             consumer.close()
@@ -644,6 +732,12 @@ def _run_steady_scenario(
         futures = [
             executor.submit(worker, index) for index in range(config.active_workers)
         ]
+        try:
+            workers_ready.wait(timeout=30)
+        except threading.BrokenBarrierError as exc:
+            raise LiveCapacityEnvironmentError(
+                "active workers did not become ready before the workload"
+            ) from exc
         relay = CommandWakeRelay(
             store,
             publisher,
@@ -729,12 +823,19 @@ def _run_fallback_scenario(
 
 
 def _record_effect(dsn: str, *, command_id: str) -> None:
+    _record_effects(dsn, command_ids=(command_id,))
+
+
+def _record_effects(dsn: str, *, command_ids: tuple[str, ...]) -> None:
+    if not command_ids:
+        return
     with psycopg.connect(dsn) as connection:
         connection.execute(
-            "INSERT INTO capacity_effects(command_id, physical_count) VALUES (%s, 1) "
+            "INSERT INTO capacity_effects(command_id, physical_count) "
+            "SELECT command_id, 1 FROM unnest(%s::text[]) AS batch(command_id) "
             "ON CONFLICT (command_id) DO UPDATE SET "
             "physical_count = capacity_effects.physical_count + 1",
-            (command_id,),
+            (list(command_ids),),
         )
 
 

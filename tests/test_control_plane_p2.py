@@ -202,11 +202,11 @@ def test_postgres_migration_and_idempotent_create_integration():
     assert len(commands) == 1
     assert commands[0]["expected_stream_version"] == 2
     assert commands[0]["payload_json"]["run_id"] == run_id
-    assert recovered.acknowledge_command(
+    assert recovered.acknowledge_commands_batch(
         tenant_id=tenant_id,
-        command_id=commands[0]["command_id"],
+        command_ids=(commands[0]["command_id"], f"stale-command-{suffix}"),
         worker_id=f"worker-{suffix}",
-    )
+    ) == (commands[0]["command_id"],)
     assert len(outbox) == 3
     projection_outbox = [
         item for item in outbox if item["destination"] == "run-projection-v1"

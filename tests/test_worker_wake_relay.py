@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
 from forge_replay.production.worker_wake import (
     CommandWakeHint,
     WorkerWakeUnavailableError,
@@ -19,6 +21,7 @@ class FakeOutbox:
         self.rows = rows
         self.claim_kwargs: dict[str, Any] | None = None
         self.marked: list[tuple[str, str, str]] = []
+        self.batch_marks: list[tuple[str, tuple[str, ...], str]] = []
         self.mark_result = True
 
     def claim_outbox(self, **kwargs: Any) -> tuple[dict[str, Any], ...]:
@@ -31,6 +34,13 @@ class FakeOutbox:
         )
         return self.mark_result
 
+    def mark_outbox_published_batch(self, **kwargs: Any) -> tuple[str, ...]:
+        outbox_ids = tuple(kwargs["outbox_ids"])
+        self.batch_marks.append(
+            (kwargs["tenant_id"], outbox_ids, kwargs["publisher_id"])
+        )
+        return outbox_ids if self.mark_result else ()
+
 
 class FakePublisher:
     def __init__(self, *, fails: bool = False) -> None:
@@ -42,6 +52,22 @@ class FakePublisher:
         if self.fails:
             raise WorkerWakeUnavailableError("redis unavailable")
         return "1-0"
+
+
+class FakeBatchPublisher(FakePublisher):
+    def __init__(self, outcomes: tuple[str | WorkerWakeUnavailableError, ...]) -> None:
+        super().__init__()
+        self.outcomes = outcomes
+        self.batch_hints: list[CommandWakeHint] = []
+
+    def publish(self, hint: CommandWakeHint) -> str:
+        raise AssertionError("relay should prefer publish_many")
+
+    def publish_many(
+        self, hints: list[CommandWakeHint]
+    ) -> tuple[str | WorkerWakeUnavailableError, ...]:
+        self.batch_hints.extend(hints)
+        return self.outcomes
 
 
 def row(**overrides: Any) -> dict[str, Any]:
@@ -60,12 +86,15 @@ def row(**overrides: Any) -> dict[str, Any]:
     return value
 
 
-def config(*, enabled: bool = True) -> CommandWakeRelayConfig:
+def config(
+    *, enabled: bool = True, publish_batch_size: int = 25
+) -> CommandWakeRelayConfig:
     return CommandWakeRelayConfig(
         tenant_id="tenant-a",
         worker_pool="default",
         publisher_id="wake-relay-1",
         enabled=enabled,
+        publish_batch_size=publish_batch_size,
     )
 
 
@@ -97,7 +126,10 @@ def test_relay_publishes_only_minimal_hint_then_owner_fenced_marks() -> None:
         "limit": 100,
         "visibility_timeout_seconds": 30,
     }
-    assert outbox.marked == [("tenant-a", "wake:cmd-1:0", "wake-relay-1")]
+    assert outbox.marked == []
+    assert outbox.batch_marks == [
+        ("tenant-a", ("wake:cmd-1:0",), "wake-relay-1")
+    ]
 
 
 def test_provider_failure_keeps_outbox_pending_for_retry() -> None:
@@ -106,6 +138,7 @@ def test_provider_failure_keeps_outbox_pending_for_retry() -> None:
     assert result.publish_errors == 1
     assert result.marked == 0
     assert outbox.marked == []
+    assert outbox.batch_marks == []
 
 
 def test_relay_rejects_business_fields_and_wrong_pool() -> None:
@@ -152,3 +185,117 @@ def test_mark_race_is_safe_duplicate_delivery() -> None:
     result = CommandWakeRelay(outbox, FakePublisher(), config()).run_once()
     assert result.published == 1
     assert result.mark_lost == 1
+
+
+def test_relay_batches_successful_marks_and_excludes_failed_publishes() -> None:
+    first = row()
+    failed = row(
+        outbox_id="wake:cmd-2:0",
+        payload_json={
+            "schema_version": 1,
+            "outbox_id": "wake:cmd-2:0",
+            "command_id": "cmd-2",
+            "worker_pool": "default",
+        },
+    )
+
+    class SelectivePublisher(FakePublisher):
+        def publish(self, hint: CommandWakeHint) -> str:
+            if hint.command_id == "cmd-2":
+                raise WorkerWakeUnavailableError("redis unavailable")
+            return super().publish(hint)
+
+    outbox = FakeOutbox([first, failed])
+    result = CommandWakeRelay(outbox, SelectivePublisher(), config()).run_once()
+
+    assert result.claimed == 2
+    assert result.published == result.marked == 1
+    assert result.publish_errors == 1
+    assert outbox.batch_marks == [
+        ("tenant-a", ("wake:cmd-1:0",), "wake-relay-1")
+    ]
+
+
+def test_relay_prefers_batch_publish_and_marks_only_successful_items() -> None:
+    second = row(
+        outbox_id="wake:cmd-2:0",
+        payload_json={
+            "schema_version": 1,
+            "outbox_id": "wake:cmd-2:0",
+            "command_id": "cmd-2",
+            "worker_pool": "default",
+        },
+    )
+    publisher = FakeBatchPublisher(
+        ("1-0", WorkerWakeUnavailableError("one XADD failed"))
+    )
+    outbox = FakeOutbox([row(), second])
+
+    result = CommandWakeRelay(outbox, publisher, config()).run_once()
+
+    assert result.claimed == 2
+    assert result.published == result.marked == 1
+    assert result.publish_errors == 1
+    assert [hint.command_id for hint in publisher.batch_hints] == ["cmd-1", "cmd-2"]
+    assert outbox.batch_marks == [
+        ("tenant-a", ("wake:cmd-1:0",), "wake-relay-1")
+    ]
+
+
+def test_relay_rejects_misaligned_batch_publisher_result() -> None:
+    publisher = FakeBatchPublisher(())
+
+    with pytest.raises(RuntimeError, match="one outcome per hint"):
+        CommandWakeRelay(FakeOutbox([row()]), publisher, config()).run_once()
+
+
+def test_relay_bounds_redis_pipeline_chunks_without_splitting_sql_mark() -> None:
+    class RecordingBatchPublisher(FakePublisher):
+        def __init__(self) -> None:
+            super().__init__()
+            self.batches: list[list[str]] = []
+
+        def publish_many(self, hints: list[CommandWakeHint]) -> tuple[str, ...]:
+            self.batches.append([hint.command_id for hint in hints])
+            return tuple(f"{index + 1}-0" for index in range(len(hints)))
+
+    publisher = RecordingBatchPublisher()
+    values = [
+        (
+            f"outbox-{index}",
+            CommandWakeHint(
+                outbox_id=f"outbox-{index}", command_id=f"command-{index}"
+            ),
+        )
+        for index in range(5)
+    ]
+    relay = CommandWakeRelay(
+        FakeOutbox([]), publisher, config(publish_batch_size=2)
+    )
+
+    published, errors = relay._publish(values)
+
+    assert publisher.batches == [
+        ["command-0", "command-1"],
+        ["command-2", "command-3"],
+        ["command-4"],
+    ]
+    assert published == [f"outbox-{index}" for index in range(5)]
+    assert errors == 0
+
+
+@pytest.mark.parametrize("value", [True, 0, 101])
+def test_relay_rejects_invalid_publish_batch_size(value: object) -> None:
+    with pytest.raises(ValueError, match="publish_batch_size"):
+        CommandWakeRelayConfig(
+            tenant_id="tenant-a",
+            worker_pool="default",
+            publisher_id="relay-1",
+            publish_batch_size=value,  # type: ignore[arg-type]
+        )
+
+
+def test_relay_default_pipeline_batch_is_bounded_below_claim_limit() -> None:
+    current = config()
+    assert current.publish_batch_size == 25
+    assert current.limit == 100

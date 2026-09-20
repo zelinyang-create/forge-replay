@@ -45,6 +45,10 @@ class SyncRedisWorkerWakeClient(Protocol):
         approximate: bool = True,
     ) -> object: ...
 
+    def pipeline(
+        self, *, transaction: bool = True
+    ) -> SyncRedisWorkerWakePipeline: ...
+
     def xgroup_create(
         self,
         name: str,
@@ -77,6 +81,21 @@ class SyncRedisWorkerWakeClient(Protocol):
     def xack(self, name: str, groupname: str, *ids: str) -> object: ...
 
     def close(self) -> object: ...
+
+
+class SyncRedisWorkerWakePipeline(Protocol):
+    """Non-transactional redis-py pipeline surface for batched wake hints."""
+
+    def xadd(
+        self,
+        name: str,
+        fields: Mapping[str, str],
+        id: str = "*",
+        maxlen: int | None = None,
+        approximate: bool = True,
+    ) -> object: ...
+
+    def execute(self, *, raise_on_error: bool = True) -> Sequence[object]: ...
 
 
 def worker_wake_stream_key(
@@ -141,15 +160,7 @@ class RedisWorkerWakePublisher:
     def publish(self, hint: CommandWakeHint) -> str:
         """Append one identifier-only hint and return its Redis stream ID."""
 
-        if not isinstance(hint, CommandWakeHint):
-            raise TypeError("hint must be a CommandWakeHint")
-        fields = {
-            "schema_version": str(hint.schema_version),
-            "outbox_id": hint.outbox_id,
-            "command_id": hint.command_id,
-        }
-        if frozenset(fields) != _HINT_FIELDS:
-            raise RuntimeError("worker wake wire field contract changed")
+        fields = _wake_hint_fields(hint)
         try:
             raw_id = self._client.xadd(
                 self._stream_key,
@@ -162,6 +173,59 @@ class RedisWorkerWakePublisher:
                 "Redis worker wake publish failed"
             ) from exc
         return _decode_stream_id(raw_id, context="XADD")
+
+    def publish_many(
+        self, hints: Sequence[CommandWakeHint]
+    ) -> tuple[str | WorkerWakeUnavailableError, ...]:
+        """Pipeline independent XADDs and preserve one outcome per input hint.
+
+        This is deliberately not a Redis transaction.  ``raise_on_error=False``
+        exposes per-command server failures, while a connection-level failure is
+        represented as a failure for every item so the SQL owner marks none of
+        them published.
+        """
+
+        if isinstance(hints, (str, bytes)):
+            raise TypeError("hints must be a sequence of CommandWakeHint values")
+        values = tuple(hints)
+        fields = tuple(_wake_hint_fields(hint) for hint in values)
+        if not values:
+            return ()
+        try:
+            pipeline = self._client.pipeline(transaction=False)
+            for item in fields:
+                pipeline.xadd(
+                    self._stream_key,
+                    item,
+                    maxlen=self._max_stream_length,
+                    approximate=True,
+                )
+            raw_results = tuple(pipeline.execute(raise_on_error=False))
+        except RedisError:
+            return tuple(
+                WorkerWakeUnavailableError("Redis worker wake batch publish failed")
+                for _ in values
+            )
+        if len(raw_results) != len(values):
+            return tuple(
+                WorkerWakeUnavailableError(
+                    "Redis worker wake pipeline returned an incomplete result"
+                )
+                for _ in values
+            )
+
+        outcomes: list[str | WorkerWakeUnavailableError] = []
+        for raw_result in raw_results:
+            if isinstance(raw_result, RedisError):
+                outcomes.append(
+                    WorkerWakeUnavailableError("Redis worker wake batch item failed")
+                )
+                continue
+            try:
+                outcomes.append(_decode_stream_id(raw_result, context="XADD"))
+            except WorkerWakeUnavailableError as exc:
+                outcomes.append(exc)
+        return tuple(outcomes)
 
     def close(self) -> None:
         _close_client(self._client)
@@ -233,22 +297,39 @@ class RedisWorkerWakeConsumer:
     def ack(self, message_id: str) -> bool:
         """Acknowledge one definite SQL decision; zero means already absent."""
 
-        _validate_stream_id(message_id)
+        return self.ack_many((message_id,)) == 1
+
+    def ack_many(self, message_ids: Sequence[str]) -> int:
+        """Acknowledge a bounded batch after PostgreSQL decisions are durable."""
+
+        if isinstance(message_ids, (str, bytes)):
+            raise TypeError("message_ids must be a sequence of stream IDs")
+        values = tuple(message_ids)
+        if not values:
+            return 0
+        if len(values) > _MAX_READ_COUNT:
+            raise ValueError(
+                f"message_ids cannot contain more than {_MAX_READ_COUNT} items"
+            )
+        if len(set(values)) != len(values):
+            raise ValueError("message_ids must not contain duplicates")
+        for message_id in values:
+            _validate_stream_id(message_id)
         try:
             acknowledged = self._client.xack(
-                self._stream_key, WORKER_WAKE_GROUP, message_id
+                self._stream_key, WORKER_WAKE_GROUP, *values
             )
         except RedisError as exc:
             raise WorkerWakeUnavailableError("Redis worker wake ACK failed") from exc
         if (
             isinstance(acknowledged, bool)
             or not isinstance(acknowledged, int)
-            or acknowledged not in (0, 1)
+            or not 0 <= acknowledged <= len(values)
         ):
             raise WorkerWakeUnavailableError(
                 "Redis worker wake ACK returned an invalid count"
             )
-        return acknowledged == 1
+        return acknowledged
 
     def close(self) -> None:
         _close_client(self._client)
@@ -386,6 +467,19 @@ def _decode_stream_id(value: object, *, context: str) -> str:
             f"Redis {context} returned an invalid stream ID"
         ) from exc
     return result
+
+
+def _wake_hint_fields(hint: CommandWakeHint) -> dict[str, str]:
+    if not isinstance(hint, CommandWakeHint):
+        raise TypeError("hint must be a CommandWakeHint")
+    fields = {
+        "schema_version": str(hint.schema_version),
+        "outbox_id": hint.outbox_id,
+        "command_id": hint.command_id,
+    }
+    if frozenset(fields) != _HINT_FIELDS:
+        raise RuntimeError("worker wake wire field contract changed")
+    return fields
 
 
 def _decode_text(value: object, *, context: str) -> str:

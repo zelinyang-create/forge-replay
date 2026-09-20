@@ -524,6 +524,18 @@ Phase 4 分三段交付，不能把单元测试里的布尔值直接当成生产
    release/config/cohort 的前一级生产观察报告、足够样本与前一报告摘要。任意安全违规立即
    回滚；软 SLO 连续超窗后能力级回滚并进入冷却期。
 
+Phase 4.3 由 `production.canary_lifecycle` 承担有状态编排。`SHADOW → 1%` 必须提交不可
+拆分的 `Phase42AdmissionBundle`（capacity/fault report、两份独立 runner attestation、release
+receipt 和 envelope）；只传裸 envelope 或容量报告一律拒绝。所有 serving 升级还必须携带
+签名的实例全集收敛快照，绑定权威 inventory revision、当前 manifest 摘要/generation、精确实例集
+和短时有效期；inventory revision 与 `state_revision` 必须在同一事务中 CAS。控制面保存连续窗口、
+最后健康证据摘要、serving 过期时间、最后 admission 摘要和冷却截止时间；`must_persist=true` 的
+拒绝结果也必须落库。运行时通过 `LifecycleTenantPolicy` 对过期、缺失或 context 不一致的状态失败
+关闭。健康窗口必须摘要相链；replay、乱序、重叠或缺口直接回到 `SHADOW`。硬安全违规或
+committed fact loss 单窗回到 `OFF`，软违规连续两窗回到 `SHADOW`。5%/25%/100% 升级强制
+验证 coverage-complete 的安全快照；所有回滚/显式降级至少冷却 30 分钟，且禁止复用回滚前的
+Phase 4.2 admission package。
+
 Redis failover、flush、eviction、网络分区，以及 PostgreSQL failover、stale epoch、重复
 command、乱序 outbox 均为真实环境门禁。Phase 4.2 产物未生成前最多允许 SHADOW、缓存
 写预热或 wake publish-only，不得签发 1% 生产读、ENFORCE 或 consume 授权。
@@ -631,6 +643,20 @@ SQLite 与 PostgreSQL 必须共同通过：
 - 1,000 queued / 20 active 基线；
 - Redis 禁用时 PostgreSQL fallback 容量；
 - Redis 重建期间的延迟和数据库冲击。
+
+容量报告中的 outbox lag 从 SQL outbox `created_at` 量到 owner-fenced publish mark；Redis wake
+latency 采用保守的端到端口径，从 Redis publish 调用开始量到 `XREADGROUP` 返回，包含客户端、
+网络与 `XADD` 耗时。一个 pipeline 批次内的 hint 共用该批次调用前的单调时钟起点；即使消费者
+早于生产者收到 pipeline 响应，也不得把延迟截断为 0 或改用响应后的时间。两段分别保留，且
+不能用 wake 指标掩盖 outbox backlog。runner 必须为全部 queued command 各保留一条 claim 与
+wake 样本，缺样本或时钟顺序异常直接判环境/演练失败。`20 active` 表示所有 Worker 已完成
+Redis 连接、consumer group 和首次 pending scan 预热；publish 必须等全部 Worker ready 后才可
+开始，避免把进程冷启动混入 wake SLO，同时不得在预热阶段发布或消费测试 hint。relay 可一次
+从 SQL owner-fenced claim 100 条，但 Redis pipeline 默认最多 25 条；每个子批次独立使用调用前
+起点并保留逐项结果，SQL 最后仍只批量 mark 明确发布成功的 outbox ID。该上限用于压低 1,000
+条突发下的 wake 尾延迟，不改变 outbox 所有权、at-least-once 语义或 100 ms 硬门槛。
+Worker 只可在对应 SQL 决定持久化后批量 `XACK` 本次明确处理的消息；批量 ACK 仅合并 Redis
+往返，不得提前确认、扩大 ID 集合或代替 PostgreSQL command owner/lease fencing。
 
 ## 14. 发布、回滚与完成定义
 
