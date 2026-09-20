@@ -22,6 +22,7 @@ forge-replay = "forge_replay.cli:main"
 [dependency-groups]
 dev = [
   "httpx>=0.28,<1",
+  "pyright>=1.1.400,<2",
   "pytest>=8.3.5",
   "ruff>=0.4.4",
 ]

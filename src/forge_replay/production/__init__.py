@@ -69,6 +69,10 @@ from forge_replay.production.redis_active_index import (
     RedisActiveRunIndex,
     active_run_cursor,
 )
+from forge_replay.production.redis_api_rate_limit import (
+    REDIS_HIERARCHICAL_TOKEN_BUCKET_LUA,
+    RedisHierarchicalRateLimitBackend,
+)
 from forge_replay.production.redis_fanout import (
     RedisRunEventHintPublisher,
     RunEventHint,
@@ -148,6 +152,7 @@ __all__ = [
     "PROMPT_WORKING_SET_CONTRACT_VERSION",
     "PROMPT_WORKING_SET_MAX_BYTES",
     "PROMPT_WORKING_SET_TTL_SECONDS",
+    "REDIS_HIERARCHICAL_TOKEN_BUCKET_LUA",
     "RUN_PROJECTION_DESTINATION",
     "ActiveRunFallbackReason",
     "ActiveRunIndexEntry",
@@ -210,6 +215,7 @@ __all__ = [
     "RedisActiveIndexAdmissionEvidence",
     "RedisActiveRunIndex",
     "RedisFanoutAdmissionEvidence",
+    "RedisHierarchicalRateLimitBackend",
     "RedisPromptCacheAdmissionEvidence",
     "RedisPromptWorkingSetCache",
     "RedisReadAdmissionEvidence",

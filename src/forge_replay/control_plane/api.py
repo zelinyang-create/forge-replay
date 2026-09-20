@@ -11,9 +11,18 @@ import uuid
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
+from inspect import isawaitable
 from typing import Annotated, Any, Protocol
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
+from fastapi import (
+    Depends,
+    FastAPI,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    status,
+)
 from fastapi.encoders import jsonable_encoder
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
@@ -21,6 +30,12 @@ from starlette.concurrency import run_in_threadpool
 from starlette.responses import JSONResponse, StreamingResponse
 
 from forge_replay.control_plane.postgres import IdempotencyConflictError
+from forge_replay.control_plane.rate_limit import (
+    ApiRateLimitDisposition,
+    ApiRateLimitResult,
+    ApiRateLimitService,
+    RouteGroup,
+)
 
 
 @dataclass(frozen=True)
@@ -72,7 +87,16 @@ class HmacIdentityVerifier:
 
 
 class ControlPlaneService(Protocol):
-    def create_run(self, **kwargs) -> Any: ...
+    def create_run(
+        self,
+        *,
+        tenant_id: str,
+        run_id: str,
+        idempotency_key: str,
+        request: dict[str, Any],
+        command_id: str,
+        event_id: str,
+    ) -> Any: ...
     def get_run(self, *, tenant_id: str, run_id: str) -> dict[str, Any] | None: ...
     def list_events(
         self, *, tenant_id: str, run_id: str, after: int = 0
@@ -127,6 +151,13 @@ class CreateRunRequest(BaseModel):
     base_sha: str = Field(pattern=r"^[0-9a-f]{40,64}$")
 
 
+@dataclass(frozen=True)
+class _ApiRateLimitExceeded(Exception):
+    route_group: RouteGroup
+    retry_after_seconds: int
+    headers: Mapping[str, str]
+
+
 def create_control_plane_app(
     service: ControlPlaneService,
     verifier: IdentityVerifier,
@@ -134,9 +165,26 @@ def create_control_plane_app(
     ui_status_reader: UIStatusReader | None = None,
     ui_event_stream: UIEventStream | None = None,
     ui_active_run_reader: UIActiveRunReader | None = None,
+    api_rate_limiter: ApiRateLimitService | None = None,
 ) -> FastAPI:
     app = FastAPI(title="ForgeReplay Control Plane", version="1.0")
     bearer = HTTPBearer(auto_error=False)
+
+    @app.exception_handler(_ApiRateLimitExceeded)
+    async def rate_limit_exceeded(
+        _request: Request,
+        exc: _ApiRateLimitExceeded,
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            content={
+                "code": "rate_limit_exceeded",
+                "detail": "rate limit exceeded",
+                "limit_class": exc.route_group.value,
+                "retry_after_seconds": exc.retry_after_seconds,
+            },
+            headers=dict(exc.headers),
+        )
 
     def principal(
         credentials: Annotated[
@@ -161,6 +209,11 @@ def create_control_plane_app(
     ):
         if not idempotency_key or len(idempotency_key) > 200:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "valid Idempotency-Key required")
+        _evaluate_api_rate_limit(
+            api_rate_limiter,
+            identity=identity,
+            route_group=RouteGroup.RUN_CREATE,
+        )
         correlation_request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
         payload = {
             **body.model_dump(),
@@ -206,6 +259,13 @@ def create_control_plane_app(
                 status.HTTP_422_UNPROCESSABLE_CONTENT,
                 "invalid active-run cursor",
             ) from None
+        _evaluate_api_rate_limit(
+            api_rate_limiter,
+            identity=identity,
+            route_group=(
+                RouteGroup.FORCE_SQL if force_sql else RouteGroup.ACTIVE_LIST
+            ),
+        )
         try:
             result = ui_active_run_reader.list_active_runs(
                 tenant_id=identity.tenant_id,
@@ -247,6 +307,13 @@ def create_control_plane_app(
                 status.HTTP_503_SERVICE_UNAVAILABLE,
                 "UI status reader is not enabled",
             )
+        _evaluate_api_rate_limit(
+            api_rate_limiter,
+            identity=identity,
+            route_group=(
+                RouteGroup.FORCE_SQL if force_sql else RouteGroup.UI_STATUS
+            ),
+        )
         result = ui_status_reader.read_ui_status(
             tenant_id=identity.tenant_id,
             run_id=run_id,
@@ -288,6 +355,11 @@ def create_control_plane_app(
         run_id: str,
         identity: Annotated[AuthenticatedPrincipal, Depends(principal)],
     ):
+        _evaluate_api_rate_limit(
+            api_rate_limiter,
+            identity=identity,
+            route_group=RouteGroup.AUTHORITY_READ,
+        )
         run = service.get_run(tenant_id=identity.tenant_id, run_id=run_id)
         if run is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "run not found")
@@ -299,6 +371,11 @@ def create_control_plane_app(
         identity: Annotated[AuthenticatedPrincipal, Depends(principal)],
         after: int = 0,
     ):
+        _evaluate_api_rate_limit(
+            api_rate_limiter,
+            identity=identity,
+            route_group=RouteGroup.EVENT_READ,
+        )
         return {
             "items": service.list_events(
                 tenant_id=identity.tenant_id, run_id=run_id, after=after
@@ -320,6 +397,7 @@ def create_control_plane_app(
                 status.HTTP_503_SERVICE_UNAVAILABLE,
                 "UI event stream is not enabled",
             )
+        event_stream = ui_event_stream
 
         if last_event_id is not None:
             after_cursor = _parse_event_cursor(
@@ -329,6 +407,13 @@ def create_control_plane_app(
             )
         else:
             after_cursor = _parse_event_cursor(after, field="after", status_code=422)
+
+        await run_in_threadpool(
+            _evaluate_api_rate_limit,
+            api_rate_limiter,
+            identity=identity,
+            route_group=RouteGroup.STREAM_CONNECT,
+        )
 
         # Establish tenant-scoped existence from PostgreSQL before sending the
         # response headers.  A streaming-generator lookup would turn a clean
@@ -342,7 +427,7 @@ def create_control_plane_app(
             raise HTTPException(status.HTTP_404_NOT_FOUND, "run not found")
 
         async def frames() -> AsyncIterator[str]:
-            items = ui_event_stream.stream(
+            items = event_stream.stream(
                 tenant_id=identity.tenant_id,
                 run_id=run_id,
                 after=after_cursor,
@@ -353,7 +438,9 @@ def create_control_plane_app(
             finally:
                 close = getattr(items, "aclose", None)
                 if callable(close):
-                    await close()
+                    close_result = close()
+                    if isawaitable(close_result):
+                        await close_result
 
         return StreamingResponse(
             frames(),
@@ -367,6 +454,64 @@ def create_control_plane_app(
     return app
 
 
+_RATE_LIMIT_UNAVAILABLE_RETRY_SECONDS = 1
+
+
+def _evaluate_api_rate_limit(
+    limiter: ApiRateLimitService | None,
+    *,
+    identity: AuthenticatedPrincipal,
+    route_group: RouteGroup,
+) -> None:
+    """Evaluate one authenticated request before any authoritative I/O."""
+
+    if limiter is None:
+        return
+    try:
+        result = limiter.evaluate(
+            tenant_id=identity.tenant_id,
+            user_id=identity.user_id,
+            route_group=route_group,
+        )
+    except Exception:  # noqa: BLE001 - never expose limiter internals
+        raise _rate_limiter_unavailable() from None
+    if not isinstance(result, ApiRateLimitResult):
+        raise _rate_limiter_unavailable()
+
+    if result.disposition is ApiRateLimitDisposition.ALLOWED:
+        return
+    if result.disposition is ApiRateLimitDisposition.RATE_LIMITED:
+        retry_after_ms = result.retry_after_ms
+        if retry_after_ms is None:  # pragma: no cover - result invariant
+            raise _rate_limiter_unavailable()
+        retry_after_seconds = max(1, _milliseconds_to_seconds(retry_after_ms))
+        headers = {
+            "Retry-After": str(retry_after_seconds),
+            "Cache-Control": "no-store",
+        }
+        raise _ApiRateLimitExceeded(
+            route_group=route_group,
+            retry_after_seconds=retry_after_seconds,
+            headers=headers,
+        )
+    if result.disposition is ApiRateLimitDisposition.UNAVAILABLE:
+        raise _rate_limiter_unavailable()
+    raise _rate_limiter_unavailable()  # pragma: no cover - enum is exhaustive
+
+
+def _milliseconds_to_seconds(value: int) -> int:
+    return (value + 999) // 1_000
+
+
+def _rate_limiter_unavailable() -> HTTPException:
+    return HTTPException(
+        status.HTTP_503_SERVICE_UNAVAILABLE,
+        "rate limiter unavailable",
+        headers={
+            "Retry-After": str(_RATE_LIMIT_UNAVAILABLE_RETRY_SECONDS),
+            "Cache-Control": "no-store",
+        },
+    )
 _MAX_EVENT_CURSOR = (1 << 63) - 1
 _ACTIVE_RUN_CURSOR_PREFIX = "ari1."
 _ACTIVE_RUN_CURSOR_PAYLOAD_RE = re.compile(r"[A-Za-z0-9_-]+\Z")

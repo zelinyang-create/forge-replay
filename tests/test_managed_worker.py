@@ -321,6 +321,7 @@ def test_managed_control_plane_migrates_before_building_app(
     service = object()
     app = object()
     object_store = object()
+    api_rate_limiter = object()
 
     class Factory:
         def __init__(
@@ -339,9 +340,14 @@ def test_managed_control_plane_migrates_before_building_app(
             actions.append("control_store")
             return service
 
-    def build(received_service: object, _verifier: object) -> object:
+    def build(
+        received_service: object,
+        _verifier: object,
+        **optional_services: object,
+    ) -> object:
         actions.append("build_app")
         assert received_service is service
+        assert optional_services == {"api_rate_limiter": api_rate_limiter}
         return app
 
     monkeypatch.setattr(managed_module, "PostgresAuthorityFactory", Factory)
@@ -351,6 +357,7 @@ def test_managed_control_plane_migrates_before_building_app(
         ManagedAuthorityConfig("postgresql://authority"),
         b"a-secure-signing-key",
         object_store=object_store,  # type: ignore[arg-type]
+        api_rate_limiter=api_rate_limiter,  # type: ignore[arg-type]
     )
 
     assert built is app

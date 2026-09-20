@@ -27,6 +27,7 @@ from forge_replay.control_plane.api import (
     create_control_plane_app,
 )
 from forge_replay.control_plane.postgres import PostgresControlPlaneStore
+from forge_replay.control_plane.rate_limit import ApiRateLimitService
 from forge_replay.domain import ExecutionContext
 from forge_replay.persistence.object_store import BlobObjectUnavailableError
 from forge_replay.persistence.postgres_store import PostgresRuntimeStore
@@ -187,6 +188,7 @@ def build_managed_control_plane(
     ui_status_reader: UIStatusReader | None = None,
     ui_event_stream: UIEventStream | None = None,
     ui_active_run_reader: UIActiveRunReader | None = None,
+    api_rate_limiter: ApiRateLimitService | None = None,
 ) -> FastAPI:
     """Build a migrated PostgreSQL control plane or fail before serving."""
 
@@ -200,6 +202,8 @@ def build_managed_control_plane(
         optional_services["ui_event_stream"] = ui_event_stream
     if ui_active_run_reader is not None:
         optional_services["ui_active_run_reader"] = ui_active_run_reader
+    if api_rate_limiter is not None:
+        optional_services["api_rate_limiter"] = api_rate_limiter
     return create_control_plane_app(
         factory.control_store(),
         verifier,
@@ -343,7 +347,7 @@ class WorkspaceAgentExecutor:
             raise ValueError("managed workspace dirty mode is invalid")
         self.workspace_controller_factory = workspace_controller_factory
         self.agent_runtime_factory = agent_runtime_factory
-        self.dirty_mode = dirty_mode
+        self.dirty_mode: Literal["refuse", "head-only"] = dirty_mode
 
     def execute(
         self,

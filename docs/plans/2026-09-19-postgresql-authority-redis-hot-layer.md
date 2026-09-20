@@ -143,7 +143,7 @@ Redis 只能保存能够从 PostgreSQL 或对象存储重建的数据：
 | Worker presence | STRING/HASH + TTL | 仅观测，不作 fencing |
 | UI 实时通知 | Pub/Sub | 提示型，客户端按 seq 补读 |
 | Worker 唤醒 | Streams consumer group | 至少一次，SQL 命令权威 |
-| API 滑动窗口限流 | Lua + sorted set/token bucket | 快速拒绝；财务预算仍在 SQL |
+| API token bucket 限流 | Redis TIME + Lua + HASH | 常数空间快速拒绝；财务预算仍在 SQL |
 | Provider 健康与熔断 | TTL key | 可过期、可重建 |
 
 ## 5. Redis Key 与消息设计
@@ -156,9 +156,18 @@ fr:<env>:v1:{t:<tenant>:r:<run>}:recent
 fr:<env>:v1:active:<tenant>:<shard>
 fr:<env>:v1:{q:<worker-pool>:<shard>}:commands
 fr:<env>:v1:worker:<worker-id>:heartbeat
-fr:<env>:v1:rate:<tenant>:<dimension>
+fr:<env>:v1:{rl:<tenant-hmac>}:rate:<route-class>:p:<policy-hmac>:tenant
+fr:<env>:v1:{rl:<tenant-hmac>}:rate:<route-class>:p:<policy-hmac>:user:<user-hmac>
 fr:<env>:v1:outbox-dedup:<outbox-id>
 ```
+
+限流 key 不得包含裸 `tenant_id`、`user_id`、bearer token、Run ID 或幂等键。
+`tenant-hmac` 使用注入的限流 key secret 对带用途前缀的 canonical tenant identity 执行
+HMAC-SHA-256 后生成；`user-hmac` 同时绑定 tenant 与 user，避免跨租户同名主体共享桶。
+secret 来自 secret manager/KMS，不进入 Redis、日志、指标或异常。两个 bucket key 复用
+`{rl:<tenant-hmac>}` hash tag，保证 Redis Cluster 中可以由一个 Lua script 原子判定。
+`policy-hmac` 绑定 route class、window、tenant limit 与 user limit；策略升降级或窗口调整会
+切换到新桶，旧桶仅等待 TTL 回收，避免用新容量误解旧余额或在关键路由制造持续 `503`。
 
 Projection 最少字段：
 
@@ -325,6 +334,79 @@ canonical 内容必须删除冲突条目，不能继续命中旧值。若后续�
 `prompt-working-set-v1` outbox destination；不得把可选
 prompt cache 的成功加入 `run-projection-v1` 的 ACK 条件。
 
+### 7.4 API 共享限流
+
+API 限流的目的，是在多 API 实例之间提供一致的短时 admission window，在请求进入昂贵的
+PostgreSQL 查询、Run 创建或 SSE 建连前快速拒绝过载。它不是身份认证、角色授权、DDoS
+边界防护、财务预算、计费、审批、取消、幂等或审计机制。边缘网关仍负责未认证来源/IP
+防护；PostgreSQL 中的预算、审批、控制命令、API idempotency key 与 Run 状态仍是权威事实。
+
+首版固定使用 Redis `TIME` 驱动的 Lua token bucket。每个 route class 同时检查 tenant bucket
+与 tenant/user bucket；每个 bucket 只保存 `tokens` 与 `last_refill_ms` 等常数字段，并设置
+覆盖完整补充周期的 TTL。Lua 先计算两个 bucket 的补充结果，只有二者都允许时才同时扣减；
+任一拒绝都不得只扣其中一个。两个 key 必须使用同一 tenant HMAC hash tag，保证 Redis
+Cluster 单 slot 内 all-or-none。禁止使用应用实例时钟、按请求写一条 member 的无界 ZSET、
+原始 URL、Run ID 或幂等键作为 bucket/指标维度。
+
+route class 是协议常量，不能从 path 动态生成：
+
+| HTTP 路径/条件 | route class | Redis 判定不可用时 | 备注 |
+|---|---|---|---|
+| `POST /v1/runs` | `run_create` | fail-closed，返回 `503` | 先认证；SQL 幂等仍处理安全重试 |
+| `GET /v1/runs`，`force_sql=false` | `active_list` | fail-open | Redis 索引失败仍由既有 SQL fallback 决定 |
+| `GET /v1/runs/{run_id}/status`，`force_sql=false` | `ui_status` | fail-open | 不改变状态缓存的一致性校验 |
+| 上述两个端点，`force_sql=true` | `force_sql` | fail-closed，返回 `503` | 防止客户端绕过缓存持续打 SQL |
+| `GET /v1/runs/{run_id}` | `run_read` | fail-open | PostgreSQL 读取仍做 tenant/RLS 隔离 |
+| `GET /v1/runs/{run_id}/events` | `event_read` | fail-open | 现有 SQL page/window 上限保持不变 |
+| `GET /v1/runs/{run_id}/stream` | `stream_connect` | fail-closed，返回 `503` | 只在发送 SSE headers 前限制握手 |
+| 未来 cancel 控制端点 | `run_cancel` | fail-open | 独立高容量保留额度，不与普通流量共桶 |
+
+本阶段 SSE 只限制连接握手；heartbeat 和每条事件不再次扣 token。并发连接 lease、断连释放、
+TTL 回收和每租户连接上限属于后续独立能力，必须另设 feature gate 与故障演练，不能宣称已由
+握手限流覆盖。未来新增 approval 或其他控制端点时，必须在此矩阵中显式分配独立 route
+class 和失败策略，不能默认继承 `run_create` 或普通读取策略。无论限流结果如何，审批
+fingerprint/expected version、取消幂等、预算 reserve/settle 与 API idempotency 均继续由 SQL
+事务验证；Redis 决策不得写入或推进业务状态。
+
+健康 Redis 在 ENFORCE 模式拒绝请求时返回：
+
+```http
+HTTP/1.1 429 Too Many Requests
+Retry-After: <向上取整且至少为 1 的秒数>
+Cache-Control: no-store
+Content-Type: application/json
+
+{"code":"rate_limit_exceeded","detail":"rate limit exceeded","limit_class":"<route-class>","retry_after_seconds":<seconds>}
+```
+
+`Retry-After` 由两个 bucket 中较长的等待时间计算，响应不得泄露 tenant/user、Redis key、
+token 数或内部 policy。Redis timeout、连接失败、`CROSSSLOT`、Lua/protocol 异常不是配额
+拒绝，不能伪装成 `429`：矩阵中的 fail-closed route 返回通用 `503`，fail-open route 继续
+现有权威路径并记录降级指标。SHADOW 模式下所有 route 都只观察、不拒绝。
+
+功能开关独立于 projection、prompt cache、fanout 和 queue：
+
+```text
+api_rate_limit_mode = off | shadow | enforce
+api_rate_limit_rollout_percent
+api_rate_limit_admission_evidence
+```
+
+模式默认 `off`，且只接受 OFF、SHADOW 和 ENFORCE 三种状态。ENFORCE 的准入证据必须
+覆盖先前 SHADOW 观察与故障演练。SHADOW 执行同一 Redis 判定并记录
+`would_allow`/`would_reject`，但不改变 HTTP 结果。ENFORCE 按 tenant identity 做稳定
+HMAC-SHA-256 canary；不得按 run、request、user 或 idempotency key 分桶，避免调用方枚举绕过。
+未进入 canary 的 tenant 继续 SHADOW。实际 rollout percent 不得超过 admission evidence 已验证
+的 canary percent，并按 1% → 5% → 25% → 100% 推进。
+
+进入 ENFORCE 前必须有真实证据证明：确有多实例统一窗口需求或持续约 500 次判定/秒；
+两倍预计峰值下 Redis 判定 P95 < 10 ms；双 bucket 原子边界、Redis server time、TTL、
+hot tenant、公平性、Cluster 同 slot、flush/eviction、disconnect/failover、协议损坏、跨租户
+隔离、`429`/`Retry-After` 及本阶段各 route 失败策略演练全部通过。未来 cancel 保留额度在
+该端点实施时进入其独立准入门禁。单元测试或
+fake Redis 只能验证契约，不能替代准入压测和故障注入。操作步骤见
+[`API Rate Limit Degradation Runbook`](../runbooks/api-rate-limit-degradation.md)。
+
 ## 8. 故障语义
 
 | 故障窗口 | 正确行为 |
@@ -396,6 +478,8 @@ SHA-256、长度、media type、tenant 和引用关系。
 6. Redis Streams worker wake-up。
 
 每项使用独立 feature flag，支持立即回退 PostgreSQL。
+共享 API rate limit 与 provider circuit breaker 必须是两个独立能力、开关和状态空间；
+本阶段只定义 API rate limit，不能用它推断 provider 健康。
 
 ### Phase 4：容量与生产门禁
 
@@ -413,7 +497,8 @@ SHA-256、长度、media type、tenant 和引用关系。
   且热点读写比 >= 10:1、预计命中率 >= 80%。上线后 SQL 读负载至少下降 30%。
 - Redis Streams：优化 PG 索引后 command claim P95 仍 > 25 ms、唤醒延迟 P95 > 100 ms，
   或持续约 1,000 claim/s 以上。
-- 共享限流：多 API 实例需要统一窗口，判定 P95 目标 < 10 ms，或持续约 500 次判断/s。
+- 共享限流：确有多 API 实例统一窗口需求，或持续约 500 次判断/s；两倍预计峰值下
+  Redis 双 bucket 判定 P95 必须 < 10 ms，并通过 7.4 节全部故障与安全演练。
 - Redis 上线故障门禁：清空 Redis 后 0 已提交事件丢失、0 权限/预算绕过、
   0 可观察重复副作用；SQL fallback 恢复 < 60 秒；outbox 投影延迟 P95 < 2 秒。
 
@@ -439,6 +524,8 @@ Redis：
 - stream lag、`XPENDING`、oldest pending、redelivery、claim age；
 - Pub/Sub subscriber/fanout failures；
 - full rebuild duration。
+- rate-limit decision latency、allow/reject/would-reject、Redis error、route-class failure
+  action、canary cohort 和 mode；只按 route class/tier/region 聚合，不带 tenant/user/run label。
 
 业务与安全：
 
@@ -475,6 +562,8 @@ SQLite 与 PostgreSQL 必须共同通过：
 - versioned cache CAS；
 - Redis miss、timeout、flush、eviction、network partition；
 - PostgreSQL fallback。
+- API 限流双 bucket 原子扣减、TTL、server time、同 slot、tenant canary、`429`/`Retry-After`
+  与逐 route fail-open/fail-closed；测试报告必须区分 fake/单元测试和真实 Redis 演练。
 
 ### 13.3 Kill-window matrix
 
@@ -498,6 +587,8 @@ SQLite 与 PostgreSQL 必须共同通过：
 redis_cache_write
 redis_cache_read
 redis_fanout
+api_rate_limit_mode
+api_rate_limit_rollout_percent
 redis_queue_publish
 redis_queue_consume
 postgres_queue_fallback
@@ -505,6 +596,8 @@ postgres_queue_fallback
 
 回滚顺序：关闭 Redis read/consume，恢复 PostgreSQL read/claim；停止新 Redis 投影；
 保留 outbox 等待修复后重放。Redis 数据从不需要反向迁回 SQL。
+API 限流误拒绝时先从 ENFORCE 降到 SHADOW；Redis 本身过载或不可用时关闭 shadow，
+并按 runbook 使用上游保护或 Run admission kill switch，而不是把限流计数迁入 PostgreSQL。
 
 本设计完成的定义：
 

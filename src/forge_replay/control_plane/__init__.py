@@ -14,13 +14,29 @@ from forge_replay.control_plane.postgres import (
     PostgresControlPlaneStore,
     RunVersionConflictError,
 )
+from forge_replay.control_plane.rate_limit import (
+    ApiRateLimitAdmissionEvidence,
+    ApiRateLimitFeatureConfig,
+    ApiRateLimitPolicies,
+    ApiRateLimitService,
+    DualBucketRateLimitPolicy,
+    RateLimitMode,
+    RouteGroup,
+)
 
 __all__ = [
+    "ApiRateLimitAdmissionEvidence",
+    "ApiRateLimitFeatureConfig",
+    "ApiRateLimitPolicies",
+    "ApiRateLimitService",
     "ArtifactEnvelope",
     "AuthenticatedPrincipal",
+    "DualBucketRateLimitPolicy",
     "IdempotencyConflictError",
     "LocalTenantCasStore",
     "PostgresControlPlaneStore",
+    "RateLimitMode",
+    "RouteGroup",
     "RunVersionConflictError",
     "UIActiveRunReader",
     "UIEventStream",
