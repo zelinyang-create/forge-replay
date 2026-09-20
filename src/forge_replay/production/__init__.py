@@ -30,6 +30,7 @@ from forge_replay.production.managed import (
     WorkspaceAgentExecutor,
     WorkspaceControllerFactory,
     build_managed_control_plane,
+    build_managed_prompt_working_set_reader,
 )
 from forge_replay.production.model_gateway import BudgetLedger, ModelGateway
 from forge_replay.production.operations import AuditHashChain, GaReadinessGate
@@ -46,6 +47,20 @@ from forge_replay.production.outbox_relay import (
 from forge_replay.production.policy import PolicyBundle, SignedPolicyEvaluator
 from forge_replay.production.postgres_active_index import PostgresActiveRunSource
 from forge_replay.production.postgres_shadow import PostgresShadowProjectionSource
+from forge_replay.production.prompt_working_set_read import (
+    PROMPT_WORKING_SET_CONTRACT_VERSION,
+    AuthoritativePromptWorkingSetSource,
+    PromptWorkingSetCacheAsideReader,
+    PromptWorkingSetCacheOutcome,
+    PromptWorkingSetCodecError,
+    PromptWorkingSetCounterSnapshot,
+    PromptWorkingSetReadCounters,
+    PromptWorkingSetReader,
+    PromptWorkingSetReadObserver,
+    PromptWorkingSetSource,
+    decode_prompt_working_set,
+    encode_prompt_working_set,
+)
 from forge_replay.production.redis_active_index import (
     ActiveRunIndexEntry,
     ActiveRunIndexPage,
@@ -64,6 +79,24 @@ from forge_replay.production.redis_fanout import (
 )
 from forge_replay.production.redis_fanout_subscriber import (
     AsyncRedisRunHintSubscriber,
+)
+from forge_replay.production.redis_prompt_working_set import (
+    PROMPT_WORKING_SET_MAX_BYTES,
+    PROMPT_WORKING_SET_TTL_SECONDS,
+    PromptWorkingSetCache,
+    PromptWorkingSetCacheEntry,
+    PromptWorkingSetCacheError,
+    PromptWorkingSetCacheIntegrityError,
+    PromptWorkingSetCacheKeyUnavailableError,
+    PromptWorkingSetCacheProtocolError,
+    PromptWorkingSetCacheTooLargeError,
+    PromptWorkingSetCacheUnavailableError,
+    PromptWorkingSetWriteResult,
+    PromptWorkingSetWriteStatus,
+    RedisPromptWorkingSetCache,
+    TenantPromptCacheKey,
+    TenantPromptCacheKeyProvider,
+    prompt_working_set_cache_key,
 )
 from forge_replay.production.redis_shadow import (
     RedisShadowProjectionSink,
@@ -86,8 +119,10 @@ from forge_replay.production.sandbox import (
 from forge_replay.production.shadow_config import (
     Phase2RedisFeatureFlags,
     Phase3RedisFeatureFlags,
+    PromptWorkingSetConfig,
     RedisActiveIndexAdmissionEvidence,
     RedisFanoutAdmissionEvidence,
+    RedisPromptCacheAdmissionEvidence,
     RedisReadAdmissionEvidence,
     ShadowProjectionConfig,
     ShadowProjectionTtlConfig,
@@ -110,6 +145,9 @@ from forge_replay.production.workspace_snapshot import (
 )
 
 __all__ = [
+    "PROMPT_WORKING_SET_CONTRACT_VERSION",
+    "PROMPT_WORKING_SET_MAX_BYTES",
+    "PROMPT_WORKING_SET_TTL_SECONDS",
     "RUN_PROJECTION_DESTINATION",
     "ActiveRunFallbackReason",
     "ActiveRunIndexEntry",
@@ -126,6 +164,7 @@ __all__ = [
     "AgentRuntimeSession",
     "AsyncRedisRunHintSubscriber",
     "AuditHashChain",
+    "AuthoritativePromptWorkingSetSource",
     "BudgetLedger",
     "ExecReceipt",
     "ExecRequest",
@@ -149,9 +188,30 @@ __all__ = [
     "PostgresShadowProjectionSource",
     "ProjectionWriteResult",
     "ProjectionWriteStatus",
+    "PromptWorkingSetCache",
+    "PromptWorkingSetCacheAsideReader",
+    "PromptWorkingSetCacheEntry",
+    "PromptWorkingSetCacheError",
+    "PromptWorkingSetCacheIntegrityError",
+    "PromptWorkingSetCacheKeyUnavailableError",
+    "PromptWorkingSetCacheOutcome",
+    "PromptWorkingSetCacheProtocolError",
+    "PromptWorkingSetCacheTooLargeError",
+    "PromptWorkingSetCacheUnavailableError",
+    "PromptWorkingSetCodecError",
+    "PromptWorkingSetConfig",
+    "PromptWorkingSetCounterSnapshot",
+    "PromptWorkingSetReadCounters",
+    "PromptWorkingSetReadObserver",
+    "PromptWorkingSetReader",
+    "PromptWorkingSetSource",
+    "PromptWorkingSetWriteResult",
+    "PromptWorkingSetWriteStatus",
     "RedisActiveIndexAdmissionEvidence",
     "RedisActiveRunIndex",
     "RedisFanoutAdmissionEvidence",
+    "RedisPromptCacheAdmissionEvidence",
+    "RedisPromptWorkingSetCache",
     "RedisReadAdmissionEvidence",
     "RedisRunEventHintPublisher",
     "RedisShadowProjectionReader",
@@ -185,6 +245,8 @@ __all__ = [
     "ShadowRelayResult",
     "SignedPolicyEvaluator",
     "SubprocessCommandTransport",
+    "TenantPromptCacheKey",
+    "TenantPromptCacheKeyProvider",
     "TenantRoutedActiveRunReader",
     "TenantRoutedUiStatusReader",
     "UnsafeHostExecutionProvider",
@@ -194,5 +256,9 @@ __all__ = [
     "WorkspaceSnapshotManager",
     "active_run_cursor",
     "build_managed_control_plane",
+    "build_managed_prompt_working_set_reader",
+    "decode_prompt_working_set",
+    "encode_prompt_working_set",
     "fanout_channel",
+    "prompt_working_set_cache_key",
 ]

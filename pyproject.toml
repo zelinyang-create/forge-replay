@@ -8,6 +8,7 @@ version = "0.5.0"
 description = "Durable, replay-aware coding agent harness backed by Ollama"
 requires-python = ">=3.10"
 dependencies = [
+    "cryptography>=44,<47",
     "fastapi>=0.116,<1",
     "psycopg[binary]>=3.2,<4",
     "pydantic>=2.11,<3",

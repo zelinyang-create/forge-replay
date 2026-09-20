@@ -191,6 +191,133 @@ class RedisActiveIndexAdmissionEvidence:
 
 
 @dataclass(frozen=True)
+class RedisPromptCacheAdmissionEvidence:
+    """Security, failure-mode, and capacity evidence for prompt-cache reads.
+
+    Prompt material can influence later model and tool actions, so this gate is
+    intentionally independent from the lower-risk UI projection read gate.
+    Shadow writes and comparisons may run while this evidence is collected,
+    but Redis must not serve a runtime prompt until every condition qualifies.
+    """
+
+    load_multiplier: float
+    sql_query_p95_ms: float
+    database_cpu_percent: float
+    hot_read_write_ratio: float
+    expected_cache_hit_percent: float
+    aead_encryption_tested: bool
+    key_provider_configured: bool
+    redis_tls_tested: bool
+    redis_acl_tested: bool
+    redis_flush_rebuild_tested: bool
+    redis_eviction_fallback_tested: bool
+    ciphertext_tamper_rejection_tested: bool
+    cross_tenant_isolation_tested: bool
+    kms_outage_fallback_tested: bool
+    semantic_shadow_compare_tested: bool
+    canary_percent: float
+
+    def __post_init__(self) -> None:
+        _finite_non_negative(self.load_multiplier, field="load_multiplier")
+        _finite_non_negative(self.sql_query_p95_ms, field="sql_query_p95_ms")
+        _finite_percent(self.database_cpu_percent, field="database_cpu_percent")
+        _finite_non_negative(
+            self.hot_read_write_ratio,
+            field="hot_read_write_ratio",
+        )
+        _finite_percent(
+            self.expected_cache_hit_percent,
+            field="expected_cache_hit_percent",
+        )
+        if self.load_multiplier == 0:
+            raise ValueError("load_multiplier must be greater than zero")
+        for name in (
+            "aead_encryption_tested",
+            "key_provider_configured",
+            "redis_tls_tested",
+            "redis_acl_tested",
+            "redis_flush_rebuild_tested",
+            "redis_eviction_fallback_tested",
+            "ciphertext_tamper_rejection_tested",
+            "cross_tenant_isolation_tested",
+            "kms_outage_fallback_tested",
+            "semantic_shadow_compare_tested",
+        ):
+            if not isinstance(getattr(self, name), bool):
+                raise TypeError(f"{name} must be a bool")
+        _finite_percent(self.canary_percent, field="canary_percent")
+        if self.canary_percent == 0:
+            raise ValueError("canary_percent must be greater than zero")
+
+    @property
+    def qualifies(self) -> bool:
+        """Whether runtime reads have both demand and complete safety proof."""
+
+        database_pressure = (
+            self.sql_query_p95_ms > 20 or self.database_cpu_percent > 65
+        )
+        performance_qualifies = (
+            self.load_multiplier >= 2
+            and database_pressure
+            and self.hot_read_write_ratio >= 10
+            and self.expected_cache_hit_percent >= 80
+        )
+        safety_qualifies = all(
+            (
+                self.aead_encryption_tested,
+                self.key_provider_configured,
+                self.redis_tls_tested,
+                self.redis_acl_tested,
+                self.redis_flush_rebuild_tested,
+                self.redis_eviction_fallback_tested,
+                self.ciphertext_tamper_rejection_tested,
+                self.cross_tenant_isolation_tested,
+                self.kms_outage_fallback_tested,
+                self.semantic_shadow_compare_tested,
+            )
+        )
+        return performance_qualifies and safety_qualifies
+
+
+@dataclass(frozen=True)
+class PromptWorkingSetConfig:
+    """Bounded retention and plaintext limits for an encrypted prompt cache."""
+
+    ttl_seconds: int = 900
+    max_plaintext_bytes: int = 262_144
+    event_limit: int = 64
+    transcript_limit: int = 12
+
+    def __post_init__(self) -> None:
+        _positive_bounded_int(
+            self.ttl_seconds,
+            field="ttl_seconds",
+            maximum=3_600,
+        )
+        _positive_bounded_int(
+            self.max_plaintext_bytes,
+            field="max_plaintext_bytes",
+            maximum=262_144,
+        )
+        _positive_bounded_int(
+            self.event_limit,
+            field="event_limit",
+            maximum=10_000,
+        )
+        _positive_bounded_int(
+            self.transcript_limit,
+            field="transcript_limit",
+            maximum=10_000,
+        )
+        if self.transcript_limit > self.event_limit:
+            raise ValueError("transcript_limit must not exceed event_limit")
+        if self.event_limit != 64:
+            raise ValueError("event_limit must equal the runtime prompt window of 64")
+        if self.transcript_limit != 12:
+            raise ValueError("transcript_limit must equal the runtime transcript window of 12")
+
+
+@dataclass(frozen=True)
 class Phase3RedisFeatureFlags:
     """Phase 3 permits independently gated UI, fanout, and active-index reads.
 
@@ -210,6 +337,13 @@ class Phase3RedisFeatureFlags:
     read_admission_evidence: RedisReadAdmissionEvidence | None = None
     fanout_admission_evidence: RedisFanoutAdmissionEvidence | None = None
     active_index_admission_evidence: RedisActiveIndexAdmissionEvidence | None = None
+    redis_prompt_cache_write: bool = False
+    redis_prompt_cache_read: bool = False
+    redis_prompt_cache_shadow_compare: bool = False
+    postgres_prompt_fallback: bool = True
+    blob_store_prompt_fallback: bool = True
+    prompt_cache_rollout_percent: float = 0.0
+    prompt_cache_admission_evidence: RedisPromptCacheAdmissionEvidence | None = None
 
     def __post_init__(self) -> None:
         for name in (
@@ -218,10 +352,15 @@ class Phase3RedisFeatureFlags:
             "redis_fanout",
             "redis_active_index_write",
             "redis_active_index_read",
+            "redis_prompt_cache_write",
+            "redis_prompt_cache_read",
+            "redis_prompt_cache_shadow_compare",
             "redis_queue_publish",
             "redis_queue_consume",
             "postgres_read_fallback",
             "postgres_queue_fallback",
+            "postgres_prompt_fallback",
+            "blob_store_prompt_fallback",
         ):
             if not isinstance(getattr(self, name), bool):
                 raise TypeError(f"{name} must be a bool")
@@ -324,6 +463,70 @@ class Phase3RedisFeatureFlags:
                 "RedisActiveIndexAdmissionEvidence"
             )
 
+        if self.redis_prompt_cache_shadow_compare:
+            if not self.redis_prompt_cache_write:
+                raise ValueError(
+                    "Phase 3 prompt-cache shadow comparison requires prompt-cache writes"
+                )
+            if not self.postgres_prompt_fallback or not self.blob_store_prompt_fallback:
+                raise ValueError(
+                    "Phase 3 prompt-cache shadow comparison requires PostgreSQL and "
+                    "Blob Store fallbacks"
+                )
+
+        if self.redis_prompt_cache_read:
+            if not self.redis_prompt_cache_write:
+                raise ValueError(
+                    "Phase 3 prompt-cache reads require prompt-cache writes"
+                )
+            if not self.redis_prompt_cache_shadow_compare:
+                raise ValueError(
+                    "Phase 3 prompt-cache reads require semantic shadow comparison"
+                )
+            if not self.postgres_prompt_fallback or not self.blob_store_prompt_fallback:
+                raise ValueError(
+                    "Phase 3 prompt-cache reads require PostgreSQL and Blob Store fallbacks"
+                )
+            prompt_evidence = self.prompt_cache_admission_evidence
+            if prompt_evidence is None:
+                raise ValueError(
+                    "Phase 3 prompt-cache reads require independent admission evidence"
+                )
+            if not isinstance(prompt_evidence, RedisPromptCacheAdmissionEvidence):
+                raise TypeError(
+                    "prompt_cache_admission_evidence must be "
+                    "RedisPromptCacheAdmissionEvidence"
+                )
+            if not prompt_evidence.qualifies:
+                raise ValueError(
+                    "Phase 3 prompt-cache admission thresholds or safety drills "
+                    "are not complete"
+                )
+            _finite_percent(
+                self.prompt_cache_rollout_percent,
+                field="prompt_cache_rollout_percent",
+            )
+            if self.prompt_cache_rollout_percent == 0:
+                raise ValueError(
+                    "Phase 3 prompt-cache reads require a non-zero rollout percent"
+                )
+            if self.prompt_cache_rollout_percent > prompt_evidence.canary_percent:
+                raise ValueError(
+                    "Phase 3 prompt-cache rollout exceeds the proven canary percent"
+                )
+        elif self.prompt_cache_admission_evidence is not None and not isinstance(
+            self.prompt_cache_admission_evidence,
+            RedisPromptCacheAdmissionEvidence,
+        ):
+            raise TypeError(
+                "prompt_cache_admission_evidence must be "
+                "RedisPromptCacheAdmissionEvidence"
+            )
+        elif self.prompt_cache_rollout_percent != 0:
+            raise ValueError(
+                "prompt_cache_rollout_percent requires prompt-cache reads"
+            )
+
     @classmethod
     def ui_status_reads(
         cls,
@@ -378,6 +581,30 @@ class Phase3RedisFeatureFlags:
             redis_active_index_write=True,
         )
 
+    @classmethod
+    def prompt_cache_shadow_writes(cls) -> Phase3RedisFeatureFlags:
+        """Warm and compare encrypted prompt entries without serving them."""
+
+        return cls(
+            redis_prompt_cache_write=True,
+            redis_prompt_cache_shadow_compare=True,
+        )
+
+    @classmethod
+    def prompt_cache_gated_reads(
+        cls,
+        evidence: RedisPromptCacheAdmissionEvidence,
+    ) -> Phase3RedisFeatureFlags:
+        """Serve prompt-cache reads only after the independent gate qualifies."""
+
+        return cls(
+            redis_prompt_cache_write=True,
+            redis_prompt_cache_read=True,
+            redis_prompt_cache_shadow_compare=True,
+            prompt_cache_rollout_percent=evidence.canary_percent,
+            prompt_cache_admission_evidence=evidence,
+        )
+
 
 @dataclass(frozen=True)
 class ShadowProjectionConfig:
@@ -388,8 +615,13 @@ class ShadowProjectionConfig:
     features: Phase2RedisFeatureFlags | Phase3RedisFeatureFlags = field(
         default_factory=Phase2RedisFeatureFlags
     )
+    prompt_working_set: PromptWorkingSetConfig = field(
+        default_factory=PromptWorkingSetConfig
+    )
 
     def __post_init__(self) -> None:
+        if not isinstance(self.prompt_working_set, PromptWorkingSetConfig):
+            raise TypeError("prompt_working_set must be PromptWorkingSetConfig")
         # Keep environment validation centralized in the key builder without
         # making construction depend on a real tenant or run identifier.
         from forge_replay.production.shadow_projection import projection_key
@@ -400,6 +632,11 @@ class ShadowProjectionConfig:
 def _positive_seconds(value: int, *, field: str) -> None:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValueError(f"{field} must be a positive integer number of seconds")
+
+
+def _positive_bounded_int(value: int, *, field: str, maximum: int) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= maximum:
+        raise ValueError(f"{field} must be an integer between 1 and {maximum}")
 
 
 def _finite_non_negative(value: float, *, field: str) -> None:

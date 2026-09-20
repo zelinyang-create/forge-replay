@@ -169,6 +169,12 @@ def test_runtime_commits_automatic_checkpoints_on_stable_boundaries(tmp_path):
 
 def test_runtime_honors_durable_cancellation_before_model_call(tmp_path):
     _, store, runtime = build_runtime(tmp_path, ["<final>must not run</final>"])
+
+    class ForbiddenPromptReader:
+        def load_working_set(self, **kwargs):
+            raise AssertionError(f"cancellation path read prompt cache: {kwargs}")
+
+    runtime.prompt_working_set_reader = ForbiddenPromptReader()
     store.request_cancellation(
         run_id="run-1",
         actor="user:test",
@@ -308,6 +314,12 @@ def test_resume_consumes_durable_model_response_and_settles_budget(tmp_path):
         ),
     )
 
+    class ForbiddenPromptReader:
+        def load_working_set(self, **kwargs):
+            raise AssertionError(f"recovery path read prompt cache: {kwargs}")
+
+    runtime.prompt_working_set_reader = ForbiddenPromptReader()
+
     outcome = runtime.run("run-1")
 
     assert outcome.status == "completed"
@@ -319,6 +331,41 @@ def test_resume_consumes_durable_model_response_and_settles_budget(tmp_path):
             ("model-budget:run-1:0",),
         ).fetchone()
     assert reservation["state"] == "settled"
+
+
+def test_runtime_passes_post_reservation_stream_version_to_prompt_reader(tmp_path):
+    _, store, runtime = build_runtime(tmp_path, ["<final>done</final>"])
+
+    class RecordingPromptReader:
+        def __init__(self):
+            self.calls = []
+
+        def load_working_set(self, *, run_id, expected_through_seq):
+            from forge_replay.runtime.prompt_working_set import PromptWorkingSet
+
+            self.calls.append((run_id, expected_through_seq))
+            return PromptWorkingSet(
+                run_id=run_id,
+                user_message="inspect and update the project",
+                entries=(),
+            )
+
+    reader = RecordingPromptReader()
+    runtime.prompt_working_set_reader = reader
+
+    assert runtime.run("run-1").status == "completed"
+    budget_seq = max(
+        event.seq
+        for event in store.load_run_events("run-1")
+        if event.event_type.value == "budget_reserved"
+    )
+    assert reader.calls == [("run-1", budget_seq)]
+
+
+def test_runtime_prompt_private_helper_keeps_legacy_uninjected_call_shape(tmp_path):
+    _, _, runtime = build_runtime(tmp_path, ["<final>unused</final>"])
+
+    assert "User request:\ninspect and update the project" in runtime._prompt("run-1", 0)
 
 
 def test_runtime_hot_path_never_calls_public_full_event_loader(tmp_path, monkeypatch):

@@ -33,6 +33,13 @@ from forge_replay.persistence.postgres_store import PostgresRuntimeStore
 from forge_replay.ports import BlobObjectStorePort
 from forge_replay.production.postgres_active_index import PostgresActiveRunSource
 from forge_replay.production.postgres_shadow import PostgresShadowProjectionSource
+from forge_replay.production.prompt_working_set_read import (
+    AuthoritativePromptWorkingSetSource,
+    PromptWorkingSetCacheAsideReader,
+    PromptWorkingSetReadObserver,
+)
+from forge_replay.production.redis_prompt_working_set import PromptWorkingSetCache
+from forge_replay.production.shadow_config import ShadowProjectionConfig
 from forge_replay.records import BlobPlacementPolicy
 
 
@@ -123,6 +130,53 @@ class PostgresAuthorityFactory:
             tenant_id=tenant_id,
             connect=self._connect,
         )
+
+    def prompt_working_set_source(
+        self,
+        tenant_id: str,
+    ) -> AuthoritativePromptWorkingSetSource:
+        """Build a fresh SQL/blob prompt source for exactly one tenant."""
+
+        if not isinstance(tenant_id, str) or not tenant_id.strip():
+            raise ValueError("tenant_id must not be empty")
+        return AuthoritativePromptWorkingSetSource(
+            self.runtime_store(tenant_id),
+            tenant_id=tenant_id,
+        )
+
+
+def build_managed_prompt_working_set_reader(
+    factory: PostgresAuthorityFactory,
+    tenant_id: str,
+    cache: PromptWorkingSetCache | None,
+    projection_config: ShadowProjectionConfig,
+    observer: PromptWorkingSetReadObserver | None = None,
+) -> PromptWorkingSetCacheAsideReader:
+    """Compose one tenant-bound cache-aside reader from managed authority."""
+
+    if not isinstance(factory, PostgresAuthorityFactory):
+        raise TypeError("factory must be a PostgresAuthorityFactory")
+    if not isinstance(projection_config, ShadowProjectionConfig):
+        raise TypeError("projection_config must be a ShadowProjectionConfig")
+    limits = projection_config.prompt_working_set
+    if cache is not None:
+        if cache.environment != projection_config.environment:
+            raise ValueError(
+                "prompt cache environment must match the managed prompt configuration"
+            )
+        if (
+            cache.ttl_seconds != limits.ttl_seconds
+            or cache.max_plaintext_bytes != limits.max_plaintext_bytes
+        ):
+            raise ValueError(
+                "prompt cache retention and size must match the managed prompt configuration"
+            )
+    return PromptWorkingSetCacheAsideReader(
+        source=factory.prompt_working_set_source(tenant_id),
+        cache=cache,
+        projection_config=projection_config,
+        observer=observer,
+    )
 
 
 def build_managed_control_plane(
@@ -647,4 +701,5 @@ __all__ = [
     "WorkspaceAgentExecutor",
     "WorkspaceControllerFactory",
     "build_managed_control_plane",
+    "build_managed_prompt_working_set_reader",
 ]

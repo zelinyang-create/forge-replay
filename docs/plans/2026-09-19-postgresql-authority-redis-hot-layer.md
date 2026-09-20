@@ -272,6 +272,59 @@ UI 状态、活跃列表和进度展示可以 cache-aside：
 
 Prompt working set 可以缓存，但 miss/驱逐时必须能从 SQL 最近事件和 Blob Store 重建。
 
+### 7.3 Prompt working set 安全缓存
+
+该缓存只用于模型调用前的 prompt 组装加速，不得用于恢复、checkpoint、状态机、
+fencing、审批、预算、工具派发、审计或 UI。缓存对象是已经按 prompt 语义筛选并水合的
+用户消息与最多 12 条 transcript entry，而不是通用 `EventEnvelope` 或完整 Blob。
+
+权威构建流程固定为：
+
+1. 在 tenant/RLS 作用域内读取 Run 当前 `stream_version` 和最近 64 条 run-local 事件；
+2. 验证事件窗口严格递增且无重复；
+3. 先筛选 prompt 会使用的事件并截取最后 12 条，再读取这些事件引用的 Blob；
+4. 用户消息经 Turn 的 user event 单独读取，因为它不属于 run-local 事件窗口；
+5. 校验 Blob tenant ownership、SHA-256、长度、媒体类型和 UTF-8 解码；
+6. 生成带 prompt contract version 的 canonical working set。
+
+只要 Redis 保存用户消息、模型回复或工具输出正文，应用层 AEAD 就是启用读路径的硬门槛。
+使用 AES-256-GCM、每次写入随机 96-bit nonce，并由注入的 tenant key provider 按租户提供
+版本化 DEK；不同租户不能共享同一解密 key ring，且必须支持按租户 rotation/revoke。
+密钥不得进入 Redis、日志、指标或异常。AAD 至少绑定 environment、用途、
+wire schema、tenant、run、covered version、prompt contract、Redis key 和 key ID。跨 tenant、
+run、version 或 key 搬运密文必须认证失败并整份回源。
+
+Redis key 使用独立 namespace key 做 HMAC-SHA256，不嵌入可逆 tenant/run ID；同一 Run 的
+key 使用同一 cluster hash tag。外层只允许 wire version、key ID、nonce、ciphertext、
+covered version 和认证指纹。Lua CAS 使用 canonical decimal string 比较版本，不能转换为
+Lua number：旧版本为 stale，相同版本同内容为 duplicate 且不续 TTL，相同版本不同内容为
+conflict，新版本才 applied。
+
+默认约束：绝对 TTL 15 分钟、每 Run 最多 64 个事件、12 条 transcript、canonical 明文
+最多 256 KiB；超限直接绕过缓存，不能截断 prompt。首版采用 cache-aside。相同版本的
+认证命中可直接使用；较旧版本只能作为候选文本，必须重新读取当前 SQL 事件窗口，以
+event ID、seq、type 和 Blob SHA 逐项验证后才能复用，新增/变化条目再从 Blob Store 水合。
+Redis ahead、miss、eviction、flush、超时、未知 key ID、AEAD 失败、schema 损坏、身份不匹配
+或 SQL 窗口错误时，整份从 PostgreSQL + Blob Store 重建，并 best-effort 回填。PostgreSQL/
+Blob 失败时不得使用旧 Redis 候选维持服务。
+
+功能开关必须独立于 projection：
+
+```text
+redis_prompt_cache_write
+redis_prompt_cache_read
+redis_prompt_cache_shadow_compare
+```
+
+三者默认关闭。read 必须要求 write、PostgreSQL/Blob fallback、AEAD key provider、Redis
+TLS/ACL、语义 shadow compare 和 flush/eviction/tamper/cross-tenant/KMS outage 演练全部
+通过。读取按 tenant/run 稳定散列执行 canary，实际 rollout percent 不得超过已经验证的
+canary percent；按 1% → 5% → 25% → 100% 推进。只记录 hit、miss、stale-assist、fallback、
+read/write error、shadow match/mismatch 和 conflict-delete 等无正文聚合指标。同版本不同
+canonical 内容必须删除冲突条目，不能继续命中旧值。若后续需要预热，使用独立
+`prompt-working-set-v1` outbox destination；不得把可选
+prompt cache 的成功加入 `run-projection-v1` 的 ACK 条件。
+
 ## 8. 故障语义
 
 | 故障窗口 | 正确行为 |

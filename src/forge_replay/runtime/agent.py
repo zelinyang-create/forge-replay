@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, Protocol
 
 from forge_replay.domain import (
     ApprovalDecision,
@@ -15,14 +14,10 @@ from forge_replay.domain import (
     ToolEffectClass,
 )
 from forge_replay.events import (
-    ApprovalDecidedPayload,
     ModelCallFailedPayload,
     ModelCallStartedPayload,
     ModelOutputRejectedPayload,
     ModelResponseReceivedPayload,
-    ToolExecutionFailedPayload,
-    ToolExecutionSucceededPayload,
-    ToolExecutionUncertainPayload,
 )
 from forge_replay.persistence import (
     BudgetLimitError,
@@ -35,6 +30,11 @@ from forge_replay.runtime.model import (
     ModelAttemptObserver,
     ModelInvocationError,
     ModelPort,
+)
+from forge_replay.runtime.prompt_working_set import (
+    PromptWorkingSet,
+    build_authoritative_prompt_working_set,
+    render_agent_prompt,
 )
 from forge_replay.runtime.shell_executor import DurableShellExecutor
 from mini_coding_agent import MiniAgent
@@ -58,6 +58,17 @@ class AgentOutcome:
 
 class DurableObservationError(RuntimeError):
     """A provider hook could not persist its attempt fact."""
+
+
+class _PromptWorkingSetReader(Protocol):
+    """Structural boundary that keeps runtime independent from Redis adapters."""
+
+    def load_working_set(
+        self,
+        *,
+        run_id: str,
+        expected_through_seq: int,
+    ) -> PromptWorkingSet: ...
 
 
 class _DurableModelAttemptObserver(ModelAttemptObserver):
@@ -148,6 +159,7 @@ class DurableAgentRuntime:
         auto_approve_processes: bool = False,
         process_tools_enabled: bool = True,
         checkpoint_interval_events: int = 25,
+        prompt_working_set_reader: _PromptWorkingSetReader | None = None,
     ):
         self.store = store
         self.model = model
@@ -159,6 +171,7 @@ class DurableAgentRuntime:
         self.auto_approve_file_mutations = auto_approve_file_mutations
         self.auto_approve_processes = auto_approve_processes
         self.process_tools_enabled = process_tools_enabled
+        self.prompt_working_set_reader = prompt_working_set_reader
         if checkpoint_interval_events < 1:
             raise ValueError("checkpoint interval must be positive")
         self.checkpoint_interval_events = checkpoint_interval_events
@@ -392,7 +405,11 @@ class DurableAgentRuntime:
         )
         try:
             result = self.model.complete(
-                self._prompt(run_id, step),
+                self._prompt(
+                    run_id,
+                    step,
+                    expected_through_seq=execution_context.stream_version,
+                ),
                 max_output_tokens=self.max_output_tokens,
                 attempt_observer=observer,
             )
@@ -624,50 +641,33 @@ class DurableAgentRuntime:
         call = self.store.get_unfinished_tool_call(run_id)
         return call.tool_call_id if call is not None else None
 
-    def _prompt(self, run_id: str, step: int) -> str:
-        transcript = []
-        for event in self.store.load_recent_run_events(run_id, limit=64):
-            payload = event.payload
-            if isinstance(payload, ModelResponseReceivedPayload):
-                transcript.append(
-                    "assistant: "
-                    + self.store.get_blob(payload.response_blob_sha256).content.decode("utf-8")
-                )
-            elif isinstance(payload, ToolExecutionSucceededPayload):
-                output = (
-                    self.store.get_blob(payload.output_blob_sha256).content.decode(
-                        "utf-8", errors="replace"
-                    )
-                    if payload.output_blob_sha256
-                    else json.dumps({"receipt": payload.receipt_sha256})
-                )
-                transcript.append(f"tool: {output}")
-            elif isinstance(payload, (ToolExecutionFailedPayload, ToolExecutionUncertainPayload)):
-                transcript.append(f"tool: {payload.model_dump_json()}")
-            elif isinstance(payload, ModelOutputRejectedPayload):
-                transcript.append(
-                    "tool: the previous model tool call was rejected; " + payload.reason
-                )
-            elif isinstance(payload, ApprovalDecidedPayload):
-                transcript.append(f"approval: {payload.decision}")
-        process_tool = (
-            ", run_process(argv, cwd='.', timeout_seconds=30)"
-            if self.process_tools_enabled
-            else ""
+    def _prompt(
+        self,
+        run_id: str,
+        step: int,
+        *,
+        expected_through_seq: int | None = None,
+    ) -> str:
+        reader = self.prompt_working_set_reader
+        if reader is not None and expected_through_seq is None:
+            raise ValueError(
+                "expected_through_seq is required for an injected prompt reader"
+            )
+        working_set = (
+            reader.load_working_set(
+                run_id=run_id,
+                expected_through_seq=expected_through_seq,
+            )
+            if reader is not None
+            else build_authoritative_prompt_working_set(
+                self.store,
+                run_id=run_id,
+            )
         )
-        process_rule = (
-            " run_process argv must be a JSON list and is not a shell string."
-            if self.process_tools_enabled
-            else " Process execution is disabled; edit files without invoking commands."
-        )
-        return (
-            "You are ForgeReplay, a coding agent. Return exactly one JSON <tool> call or one "
-            "<final> answer. Available tools: list_files(path='.'), read_file(path), "
-            "search(pattern, path='.'), write_file(path, content), "
-            f"patch_file(path, old_text, new_text){process_tool}."
-            f"{process_rule}\n\n"
-            f"User request:\n{self.store.get_run_user_message(run_id)}\n\n"
-            f"Step: {step}\nTranscript:\n" + "\n".join(transcript[-12:])
+        return render_agent_prompt(
+            working_set,
+            step=step,
+            process_tools_enabled=self.process_tools_enabled,
         )
 
     def _classify(self, name: str, args: dict) -> tuple[ToolEffectClass, tuple[str, ...]]:

@@ -134,6 +134,10 @@ def _aware_datetime(value: Any) -> datetime:
 class PostgresRuntimeStore:
     """Tenant-scoped PostgreSQL implementation of the durable runtime core."""
 
+    # The PostgreSQL query orders a single run's append-only sequence directly;
+    # prompt construction may therefore fail closed on an internal sequence gap.
+    run_event_sequences_contiguous = True
+
     def __init__(
         self,
         dsn: str,
